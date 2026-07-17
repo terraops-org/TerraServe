@@ -1,0 +1,24 @@
+{
+  "type": "FeatureCollection",
+  "name": "tiny",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "a", "pop": 10 },
+      "geometry": { "type": "Point", "coordinates": [1.0, 2.0] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "b", "pop": 20 },
+      "geometry": { "type": "Point", "coordinates": [5.0, 6.0] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "c", "pop": 30 },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[0.0, 0.0], [3.0, 0.0], [3.0, 3.0], [0.0, 3.0], [0.0, 0.0]]]
+      }
+    }
+  ]
+}

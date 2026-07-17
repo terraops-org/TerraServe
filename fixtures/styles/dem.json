@@ -1,0 +1,14 @@
+{
+  "mode": "pseudocolor",
+  "band": 1,
+  "nodata_transparent": true,
+  "_doc": "Hypsometric elevation ramp (metres): low blue-green -> mid green/yellow -> high brown -> snow.",
+  "stops": [
+    [0,     46,  70, 120, 255],
+    [300,   70, 130,  90, 255],
+    [900,  150, 180, 100, 255],
+    [1700, 225, 210, 140, 255],
+    [2600, 165, 120,  85, 255],
+    [3600, 240, 240, 245, 255]
+  ]
+}

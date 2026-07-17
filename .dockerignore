@@ -1,0 +1,24 @@
+# Keep the Docker build context small and deterministic (context root = terraserve/).
+
+# Build artifacts — always rebuilt inside the image, never reused from the host.
+target/
+tmp/
+build.log
+
+# Test-only assets. score.sh/cargo test are not run inside the image; excluding these keeps
+# ~14 MiB of comparison PNGs and the integration-test sources out of the build context.
+# (Dockerfile only COPYs src/ + fixtures/ minus goldens/ — this belongs alongside that.)
+fixtures/goldens/
+tests/
+
+# Dev-only extras not needed to build the release binary.
+examples/
+docs/
+oracle.sh
+score.sh
+tools/
+
+# Editor / VCS noise (defensive; most of this never reaches terraserve/ anyway).
+.git/
+.gitignore
+*.md

@@ -1,0 +1,1 @@
+{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"name": "Green Forest"}, "geometry": {"type": "MultiPolygon", "coordinates": [[[[-0.0014, -0.0024], [-0.0014, 0.0002], [0.0002, 0.0007], [0.0014, 0.001], [0.0028, 0.0014], [0.0042, 0.0018], [0.0042, -0.0024], [-0.0014, -0.0024]]]]}}]}

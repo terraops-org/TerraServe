@@ -1,0 +1,20 @@
+# Example multi-layer config:  terraserve serve --config fixtures/layers.example.yaml
+# (S3 credentials come from the environment: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY;
+#  the endpoint/region are per-layer here, or via --s3-endpoint / AWS_ENDPOINT_URL.)
+layers:
+  # NDVI computed on the fly from a Sentinel-2 stack stored on OVH S3.
+  - name: ndvi
+    cog: s3://terraserve-cogs/s2_stack.cog.tif
+    src_crs: EPSG:32629
+    s3_endpoint: https://s3.gra.io.cloud.ovh.net
+    s3_region: gra
+    nodata: -32768
+    bands: { B02: 1, B03: 2, B04: 3, B08: 4 }
+    expression: "(B08 - B04) / (B08 + B04)"
+    style: fixtures/styles/ndvi.json
+
+  # A plain RGB orthophoto from a local COG.
+  - name: cascais
+    cog: ../cogs/cascais.cog.deflate.tif
+    src_crs: EPSG:3763
+    style: fixtures/styles/rgb.json

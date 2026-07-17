@@ -1,0 +1,56 @@
+{
+  "version": 8,
+  "name": "VIDA Open Buildings — by source",
+  "metadata": {
+    "field": "bf_source",
+    "title": "VIDA Google-Microsoft-OSM Open Buildings (Iberia) — ODbL v1.0",
+    "legend": [
+      {
+        "code": "microsoft",
+        "color": "#00d5ff",
+        "label": "Microsoft GlobalML  (10.7M · 71%)"
+      },
+      {
+        "code": "osm",
+        "color": "#ff1744",
+        "label": "OpenStreetMap  (2.7M · 18%)"
+      },
+      {
+        "code": "google",
+        "color": "#39ff14",
+        "label": "Google Open Buildings v3  (1.6M · 11%)"
+      }
+    ],
+    "glow": true
+  },
+  "layers": [
+    {
+      "id": "buildings-fill",
+      "type": "fill",
+      "source": "terraserve",
+      "source-layer": "vida",
+      "filter": [
+        "==",
+        "$type",
+        "Polygon"
+      ],
+      "paint": {
+        "fill-color": [
+          "match",
+          [
+            "get",
+            "bf_source"
+          ],
+          "microsoft",
+          "#00d5ff",
+          "google",
+          "#39ff14",
+          "osm",
+          "#ff1744",
+          "#b0bec5"
+        ],
+        "fill-opacity": 1.0
+      }
+    }
+  ]
+}

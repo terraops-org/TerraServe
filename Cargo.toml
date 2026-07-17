@@ -1,0 +1,88 @@
+[package]
+name = "terraserve"
+version = "0.0.0"
+edition = "2021"
+
+# Pilot skeleton. The measured agent fills in the implementation bodies.
+#
+# ALLOWED deps: codec / specialized-correctness / util crates that are NOT the
+#   differentiator — flate2 / libdeflate, zstd, zune-jpeg / jpeg-decoder, png,
+#   proj4rs / proj (coordinate transforms), bytemuck, ndarray, clap, and similar.
+#
+# BANNED (score.sh enforces): gdal, georust-gdal, tiff, geotiff, cog, tiff2, or ANY
+#   GeoTIFF/COG *reader* crate. The COG container + IFD/tiling + windowed read + warp
+#   mechanics + protocol stay bespoke — that is what the pilot measures.
+
+[features]
+default = ["jemalloc"]
+# jemalloc global allocator. glibc's malloc keeps freed memory in-process (RSS stays at the
+# high-water mark, inflating the k8s pod footprint after a big whole-extent request); jemalloc
+# returns dirty pages to the OS and is fast under the engine's multithreaded decode/render.
+# Opt-in so the default build (and score.sh/CI) stay on glibc: `cargo build --release --features jemalloc`.
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# jemalloc allocator (opt-in via the `jemalloc` feature). Unprefixed so it provides the standard
+# malloc/free symbols + reads MALLOC_CONF. A memory allocator, not a COG/GeoTIFF reader — allowed.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
+flate2 = "1"
+png = "0.17"
+proj = "0.27"
+weezl = "0.1"   # LZW codec (TIFF variant) — a codec crate like flate2/zune-jpeg, not a TIFF reader
+zune-jpeg = "0.4"
+zstd = "0.13"   # ZSTD codec (libzstd binding) — a codec crate like flate2/zune-jpeg, not a TIFF reader
+image-webp = "0.2"   # WEBP codec (pure Rust, decode) — a codec crate like zune-jpeg, not a TIFF reader
+
+# Async HTTP server. The request/I/O path is async; CPU render work is dispatched to a
+# blocking worker pool (spawn_blocking) so it never stalls the reactor.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+axum = "0.7"
+# hyper/hyper-util: already transitive via axum. Pulled in directly so the serve loop can
+# reach `http1().title_case_headers(true)` (axum::serve doesn't expose it) — HTTP plumbing,
+# not a banned crate.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
+
+# Bounded, thread-safe decoded-tile cache with a hard memory cap (server-only). A cache
+# util crate, not a COG/GeoTIFF reader — the container/tiling/warp stay bespoke.
+moka = { version = "0.12", features = ["sync"] }
+
+# Data-parallel batch tile decode across cores (per-tile independent, CPU-bound).
+rayon = "1"
+
+# SQLite bindings for GeoPackage (GPKG) container read. The "bundled" feature
+# static-links SQLite from source — preserves the single-static-binary property.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# S3 range-read I/O layer (cloud COGs). A sync HTTP client + hand-rolled SigV4 signing —
+# generic S3 plumbing (works with OVH/AWS/any S3-compatible endpoint), NOT a COG reader.
+# sha2/hmac are the standard crypto primitives the AWS SigV4 algorithm is defined in terms of.
+ureq = "2"
+sha2 = "0.10"
+hmac = "0.12"
+
+# Multi-layer server config (layers.yaml). Config parsing plumbing, not a differentiator.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+# Text shaping + glyph rasterization for the label engine. Text/font libs, NOT geo readers —
+# the label PLACEMENT engine is the bespoke differentiator; shaping/AA is plumbing (like proj).
+harfrust = "0.12.0"
+swash = "0.2.9"
+serde_json = "1.0.150"
+roxmltree = "0.20"  # generic XML DOM for SLD parsing — the SLD interpretation is ours
+
+# CPU rasterizer for polygon + line rendering. A rendering engine, not a geo reader —
+# the vector rasterization/AA plumbing (like proj/harfrust); raster.rs uses this.
+tiny-skia = "0.11"
+
+# FlatBuffers runtime — codec, not a geo-format reader. The FlatGeoBuf container/Header/
+# R-tree/Feature decode (src/vector/fgb/) is hand-written on top of this low-level Table API.
+flatbuffers = "25"
+
+[dev-dependencies]
+# SIMD micro-benchmark only (examples/simd_bench.rs) — not used by the engine yet.
+wide = "0.7"
+
+[profile.release]
+opt-level = 3

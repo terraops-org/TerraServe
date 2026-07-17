@@ -1,0 +1,51 @@
+# OGC CITE WMS 1.1.1 reference dataset (ets-wms11) — all 11 standard-dataset layers the
+# ETS "queryable" profile looks for, named "cite:{Name}" (TerraServe sets Title=Name, and the
+# ETS checks Title == 'cite:BasicPolygons' etc., so the layer `name:` here carries the prefix).
+# 4 layers (BasicPolygons/Forests/Lakes/NamedPlaces) reused as-is from the WMS 1.3.0 dataset.
+# 7 layers (Bridges/Buildings/DividedRoutes/MapNeatline/Ponds/RoadSegments/Streams) fetched from
+# ets-wms13 src/main/resources/data/gml/*.xml → GeoJSON (CRS:84 = EPSG:4326 lon/lat, no axis swap).
+layers:
+  - name: "cite:BasicPolygons"
+    vector: fixtures/cite/data/BasicPolygons.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Bridges"
+    vector: fixtures/cite/data/Bridges.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Buildings"
+    vector: fixtures/cite/data/Buildings.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:DividedRoutes"
+    vector: fixtures/cite/data/DividedRoutes.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Forests"
+    vector: fixtures/cite/data/Forests.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Lakes"
+    vector: fixtures/cite/data/Lakes.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:MapNeatline"
+    vector: fixtures/cite/data/MapNeatline.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:NamedPlaces"
+    vector: fixtures/cite/data/NamedPlaces.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Ponds"
+    vector: fixtures/cite/data/Ponds.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:RoadSegments"
+    vector: fixtures/cite/data/RoadSegments.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: "cite:Streams"
+    vector: fixtures/cite/data/Streams.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326

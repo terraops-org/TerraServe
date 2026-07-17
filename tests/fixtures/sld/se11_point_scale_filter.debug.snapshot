@@ -1,0 +1,128 @@
+StyledLayerDescriptor {
+    named_layers: [
+        NamedLayer {
+            name: Some(
+                "Simple Point Filter",
+            ),
+            styles: [
+                UserStyle {
+                    name: Some(
+                        "Simple Point Filter",
+                    ),
+                    feature_type_styles: [
+                        FeatureTypeStyle {
+                            rules: [
+                                Rule {
+                                    name: Some(
+                                        "Small populated New Yorks",
+                                    ),
+                                    title: None,
+                                    filter: Some(
+                                        And(
+                                            [
+                                                Comparison {
+                                                    op: Eq,
+                                                    prop: "NAME",
+                                                    value: "New York",
+                                                },
+                                                Comparison {
+                                                    op: Eq,
+                                                    prop: "TEST_BOOL",
+                                                    value: "true",
+                                                },
+                                                IsNull {
+                                                    prop: "TEST",
+                                                },
+                                                Like {
+                                                    prop: "TEST2",
+                                                    pattern: "%York%",
+                                                },
+                                                Like {
+                                                    prop: "TEST1",
+                                                    pattern: "%New%",
+                                                },
+                                                Not(
+                                                    Comparison {
+                                                        op: Gt,
+                                                        prop: "POPULATION",
+                                                        value: "100000",
+                                                    },
+                                                ),
+                                                Or(
+                                                    [
+                                                        Comparison {
+                                                            op: Eq,
+                                                            prop: "TEST2",
+                                                            value: "1",
+                                                        },
+                                                        Comparison {
+                                                            op: Eq,
+                                                            prop: "TEST2",
+                                                            value: "2",
+                                                        },
+                                                    ],
+                                                ),
+                                                Between {
+                                                    prop: "TEST3",
+                                                    lo: "1",
+                                                    hi: "5",
+                                                },
+                                            ],
+                                        ),
+                                    ),
+                                    else_filter: false,
+                                    min_scale: Some(
+                                        10000.0,
+                                    ),
+                                    max_scale: Some(
+                                        20000.0,
+                                    ),
+                                    symbolizers: [
+                                        Point(
+                                            PointSymbolizer {
+                                                graphic: Graphic {
+                                                    marks: [
+                                                        Mark {
+                                                            well_known_name: "circle",
+                                                            fill: Some(
+                                                                Fill {
+                                                                    color: Some(
+                                                                        "#FF0000",
+                                                                    ),
+                                                                    opacity: None,
+                                                                },
+                                                            ),
+                                                            stroke: Some(
+                                                                Stroke {
+                                                                    color: Some(
+                                                                        "#000000",
+                                                                    ),
+                                                                    width: Some(
+                                                                        Literal(
+                                                                            "2",
+                                                                        ),
+                                                                    ),
+                                                                    opacity: None,
+                                                                },
+                                                            ),
+                                                        },
+                                                    ],
+                                                    size: Some(
+                                                        Literal(
+                                                            "6",
+                                                        ),
+                                                    ),
+                                                    opacity: None,
+                                                },
+                                            },
+                                        ),
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}

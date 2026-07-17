@@ -1,0 +1,10 @@
+{
+  "mode": "pseudocolor",
+  "band": 1,
+  "nodata_transparent": true,
+  "_doc": "Monotonic grayscale (0..3700 m) for the correctness oracle ONLY: luminance is linear in the value, so it matches GDAL's raw warped values structurally and the ZNCC alignment peak is clean. A hypsometric ramp (dem.json) is non-monotonic in luma and would degrade the correlation.",
+  "stops": [
+    [0,    0,   0,   0,   255],
+    [3700, 255, 255, 255, 255]
+  ]
+}

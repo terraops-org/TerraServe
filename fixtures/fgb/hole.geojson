@@ -1,0 +1,17 @@
+{
+  "type": "FeatureCollection",
+  "name": "hole",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "donut", "pop": 42 },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]],
+          [[3.0, 3.0], [3.0, 7.0], [7.0, 7.0], [7.0, 3.0], [3.0, 3.0]]
+        ]
+      }
+    }
+  ]
+}

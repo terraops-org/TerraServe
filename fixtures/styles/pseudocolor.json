@@ -1,0 +1,14 @@
+{
+  "mode": "pseudocolor",
+  "band": 1,
+  "nodata_transparent": true,
+  "interpolation": "linear",
+  "_doc": "Apply a color ramp to band 1 (Byte 0-255). For each pixel value v, linearly interpolate RGBA between the two surrounding stops (clamp below stops[0] and above stops[-1]). Where the COG mask/alpha marks a pixel invalid, output alpha 0. Stop format: [value, R, G, B, A].",
+  "stops": [
+    [0,   68,  1,   84,  255],
+    [64,  59,  82,  139, 255],
+    [128, 33,  145, 140, 255],
+    [192, 94,  201, 98,  255],
+    [255, 253, 231, 37,  255]
+  ]
+}
