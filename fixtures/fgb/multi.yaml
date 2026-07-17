@@ -1,0 +1,14 @@
+# Two-layer .fgb config (Task 6, multi-layer smoke test): both are the tiny committed
+# .fgb fixtures, no real-data dependency, so this config loads and resolves everywhere
+# (unlike the PRT.fgb/COS2018v3-S2.fgb oracle tests, which self-skip when those big files
+# are absent). `vec_style` just needs to parse -- reused from the existing roads/countries
+# fixtures rather than minting a third file.
+layers:
+  - name: tiny
+    vector: fixtures/fgb/tiny.fgb
+    vec_style: fixtures/styles/countries.vec.json
+    src_crs: EPSG:4326
+  - name: lines
+    vector: fixtures/fgb/lines.fgb
+    vec_style: fixtures/styles/roads.vec.json
+    src_crs: EPSG:4326

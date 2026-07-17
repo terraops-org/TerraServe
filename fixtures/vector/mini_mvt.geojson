@@ -1,0 +1,29 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "pt", "kind": "town" },
+      "geometry": { "type": "Point", "coordinates": [10, 10] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "ln", "length": 42 },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[-20, -20], [20, 20]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "poly", "area": 900 },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [[-30, -30], [30, -30], [30, 30], [-30, 30], [-30, -30]],
+          [[-10, -10], [10, -10], [10, 10], [-10, 10], [-10, -10]]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,647 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>TerraServe — X-ray</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
+<style>
+  html, body, #map { margin: 0; height: 100%; width: 100%; background: #05070a; }
+  body {
+    display: flex;
+    font: 12px/1.4 "SFMono-Regular", Consolas, Menlo, monospace;
+    color: #b7f7ff;
+  }
+  #map { flex: 1 1 auto; }
+
+  #sidebar {
+    flex: 0 0 260px;
+    background: #060a0f;
+    border-right: 1px solid rgba(0, 229, 255, 0.25);
+    overflow-y: auto;
+    padding: 10px;
+    box-sizing: border-box;
+  }
+  #sidebar h1 {
+    font-size: 13px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: #00e5ff;
+    text-shadow: 0 0 8px rgba(0, 229, 255, .6);
+    margin: 2px 0 10px;
+  }
+  #sidebar h2 {
+    font-size: 10px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: #6fb8c4;
+    margin: 16px 0 6px;
+    border-bottom: 1px solid rgba(0, 229, 255, 0.15);
+    padding-bottom: 4px;
+  }
+  .field { margin-bottom: 8px; }
+  .field label { display: block; color: #6fb8c4; margin-bottom: 3px; }
+  .field input, .field select {
+    width: 100%;
+    box-sizing: border-box;
+    background: #0a1016;
+    color: #b7f7ff;
+    border: 1px solid rgba(0, 229, 255, 0.3);
+    border-radius: 3px;
+    padding: 4px 6px;
+    font: inherit;
+  }
+  #applyBtn {
+    width: 100%;
+    margin-top: 4px;
+    background: rgba(0, 229, 255, 0.12);
+    color: #00e5ff;
+    border: 1px solid rgba(0, 229, 255, 0.5);
+    border-radius: 3px;
+    padding: 5px 6px;
+    cursor: pointer;
+    font: inherit;
+    letter-spacing: .05em;
+  }
+  #applyBtn:hover { background: rgba(0, 229, 255, 0.22); }
+
+  /* "WMS layer below" + "Use WMS style" tick boxes — same framed look, mixed case. */
+  #wmsRow, #wmsStyleRow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 18px;
+    padding: 10px 8px;
+    background: rgba(0, 229, 255, 0.10);
+    color: #00e5ff;
+    border: 1px solid rgba(0, 229, 255, 0.5);
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+    font-weight: bold;
+    letter-spacing: .05em;
+  }
+  #wmsStyleRow { margin-top: 10px; }
+  #wmsRow:hover, #wmsStyleRow:hover { background: rgba(0, 229, 255, 0.18); }
+  #wmsRow input, #wmsStyleRow input { cursor: pointer; margin: 0; }
+  #wmsHint { color: #4c6b73; font-size: 10px; margin-top: 6px; line-height: 1.35; }
+
+  .layer-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+  }
+  .layer-row label { flex: 1 1 auto; color: #b7f7ff; word-break: break-all; }
+
+  #inspector { min-height: 40px; }
+  #inspector .empty { color: #4c6b73; font-style: italic; }
+  #inspector table { width: 100%; border-collapse: collapse; }
+  #inspector td {
+    padding: 3px 4px;
+    border-bottom: 1px solid rgba(0, 229, 255, 0.12);
+    vertical-align: top;
+    word-break: break-word;
+  }
+  #inspector td.key { color: #6fb8c4; width: 40%; }
+  #inspector td.val { color: #e8fdff; }
+
+  #hud {
+    position: absolute;
+    z-index: 1;
+    right: 8px;
+    bottom: 8px;
+    background: rgba(6, 10, 15, .82);
+    color: #6fb8c4;
+    padding: 5px 9px;
+    border-radius: 4px;
+    border: 1px solid rgba(0, 229, 255, 0.2);
+  }
+  .ol-control button { background: rgba(6, 10, 15, .85); color: #00e5ff; }
+  .ol-control button:hover, .ol-control button:focus { background: rgba(0, 229, 255, .25); color: #fff; }
+  .ol-attribution { background: rgba(6, 10, 15, .7) !important; color: #6fb8c4; }
+  .ol-attribution a { color: #00e5ff; }
+
+  #spinner {
+    position: absolute;
+    z-index: 2;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: none;
+    align-items: center;
+    gap: 7px;
+    background: rgba(6, 10, 15, .9);
+    color: #00e5ff;
+    padding: 5px 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(0, 229, 255, 0.4);
+    text-shadow: 0 0 6px rgba(0, 229, 255, .6);
+    letter-spacing: .05em;
+    pointer-events: none;
+  }
+  #spinner.on { display: flex; }
+  #spinner .ring {
+    width: 11px; height: 11px;
+    border: 2px solid rgba(0, 229, 255, 0.25);
+    border-top-color: #00e5ff;
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  #spinner .err { color: #ff6b6b; text-shadow: 0 0 6px rgba(255, 107, 107, .6); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { #spinner .ring { animation: none; } }
+
+  #legend .lg-row { display: flex; align-items: center; gap: 7px; padding: 2px 0; }
+  #legend .sw {
+    width: 13px; height: 13px; border-radius: 2px; flex: 0 0 auto;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+  }
+  #legend .lg-label { color: #cfe9ee; font-size: 11px; word-break: break-word; }
+  #legend .lg-title { color: #6fb8c4; font-size: 10px; margin-bottom: 5px; }
+  #legend .empty { color: #4c6b73; font-style: italic; }
+
+  /* ---- mobile: collapse the sidebar into an offcanvas panel behind a toolbar button ---- */
+  #navToggle {
+    display: none;
+    position: fixed; top: 10px; left: 10px; z-index: 1200;
+    width: 42px; height: 42px; padding: 0;
+    background: rgba(6, 10, 15, 0.92); color: #00e5ff;
+    border: 1px solid rgba(0, 229, 255, 0.5); border-radius: 6px;
+    cursor: pointer; font-size: 20px; line-height: 40px; text-align: center;
+    box-shadow: 0 0 10px rgba(0, 229, 255, 0.25);
+  }
+  #scrim { display: none; position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, 0.55); }
+  @media (max-width: 720px) {
+    #navToggle { display: block; }
+    #sidebar {
+      position: fixed; top: 0; left: 0; height: 100%;
+      width: 82%; max-width: 300px; z-index: 1100;
+      transform: translateX(-100%); transition: transform .22s ease;
+      box-shadow: 2px 0 20px rgba(0, 0, 0, 0.6);
+    }
+    #sidebar h1 { margin-top: 46px; } /* clear the fixed toggle button */
+    body.nav-open #sidebar { transform: translateX(0); }
+    body.nav-open #scrim { display: block; }
+  }
+  @media (prefers-reduced-motion: reduce) { #sidebar { transition: none; } }
+</style>
+</head>
+<body>
+<button id="navToggle" aria-label="Toggle panel" title="Panel">&#9776;</button>
+<div id="scrim"></div>
+<div id="sidebar">
+  <h1>&#9889; X-Ray</h1>
+
+  <h2>Source</h2>
+  <div class="field">
+    <label for="layerInput">layer(s), comma-separated</label>
+    <input id="layerInput" type="text" spellcheck="false">
+  </div>
+  <div class="field">
+    <label for="tmsInput">tile grid</label>
+    <select id="tmsInput">
+      <option value="WebMercatorQuad">WebMercatorQuad (EPSG:3857)</option>
+    </select>
+  </div>
+  <button id="applyBtn" type="button">reload</button>
+
+  <h2>Legend</h2>
+  <div id="legend"><div class="empty">&mdash;</div></div>
+
+  <h2>Inspector</h2>
+  <div id="inspector"><div class="empty">click a feature&hellip;</div></div>
+
+  <h2>View</h2>
+  <div id="viewStatus" class="empty">&mdash;</div>
+
+  <label id="wmsRow" title="Stack the server's class-coloured /wms raster UNDER the X-ray vector — crisp, hole-free, browser-light">
+    <input type="checkbox" id="wmsChk" checked> WMS layer below
+  </label>
+  <div id="wmsHint">Class-coloured raster underlay from <code>/wms</code>. Renders on the fly, so tiles can take a moment at overview zooms.</div>
+
+  <label id="wmsStyleRow" title="Colour the vector polygons by the layer's WMS/SLD class palette (the same colours as the raster underlay) instead of the cyan X-ray wireframe — derived from the one --vec-style, no separate MapLibre style needed">
+    <input type="checkbox" id="wmsStyleChk" disabled checked> Use WMS style
+  </label>
+</div>
+<div id="map"></div>
+<div id="spinner"><span class="ring"></span><span id="spinnerText">loading&hellip;</span></div>
+<div id="hud">TerraServe · X-ray MVT viewer</div>
+
+<script src="https://cdn.jsdelivr.net/npm/ol@9/dist/ol.js"></script>
+<script>
+// The X-ray viewer is a fully client-side, self-contained page: the `{layer}`/`{tms}` it renders
+// come from the `?layer=`/`?tms=` query string (comma-separated for multiple layers), NOT from any
+// server-side templating — this same static file works for any layer(s) a `terraserve serve` is
+// currently publishing. WebMercatorQuad (EPSG:3857) is the default grid: it's the standard OL/XYZ
+// pyramid (z0 = 1x1 tile, doubling per level), so no custom tileGrid/tileUrlFunction is needed —
+// unlike WorldCRS84Quad, which needs its own projection wiring (see /viewer for that case).
+var params = new URLSearchParams(location.search);
+var layerParam = params.get('layer') || params.get('layers') || 'vector';
+var layerNames = layerParam.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+var tms = params.get('tms') || 'WebMercatorQuad';
+
+document.getElementById('layerInput').value = layerNames.join(',');
+document.getElementById('tmsInput').value = tms;
+document.getElementById('applyBtn').addEventListener('click', function () {
+  var l = document.getElementById('layerInput').value.trim();
+  var t = document.getElementById('tmsInput').value;
+  var qs = new URLSearchParams();
+  if (l) qs.set('layer', l);
+  qs.set('tms', t);
+  location.search = qs.toString();
+});
+
+// X-ray style: near-black background, no fills — a wide soft low-opacity cyan stroke (the glow)
+// under a thin bright cyan stroke; points render as a soft glow disc under a small bright dot.
+var GLOW = 'rgba(0, 229, 255, 0.16)';
+var BRIGHT = '#00e5ff';
+
+// Thematic styling: when the layer's style.json carries a data-driven fill
+// (a MapLibre `["match", ["get", FIELD], val, colour, ..., default]`), colour polygons by FIELD and
+// show the legend; otherwise keep the cyan wireframe. `theme` is null until style.json resolves.
+var theme = null; // { field, lookup: {value: colour}, def }
+var useWmsStyle = false; // "Use WMS style" tick box: colour polygons by the SLD class palette when ON
+
+function parseFillMatch(styleDoc) {
+  if (!styleDoc || !Array.isArray(styleDoc.layers)) return null;
+  var fillLayer = styleDoc.layers.filter(function (l) {
+    return l.type === 'fill' && l.paint && l.paint['fill-color'];
+  })[0];
+  if (!fillLayer) return null;
+  var fc = fillLayer.paint['fill-color'];
+  // Only the data-driven `["match", ["get", FIELD], v, c, ..., default]` shape is themed;
+  // a plain colour string (the generic X-ray style) leaves `theme` null -> cyan wireframe.
+  if (!Array.isArray(fc) || fc[0] !== 'match') return null;
+  var getExpr = fc[1];
+  var field = (Array.isArray(getExpr) && getExpr[0] === 'get') ? getExpr[1] : null;
+  if (!field) return null;
+  var lookup = {};
+  for (var i = 2; i + 1 < fc.length; i += 2) { lookup[fc[i]] = fc[i + 1]; }
+  var def = (fc.length % 2 === 1) ? fc[fc.length - 1] : '#cccccc';
+  // `metadata.glow: true` = the layer is made of SMALL, SPARSE features (building footprints,
+  // parcels) rather than a wall-to-wall coverage. Such features go sub-pixel at overview zoom, so
+  // the default near-black class boundary below is all that survives -> they render BLACK. Glow
+  // mode instead strokes each feature in its OWN colour (plus a translucent halo), so a sub-pixel
+  // footprint still deposits its colour and a settlement pattern lights up. Leave it off for a
+  // coverage like COS, where the dark boundary usefully separates adjacent classes.
+  var md = styleDoc.metadata || {};
+  return { field: field, lookup: lookup, def: def, glow: md.glow === true };
+}
+
+// '#rrggbb' -> 'rgba(r,g,b,a)' for the halo. Non-hex (already rgba) is returned unchanged.
+function withAlpha(col, a) {
+  var m = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(col);
+  if (!m) return col;
+  return 'rgba(' + parseInt(m[1], 16) + ',' + parseInt(m[2], 16) + ',' + parseInt(m[3], 16) + ',' + a + ')';
+}
+
+function xrayStyle(feature) {
+  var type = feature.getGeometry().getType();
+  if (type === 'Point' || type === 'MultiPoint') {
+    return [
+      new ol.style.Style({
+        image: new ol.style.Circle({
+          radius: 9,
+          fill: new ol.style.Fill({ color: GLOW })
+        })
+      }),
+      new ol.style.Style({
+        image: new ol.style.Circle({
+          radius: 2.5,
+          fill: new ol.style.Fill({ color: BRIGHT })
+        })
+      })
+    ];
+  }
+  // Thematic fill (e.g. COS land cover): colour the polygon by the style's data-driven field,
+  // with a thin dark class boundary. Falls through to the cyan wireframe when no theme is loaded.
+  if (useWmsStyle && theme && (type === 'Polygon' || type === 'MultiPolygon')) {
+    var col = theme.lookup[feature.get(theme.field)] || theme.def;
+    if (theme.glow) {
+      // Sparse small features: halo + same-colour stroke so a sub-pixel footprint still paints
+      // its own colour instead of the near-black boundary (which is ALL that renders once the
+      // interior drops below a pixel — that's why fluorescent fills looked black at z6).
+      return [
+        new ol.style.Style({ stroke: new ol.style.Stroke({ color: withAlpha(col, 0.35), width: 3 }) }),
+        new ol.style.Style({
+          fill: new ol.style.Fill({ color: col }),
+          stroke: new ol.style.Stroke({ color: col, width: 1 })
+        })
+      ];
+    }
+    return [
+      new ol.style.Style({
+        fill: new ol.style.Fill({ color: col }),
+        stroke: new ol.style.Stroke({ color: 'rgba(15, 15, 15, 0.35)', width: 0.4 })
+      })
+    ];
+  }
+  // Lines: stroke only. Polygons: the same glowing outline PLUS a near-invisible cyan fill so the
+  // whole interior is click/hit-detectable — OpenLayers `forEachFeatureAtPixel` only registers a hit
+  // on RENDERED pixels, so a stroke-only polygon is clickable only ON its thin outline (that's why
+  // BUPi parcels felt unclickable). alpha ~0.04 cyan on near-black stays visually ~black.
+  var styles = [];
+  if (type === 'Polygon' || type === 'MultiPolygon') {
+    styles.push(new ol.style.Style({ fill: new ol.style.Fill({ color: 'rgba(0, 229, 255, 0.04)' }) }));
+  }
+  styles.push(new ol.style.Style({ stroke: new ol.style.Stroke({ color: GLOW, width: 6 }) }));
+  styles.push(new ol.style.Style({ stroke: new ol.style.Stroke({ color: BRIGHT, width: 1.3 }) }));
+  return styles;
+}
+
+var olLayers = layerNames.map(function (name) {
+  var source = new ol.source.VectorTile({
+    format: new ol.format.MVT(),
+    url: 'mvt/' + encodeURIComponent(name) + '/' + tms + '/{z}/{x}/{y}.pbf'
+  });
+  return new ol.layer.VectorTile({
+    source: source,
+    style: xrayStyle,
+    properties: { name: name }
+  });
+});
+
+var map = new ol.Map({
+  target: 'map',
+  layers: olLayers,
+  view: new ol.View({ center: [0, 0], zoom: 2 })
+});
+
+// Debug status box: live zoom + view bbox (lon/lat) + the centre WebMercatorQuad tile z/x/y, so tile
+// seams can be pinned to exact coordinates.
+var viewStatusEl = document.getElementById('viewStatus');
+function updateViewStatus() {
+  var v = map.getView();
+  var z = v.getZoom();
+  if (z == null) return;
+  var zi = Math.round(z);
+  var ext = v.calculateExtent(map.getSize());
+  var ll = ol.proj.transformExtent(ext, 'EPSG:3857', 'EPSG:4326');
+  var c = ol.proj.toLonLat(v.getCenter());
+  var n = Math.pow(2, zi);
+  var tx = Math.floor((c[0] + 180) / 360 * n);
+  var lat = c[1] * Math.PI / 180;
+  var ty = Math.floor((1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2 * n);
+  viewStatusEl.classList.remove('empty');
+  viewStatusEl.innerHTML =
+    '<div>zoom <b style="color:#e8fdff">' + z.toFixed(2) + '</b> &middot; tiles z<b>' + zi + '</b></div>' +
+    '<div>centre tile <b style="color:#e8fdff">' + zi + '/' + tx + '/' + ty + '</b></div>' +
+    '<div style="margin-top:4px;color:#6fb8c4">bbox lon/lat</div>' +
+    '<div>' + ll[0].toFixed(4) + ', ' + ll[1].toFixed(4) + '</div>' +
+    '<div>' + ll[2].toFixed(4) + ', ' + ll[3].toFixed(4) + '</div>';
+}
+map.on('moveend', updateViewStatus);
+map.getView().on('change:resolution', updateViewStatus);
+updateViewStatus();
+
+// Click highlight: one selection overlay per layer that SHARES the layer's MVT source (no extra
+// fetch) and styles ONLY the clicked feature — matched by its stable, unique MVT feature id — with
+// a bright white outline + translucent fill. Drawn above the base layers.
+var selected = null; // { id, layer }
+// Fluorescent-red selection: a wide soft red halo (the "glow") under a thin bright neon-red line —
+// pops against the class-coloured underlay far better than the old washed-out white.
+var HL_RED = '#ff1744';
+var highlightStyle = [
+  new ol.style.Style({
+    stroke: new ol.style.Stroke({ color: 'rgba(255, 23, 68, 0.35)', width: 8 })
+  }),
+  new ol.style.Style({
+    stroke: new ol.style.Stroke({ color: HL_RED, width: 2.5 }),
+    fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.14)' }),
+    image: new ol.style.Circle({
+      radius: 7,
+      stroke: new ol.style.Stroke({ color: HL_RED, width: 2 }),
+      fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.35)' })
+    })
+  })
+];
+var selectionLayers = olLayers.map(function (lyr) {
+  return new ol.layer.VectorTile({
+    source: lyr.getSource(),
+    renderMode: 'vector',
+    style: function (feature) {
+      return (selected && selected.layer === lyr.get('name') && feature.getId() === selected.id)
+        ? highlightStyle : null;
+    }
+  });
+});
+selectionLayers.forEach(function (s) { map.addLayer(s); });
+
+// Tile-loading spinner: count in-flight tile requests across every layer's source (OL VectorTile
+// fires tileloadstart/end/error). BUPi's initial extent view fetches many tiles at once, so the
+// spinner is a "working" cue over the otherwise-black canvas; it also surfaces tile errors instead
+// of failing silently. A fresh load batch (inflight 0 -> 1) clears the prior batch's error tally.
+var spinnerEl = document.getElementById('spinner');
+var spinnerText = document.getElementById('spinnerText');
+var inflight = 0, tileErrors = 0;
+function updateSpinner() {
+  if (inflight > 0) {
+    spinnerText.textContent = 'loading ' + inflight + ' tile' + (inflight === 1 ? '' : 's') + '…';
+    spinnerText.className = '';
+    spinnerEl.classList.add('on');
+  } else if (tileErrors > 0) {
+    spinnerText.textContent = tileErrors + ' tile error' + (tileErrors === 1 ? '' : 's');
+    spinnerText.className = 'err';
+    spinnerEl.classList.add('on');
+  } else {
+    spinnerEl.classList.remove('on');
+  }
+}
+olLayers.forEach(function (lyr) {
+  var s = lyr.getSource();
+  s.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
+  s.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
+  s.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
+});
+
+// (Layers list removed — the Source "layer(s)" field is the sole layer indication.)
+
+// Fit the view to the first layer's advertised bounds (from its TileJSON) once it resolves;
+// falls back to the initial world view (harmless) if the layer/tms doesn't exist.
+// `?center=lon,lat&zoom=N` pins the start view; without it we fit the layer's full extent.
+// Fitting is the wrong default for a layer whose interesting scale is far below its extent — e.g.
+// 14.9M building footprints spanning the Azores to the Canaries fit to ~z5, where each footprint
+// is ~0.0001 px: an empty-looking map, and in the band where `--mvt-max-features` sampling makes
+// per-tile density (hence visible seams) at that. Point such a layer at a city instead.
+var startCenter = null, startZoom = null;
+if (params.get('center')) {
+  var c = params.get('center').split(',').map(parseFloat);
+  if (c.length === 2 && isFinite(c[0]) && isFinite(c[1])) startCenter = c;
+}
+if (params.get('zoom')) {
+  var z = parseFloat(params.get('zoom'));
+  if (isFinite(z)) startZoom = z;
+}
+if (startCenter) {
+  map.getView().setCenter(ol.proj.fromLonLat(startCenter));
+  map.getView().setZoom(startZoom === null ? 13 : startZoom);
+} else if (layerNames.length > 0) {
+  fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/' + tms + '.json')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (doc) {
+      if (doc && Array.isArray(doc.bounds) && doc.bounds.length === 4) {
+        var extent = ol.proj.transformExtent(doc.bounds, 'EPSG:4326', 'EPSG:3857');
+        map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 17 });
+        if (startZoom !== null) map.getView().setZoom(startZoom);
+      }
+    })
+    .catch(function () {});
+}
+
+// Fetch the first layer's style.json: if it has a data-driven fill, theme the map + build the
+// legend; otherwise the map stays the cyan wireframe. Legend metadata (metadata.legend) is a list
+// of { color, label } entries carried by the style (e.g. the DGT COS2018 megaclasses).
+var legendEl = document.getElementById('legend');
+function renderLegend(styleDoc) {
+  var legend = styleDoc && styleDoc.metadata && styleDoc.metadata.legend;
+  var title = styleDoc && styleDoc.metadata && styleDoc.metadata.title;
+  // Fallback: an SLD-derived /style.json carries the class palette (a fill "match") but no
+  // metadata.legend. `theme` already holds the parsed value→colour map — build the legend from it so a
+  // thematic map always shows its classes (code + swatch), even without an operator --mvt-style legend.
+  if ((!Array.isArray(legend) || legend.length === 0) && theme && theme.lookup) {
+    legend = Object.keys(theme.lookup).map(function (code) {
+      return { code: code, color: theme.lookup[code] };
+    });
+    title = title || (theme.field + ' — ' + legend.length + ' classes');
+  }
+  if (!Array.isArray(legend) || legend.length === 0) {
+    legendEl.innerHTML = '<div class="empty">cyan wireframe (no thematic style)</div>';
+    return;
+  }
+  var rows = legend.map(function (e) {
+    return '<div class="lg-row"><span class="sw" style="background:' +
+      escapeHtml(String(e.color || '#888888')) + '"></span><span class="lg-label">' +
+      escapeHtml(String(e.label || e.code || '')) + '</span></div>';
+  }).join('');
+  legendEl.innerHTML = (title ? '<div class="lg-title">' + escapeHtml(String(title)) + '</div>' : '') + rows;
+}
+if (layerNames.length > 0) {
+  fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/style.json')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (styleDoc) {
+      theme = parseFillMatch(styleDoc);
+      // "Use WMS style" is only meaningful once a class palette resolves (from --mvt-style or the
+      // SLD-derived /style.json); enable the tick box then and let it toggle wireframe <-> class fill.
+      var wmsStyleChk = document.getElementById('wmsStyleChk');
+      wmsStyleChk.disabled = !theme;
+      // `?wms_style=0` forces the cyan X-ray wireframe even when a class palette exists (the tick
+      // box still turns it back on). Companion to `?wms=0` — both toggles are URL-addressable so a
+      // deployment can pick its own defaults per layer without a code change.
+      if (params.get('wms_style') === '0' || params.get('wms_style') === 'false') {
+        wmsStyleChk.checked = false;
+      }
+      wmsStyleChk.addEventListener('change', function () {
+        useWmsStyle = wmsStyleChk.checked;
+        olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
+      });
+      // "Use WMS style" defaults ON: once the class palette resolves, apply it immediately.
+      if (theme && wmsStyleChk.checked) {
+        useWmsStyle = true;
+        olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
+      }
+      renderLegend(styleDoc);
+    })
+    .catch(function () {});
+}
+
+// Click inspector: forEachFeatureAtPixel -> show properties as a key/value table; empty click clears.
+var inspector = document.getElementById('inspector');
+function showProps(props) {
+  var keys = Object.keys(props).filter(function (k) { return k !== 'geometry'; });
+  if (keys.length === 0) {
+    inspector.innerHTML = '<div class="empty">(no attributes)</div>';
+    return;
+  }
+  var rows = keys.map(function (k) {
+    var v = props[k];
+    return '<tr><td class="key">' + escapeHtml(k) + '</td><td class="val">' + escapeHtml(String(v)) + '</td></tr>';
+  }).join('');
+  inspector.innerHTML = '<table>' + rows + '</table>';
+}
+function clearProps() {
+  inspector.innerHTML = '<div class="empty">click a feature&hellip;</div>';
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+map.on('singleclick', function (evt) {
+  var found = null, foundLayer = null;
+  map.forEachFeatureAtPixel(evt.pixel, function (f, layer) {
+    found = f;
+    foundLayer = layer;
+    return true;
+  }, {
+    hitTolerance: 4,
+    // Don't hit-test the selection overlays themselves — only the base layers.
+    layerFilter: function (l) { return selectionLayers.indexOf(l) === -1; }
+  });
+  if (found) {
+    selected = { id: found.getId(), layer: foundLayer ? foundLayer.get('name') : null };
+    showProps(found.getProperties());
+  } else {
+    selected = null;
+    clearProps();
+  }
+  // Re-render the overlays so the highlight follows the click.
+  selectionLayers.forEach(function (s) { s.changed(); });
+});
+
+// --- WMS raster underlay ("Add WMS layer") ---------------------------------------------------------
+// Stack the server's class-coloured `/wms` render UNDERNEATH the X-ray vector. Rasterising a
+// wall-to-wall coverage has no gaps, so this is a CRISP, HOLE-FREE, browser-light (small PNG per
+// tile) way to see a dense coverage's overview — the pragmatic alternative to a heavy vector overview.
+// It renders on the fly (projection-bound), so tiles can take seconds to appear at low zoom; browser
+// tile-caching makes revisits instant. Uses this same server's `/wms` for the first `?layer=`.
+var wmsLayer = null;
+var wmsChk = document.getElementById('wmsChk');
+var wmsName = layerNames[0] || 'vector';
+// `?wms=0` starts with the underlay OFF (the tick box still turns it on). The underlay is a LIVE
+// rasterize with no precomputed archive — `--pmtiles` only ever serves the MVT path — so on a
+// layer whose low-zoom GetMap decodes millions of features it costs seconds per tile and stalls
+// the whole viewport behind `--max-inflight`. Layers that are cheap to rasterize (e.g. one with a
+// `--topology-simplify` LOD) can leave it on; huge windowed layers should pass `?wms=0`.
+if (params.get('wms') === '0' || params.get('wms') === 'false') {
+  wmsChk.checked = false;
+}
+function setWmsUnderlay(on) {
+  if (on && !wmsLayer) {
+    var src = new ol.source.TileWMS({
+      url: 'wms',
+      params: { LAYERS: wmsName, VERSION: '1.3.0', FORMAT: 'image/png', TRANSPARENT: true },
+      // Each tile is a windowed GetMap → smaller tiles project fewer features → they trickle in.
+      crossOrigin: 'anonymous'
+    });
+    // Feed the existing spinner tally so the "rendering N tiles…" cue covers the WMS renders too.
+    src.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
+    src.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
+    src.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
+    wmsLayer = new ol.layer.Tile({ source: src, properties: { name: wmsName + ' (WMS raster)' } });
+    map.getLayers().insertAt(0, wmsLayer); // index 0 = BOTTOM of the stack → under the vector X-ray
+  } else if (!on && wmsLayer) {
+    map.removeLayer(wmsLayer);
+    wmsLayer = null;
+  }
+}
+wmsChk.addEventListener('change', function () { setWmsUnderlay(wmsChk.checked); });
+setWmsUnderlay(wmsChk.checked); // checkbox is `checked` by default → underlay ON at start
+
+// mobile: toolbar button toggles the offcanvas sidebar (Bootstrap-style); scrim/✕ close it.
+(function () {
+  var navToggle = document.getElementById('navToggle');
+  var scrim = document.getElementById('scrim');
+  function setNav(open) {
+    document.body.classList.toggle('nav-open', open);
+    navToggle.innerHTML = open ? '&#10005;' : '&#9776;';
+  }
+  navToggle.addEventListener('click', function () {
+    setNav(!document.body.classList.contains('nav-open'));
+  });
+  scrim.addEventListener('click', function () { setNav(false); });
+})();
+</script>
+</body>
+</html>

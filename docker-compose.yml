@@ -1,0 +1,50 @@
+# Local / production-shaped compose file for the TerraServe tile server.
+#
+# No data is baked into the image — mount your COG(s)/GeoPackage(s)/style(s)/layers.yaml at
+# /data (read-only) and point the command at them. Defaults below serve the small committed
+# `fixtures/vector/airports.geojson` + `fixtures/styles/airports.vec.json` demo layer so
+# `docker compose up` works with zero configuration; see DOCKER.md for real-data examples
+# (--cog, --config layers.yaml, --mvt-style, --mvt-max-features, S3 creds, ...).
+#
+# Override the served layer without editing this file, e.g.:
+#   TERRASERVE_DATA_DIR=/srv/terraserve-data docker compose up
+# or replace `command:` entirely on the CLI:
+#   docker compose run --rm terraserve serve --config /data/layers.yaml --host 0.0.0.0 --port 8080
+
+services:
+  terraserve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: terraserve:latest
+    ports:
+      - "${TERRASERVE_PORT:-8080}:8080"
+    volumes:
+      # Read-only: the server never writes into /data. Default mounts this repo's whole
+      # fixtures/ dir so the demo command below (paths under vector/ and styles/) resolves
+      # with zero setup; point TERRASERVE_DATA_DIR at a flat directory of your own real data
+      # and pass matching filenames via TERRASERVE_VECTOR/TERRASERVE_STYLE (or override
+      # `command:` outright — see the file header).
+      - ${TERRASERVE_DATA_DIR:-./fixtures}:/data:ro
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+      # Only consulted for `s3://` COG sources; harmless/unused otherwise.
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    command:
+      - serve
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8080"
+      - --vector
+      - /data/${TERRASERVE_VECTOR:-vector/airports.geojson}
+      - --vec-style
+      - /data/${TERRASERVE_STYLE:-styles/airports.vec.json}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped

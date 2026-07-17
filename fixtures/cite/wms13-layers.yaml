@@ -1,0 +1,20 @@
+# OGC CITE WMS 1.3.0 reference dataset — the 4 standard test layers the ETS looks for
+# (BasicPolygons/Forests/Lakes/NamedPlaces). Served as queryable vector layers via multi-vector config.
+# Source GML: ets-wms13 src/main/resources/data/gml/*.xml → GeoJSON (CRS:84 = EPSG:4326 lon/lat).
+layers:
+  - name: BasicPolygons
+    vector: fixtures/cite/data/BasicPolygons.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: Forests
+    vector: fixtures/cite/data/Forests.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: Lakes
+    vector: fixtures/cite/data/Lakes.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326
+  - name: NamedPlaces
+    vector: fixtures/cite/data/NamedPlaces.geojson
+    vec_style: fixtures/cite/cite-fixture.vec.json
+    src_crs: EPSG:4326

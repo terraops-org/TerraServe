@@ -1,0 +1,7 @@
+/target/
+tmp/
+*.log
+.DS_Store
+**/CLAUDE.md
+# bring-your-own sample data (not committed)
+/data/

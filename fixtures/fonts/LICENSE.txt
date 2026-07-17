@@ -1,0 +1,5 @@
+DejaVuSans.ttf — DejaVu Fonts, a permissive (Bitstream Vera + DejaVu changes)
+redistributable license. Committed as the pinned font for deterministic label
+rendering (spec §8). Latin coverage suffices for the MVP; a Noto Sans (SIL OFL)
+can replace it at the i18n/fallback rung for broader script reach.
+Upstream: https://dejavu-fonts.github.io/

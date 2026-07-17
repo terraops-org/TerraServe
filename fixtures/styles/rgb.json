@@ -1,0 +1,6 @@
+{
+  "mode": "rgb",
+  "bands": [1, 2, 3],
+  "alpha": "mask",
+  "_doc": "RGB(A) passthrough. Bands 1,2,3 -> R,G,B. Alpha from the COG mask/alpha band -> transparent PNG where masked or outside the data extent."
+}
