@@ -1,0 +1,145 @@
+# Publish the TerraServe container image to GHCR, multi-architecture.
+#
+# Why two jobs instead of one buildx run with `platforms: linux/amd64,linux/arm64`:
+# a single-runner multi-arch build emulates the foreign architecture through QEMU, and this
+# image compiles Rust plus bindgen, proj-sys and rusqlite's vendored SQLite. Under emulation
+# that is a very long build and a reliable source of timeouts. Instead each architecture
+# builds NATIVELY on its own runner and pushes by digest, then a final job stitches the two
+# digests into one manifest list. arm64 runners (ubuntu-24.04-arm) are free on public
+# repositories, so this costs nothing.
+#
+# Result: `docker run -p 8080:8080 ghcr.io/terraops-org/terraserve` works on an x86 server
+# and on an Apple-silicon laptop, pulling the right architecture automatically.
+
+name: Publish image
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:      # lets you publish without cutting a tag
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # terraops-org/TerraServe -> lowercased below
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires a lowercase path; github.repository preserves the org's capital S.
+      - name: Normalise image name
+        id: img
+        run: echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # no PAT needed; scoped to this repo
+
+      # Push by digest only. The manifest list is assembled in the `merge` job below, so
+      # neither architecture's build publishes a user-visible tag on its own.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ steps.img.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${digest#sha256:}"
+        env:
+          digest: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    name: manifest + smoke test
+    runs-on: ubuntu-24.04
+    needs: [build]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Normalise image name
+        id: img
+        run: echo "name=${IMAGE_NAME,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` only for a real version tag; a manual dispatch publishes `edge` so it can
+      # never quietly move `latest` out from under people.
+      - name: Compute tags
+        id: tags
+        run: |
+          img="${{ env.REGISTRY }}/${{ steps.img.outputs.name }}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${{ github.ref_name }}"; v="${v#v}"
+            echo "args=-t $img:$v -t $img:latest" >> "$GITHUB_OUTPUT"
+            echo "test=$img:$v" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=-t $img:edge" >> "$GITHUB_OUTPUT"
+            echo "test=$img:edge" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create the manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create ${{ steps.tags.outputs.args }} \
+            $(printf '${{ env.REGISTRY }}/${{ steps.img.outputs.name }}@sha256:%s ' *)
+
+      - name: Show what was published
+        run: docker buildx imagetools inspect ${{ steps.tags.outputs.test }}
+
+      # The point of publishing an image is that `docker run` with NO arguments serves a map.
+      # That default was broken once (CMD pointed at /data, a mount point that is empty
+      # without -v), so assert it rather than trust it.
+      - name: Smoke test — a bare `docker run` must serve a real map
+        run: |
+          docker run -d --name ts -p 8080:8080 ${{ steps.tags.outputs.test }}
+          for i in $(seq 1 30); do
+            curl -fsS -o /dev/null http://127.0.0.1:8080/ && break || sleep 2
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:8080/wms?SERVICE=WMS&REQUEST=GetCapabilities"
+          curl -fsS -o /tmp/map.png \
+            "http://127.0.0.1:8080/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=airports&CRS=EPSG:4326&BBOX=-90,-180,90,180&WIDTH=256&HEIGHT=128&FORMAT=image/png"
+          file /tmp/map.png | grep -q 'PNG image data' || { echo "GetMap did not return a PNG"; docker logs ts; exit 1; }
+          echo "ok: bare docker run serves a valid PNG"
+          docker rm -f ts
