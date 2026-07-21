@@ -59,6 +59,14 @@ RUN touch src/main.rs src/lib.rs && cargo build --release
 ########################################################################
 FROM debian:trixie-slim AS runtime
 
+# OCI metadata. Without org.opencontainers.image.source a GHCR package has no link back to
+# its repository, shows no README and no licence, and cannot inherit the repo's visibility
+# — it just appears as an orphan under the org.
+LABEL org.opencontainers.image.source="https://github.com/terraops-org/TerraServe" \
+      org.opencontainers.image.description="Clean-room raster + vector map tile server in Rust — WMS/WMTS/TMS/MVT, no GDAL." \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.title="TerraServe"
+
 # Runtime deps:
 #   - libproj25       : the PROJ shared library the binary dynamically links against
 #   - proj-data       : PROJ's transformation grids + proj.db — needed for CRS lookups/datum
