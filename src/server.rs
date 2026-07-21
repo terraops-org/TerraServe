@@ -796,10 +796,21 @@ async fn viewer_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// page (`xray.html`, embedded at compile time — no per-request templating needed): it reads the
 /// `{layer}`/`{tms}` to display from the `?layer=`/`?tms=` query string client-side and requests
 /// tiles straight from `/mvt/{layer}/{tms}/{z}/{x}/{y}.pbf`, so no `ServeState` is needed here.
-async fn xray_handler() -> Response {
+async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
+    // Substitute the server's FIRST layer as the viewer's default. Without this the page
+    // defaulted to the literal "vector" and every tile 404'd whenever the layer was named
+    // anything else (`--name airports` on the published demo image, for instance) — the
+    // viewer loaded, then failed to fetch a single tile, which reads as a broken server.
+    let default_layer = state
+        .layers
+        .first()
+        .map(|l| l.name.as_str())
+        .unwrap_or("vector");
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(xray_html()))
+        .body(Body::from(
+            xray_html().replace("__TS_DEFAULT_LAYER__", default_layer),
+        ))
         .unwrap()
 }
 

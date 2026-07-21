@@ -238,7 +238,12 @@
 // pyramid (z0 = 1x1 tile, doubling per level), so no custom tileGrid/tileUrlFunction is needed —
 // unlike WorldCRS84Quad, which needs its own projection wiring (see /viewer for that case).
 var params = new URLSearchParams(location.search);
-var layerParam = params.get('layer') || params.get('layers') || 'vector';
+// The default is substituted by the server with its FIRST published layer (see
+// server.rs xray_handler). It used to be the literal 'vector', which broke the viewer
+// on any server whose layer was named anything else: tiles 404'd because /xray asked
+// for /mvt/vector/... while the layer was, say, 'airports'. The token below is replaced
+// at request time; it stays as a working fallback if substitution ever fails.
+var layerParam = params.get('layer') || params.get('layers') || '__TS_DEFAULT_LAYER__';
 var layerNames = layerParam.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
 var tms = params.get('tms') || 'WebMercatorQuad';
 
