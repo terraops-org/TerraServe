@@ -104,20 +104,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `latest` only for a real version tag; a manual dispatch publishes `edge` so it can
-      # never quietly move `latest` out from under people.
+      # Every publish produces BOTH a moving tag and an immutable one:
+      #   :latest       — what people pull to try it
+      #   :<version>    — from a v* git tag, for real releases
+      #   :YYYY-MM-DD   — from a manual run, so there is always something to PIN and to
+      #                   ROLL BACK TO. `latest` alone gives neither: a bad build leaves
+      #                   nothing to fall back on, and two people pulling a week apart get
+      #                   different software with no way to name the difference.
+      # Date tags deliberately avoid promising semver while the crate is pre-release; the
+      # v* path stays for when real versions are wanted.
       - name: Compute tags
         id: tags
         run: |
           img="${{ env.REGISTRY }}/${{ steps.img.outputs.name }}"
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            v="${{ github.ref_name }}"; v="${v#v}"
-            echo "args=-t $img:$v -t $img:latest" >> "$GITHUB_OUTPUT"
-            echo "test=$img:$v" >> "$GITHUB_OUTPUT"
+            imm="${{ github.ref_name }}"; imm="${imm#v}"
           else
-            echo "args=-t $img:edge" >> "$GITHUB_OUTPUT"
-            echo "test=$img:edge" >> "$GITHUB_OUTPUT"
+            imm="$(date -u +%Y-%m-%d)"
           fi
+          echo "args=-t $img:$imm -t $img:latest" >> "$GITHUB_OUTPUT"
+          echo "test=$img:$imm" >> "$GITHUB_OUTPUT"
+          echo "immutable=$imm" >> "$GITHUB_OUTPUT"
+
+      - name: What will be published
+        run: |
+          echo "immutable tag : ${{ steps.tags.outputs.immutable }}"
+          echo "moving tag    : latest"
 
       - name: Create the manifest list
         working-directory: /tmp/digests
