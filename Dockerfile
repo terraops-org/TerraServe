@@ -93,7 +93,16 @@ ENTRYPOINT ["terraserve"]
 # Default demo command — serves the committed airports fixture. Override via `docker run <image>
 # serve --config /data/layers.yaml ...` (or the `command:` in docker-compose.yml) to point at
 # real mounted data. --host 0.0.0.0 is required for the container's network to be reachable.
+# Default: serve the airports fixture that is BAKED INTO the image, so a bare
+# `docker run -p 8080:8080 <image>` works with no volume and no flags — that first
+# command is most people's entire evaluation of the project. This previously pointed at
+# /data/, which is a MOUNT POINT: with no -v it is empty, and the container exited with
+# "read /data/airports.vec.json: No such file or directory".
+# Override for real data: `docker run <image> serve --config /data/layers.yaml ...`
+# (or the `command:` in docker-compose.yml). --host 0.0.0.0 is required for the
+# container's port to be reachable from outside it.
 CMD ["serve", \
      "--host", "0.0.0.0", "--port", "8080", \
-     "--vector", "/data/airports.geojson", \
-     "--vec-style", "/data/airports.vec.json"]
+     "--vector", "/app/fixtures/vector/airports.geojson", \
+     "--vec-style", "/app/fixtures/styles/airports.vec.json", \
+     "--name", "airports"]
