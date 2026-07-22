@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
 //! `/mvt` HTTP front-end (Task 5) — bespoke MVT tiles over XYZ addressing (`{z}/{x}/{y}.pbf`, TOP-LEFT

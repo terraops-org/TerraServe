@@ -1,0 +1,73 @@
+# Build TerraServe's Python wheels and attach them to the GitHub release.
+#
+# On a `v*` tag (or manual dispatch) this builds portable manylinux_2_28 wheels for the
+# `terraserve` Python package (the PyO3 bindings in bindings/python) and uploads them to the
+# release. The bindings vendor PROJ (the engine's `bundled-proj` feature) so the wheels import
+# on hosts with no system libproj; the manylinux_2_28 baseline (glibc 2.28) installs on
+# ~every Linux since 2019 — Ubuntu 20.04+, Debian 11+, RHEL/Alma 8+.
+#
+# abi3 (pyo3's abi3-py39) means ONE wheel per architecture covers CPython 3.9+, so the matrix
+# is over architecture only — each built NATIVELY (never QEMU), like publish-image.yml.
+
+name: Publish wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:      # lets you build wheels without cutting a tag
+
+jobs:
+  build:
+    name: wheel ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-24.04-arm      # free arm64 runner on public repos
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel (manylinux_2_28, PROJ vendored)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: '2_28'
+          args: --release --out dist
+          # The vendored PROJ build needs cmake + sqlite. AlmaLinux 8's cmake is 3.x, so no
+          # CMake-4 policy break here, but pin the minimum anyway for safety (see env below).
+          before-script-linux: |
+            (command -v cmake || yum install -y cmake || dnf install -y cmake)
+            (yum install -y sqlite-devel sqlite || dnf install -y sqlite-devel sqlite)
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.arch }}
+          path: bindings/python/dist/*.whl
+
+  release:
+    name: attach wheels to release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write     # create the release and upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach wheels to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true

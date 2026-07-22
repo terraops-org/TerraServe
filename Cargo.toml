@@ -1,7 +1,17 @@
 [package]
 name = "terraserve"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
+license = "MPL-2.0"
+description = "Clean-room raster + vector tile engine in Rust (COG / GeoPackage / FlatGeoBuf → WMS / WMTS / TMS / MVT), no GDAL / MapServer / GeoServer."
+repository = "https://github.com/terraops-org/TerraServe"
+readme = "README.md"
+
+# The Python bindings crate (bindings/python) is EXCLUDED from this workspace so a plain
+# `cargo build` / score.sh never builds it, nor unifies its vendored-PROJ feature into the
+# server build. maturin builds it standalone against a path dependency on this crate.
+[workspace]
+exclude = ["bindings/python"]
 
 # Pilot skeleton. The measured agent fills in the implementation bodies.
 #
@@ -20,6 +30,10 @@ default = ["jemalloc"]
 # returns dirty pages to the OS and is fast under the engine's multithreaded decode/render.
 # Opt-in so the default build (and score.sh/CI) stay on glibc: `cargo build --release --features jemalloc`.
 jemalloc = ["dep:tikv-jemallocator"]
+# Build PROJ from source (vendored) instead of linking system libproj. OFF by default so the
+# server build and score.sh stay on fast system libproj; the Python wheel turns it ON so the
+# distributed artifact is self-contained (imports on a host with no libproj installed).
+bundled-proj = ["proj/bundled_proj"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
