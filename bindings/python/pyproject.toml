@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "terraserve"
+version = "0.1.0"
+description = "TerraServe raster map rendering (COG → PNG) + a pygeoapi OGC API - Maps provider."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MPL-2.0" }
+keywords = ["gis", "geospatial", "raster", "cog", "wms", "pygeoapi", "ogc"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: GIS",
+  "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "terraserve._terraserve"
+features = ["pyo3/extension-module"]

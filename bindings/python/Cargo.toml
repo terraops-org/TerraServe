@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MPL-2.0
+[package]
+name = "terraserve-py"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Python bindings for the TerraServe raster map engine (COG → PNG)."
+
+[lib]
+name = "_terraserve"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
+# The engine, built with PROJ vendored (`bundled-proj`) so the wheel is self-contained and
+# imports on a host with no system libproj. `default-features = false` drops jemalloc — that
+# global allocator belongs only to the server binary's main.rs, never an extension module.
+terraserve = { path = "../..", default-features = false, features = ["bundled-proj"] }

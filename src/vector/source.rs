@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
 //! The reader seam. Every feature enters the pipeline through `FeatureSource`; the source

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
 //! `sld_lower` — lowers a parsed SLD document (`crate::sld`) into the renderer's Style IR

@@ -9,13 +9,13 @@ reprojection plumbing, the tiling, the styling and the OGC protocol layer are wr
 The result is small, predictable in memory (a request's buffers are freed the instant it returns —
 no GC, no caches that grow forever), and certifiable against the OGC standards.
 
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE) · **OGC CITE WMS 1.3.0: 135 / 0** (certifiable) · **Rust**
+[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue)](LICENSE) · **OGC CITE WMS 1.3.0: 135 / 0** (certifiable) · **Rust**
 
 ### 🌍 Live demos, docs & benchmarks → **[terraserve.io](https://terraserve.io)**  ·  built by **[TerraOps](https://terraops.org)**
 
 ## Get it running
 
-**Docker** — build the image and serve a dataset. Point QGIS at `http://localhost:8080/wms`, or open the viewer at `http://localhost:8080/viewer`:
+**Docker** build the image and serve a dataset. Point QGIS at `http://localhost:8080/wms`, or open the viewer at `http://localhost:8080/viewer`:
 
 ```bash
 docker build -t terraserve .
@@ -65,9 +65,8 @@ Three real datasets on a small server, each exercising a different part of the e
 TerraServe ships **no datasets** — any Cloud-Optimized GeoTIFF or GeoPackage / FlatGeoBuf / GeoJSON
 works. To reproduce the demos, the underlying data is all public:
 
-- **Land cover (cos2023)** — Direção-Geral do Território (DGT), *Carta de Uso e Ocupação do Solo (COS),
-  Série 2, 2023*: open data at [dadosabertos.dgterritorio.gov.pt](https://dadosabertos.dgterritorio.gov.pt)
-  (DGT also serves this same layer live on their own GeoServer, `geo2.dgterritorio.gov.pt`).
+- **Land cover (cos2023)** - Direção-Geral do Território (DGT), *Carta de Uso e Ocupação do Solo (COS),
+  Série 2, 2023*: metadata at [Carta de Ocupacão do Solo Conjuntural](https://snig.dgterritorio.gov.pt/rndg/srv/api/records/e9d25fc4-5a25-4c5e-9bce-d470f745d89e).
 - **Buildings (vida)** — VIDA *Combined Open Buildings* (Google Open Buildings + Microsoft Global ML
   Buildings + OpenStreetMap), published as open data.
 - **NDVI (ndvi)** — Sentinel-2 imagery from the Copernicus Data Space:
@@ -79,21 +78,21 @@ works. To reproduce the demos, the underlying data is all public:
 
 ## Capabilities
 
-**Raster** — bespoke COG / BigTIFF reader (DEFLATE + LZW + horizontal/float predictor + YCbCr-JPEG +
+**Raster** : bespoke COG / BigTIFF reader (DEFLATE + LZW + horizontal/float predictor + YCbCr-JPEG +
 ZSTD + WEBP, overviews, mask/alpha, **8 dtypes lossless**), lazy/windowed open for huge files,
 warp/resample (nearest + bilinear), reprojection via libproj (incl. **polar UPS**), styling
 (RGB(A) passthrough + pseudocolor ramp), on-the-fly **band-math / NDVI**, **S3** cloud COGs,
 **multi-layer** YAML config.
 
-**Vector** — GeoJSON, **native GeoPackage** and **FlatGeoBuf** readers (bespoke WKB decoder,
+**Vector**:  GeoJSON, **native GeoPackage** and **FlatGeoBuf** readers (bespoke WKB decoder,
 `rusqlite` container, OGC R-tree **windowed reads**) → **tiny-skia** polygon / line / point
-rasterization, **SLD-first** styling (SLD 1.0 → a Style IR) + a point-label engine, per-zoom LOD
+rasterization, **SLD-first** styling (SLD 1.0 -> a Style IR) + a point-label engine, per-zoom LOD
 (shared-arc simplification), and offline **PMTiles** baking. Proven live on the Portuguese BUPi
 cadastre (**3.4 M parcels**) and the VIDA Iberia buildings (**14.9 M**).
 
-**Protocols** — WMS 1.1.1 / 1.3.0 (GetMap · GetCapabilities · GetFeatureInfo · GetLegendGraphic, incl.
+**Protocols**: WMS 1.1.1 / 1.3.0 (GetMap · GetCapabilities · GetFeatureInfo · GetLegendGraphic, incl.
 EPSG:4326 axis flip + exceptions), **WMTS 1.0.0** (KVP + RESTful), **OSGeo TMS 1.0.0**, and **MVT
-vector tiles** (bespoke protobuf encoder + TileJSON) — all over one engine. A raster viewer at
+vector tiles** (bespoke protobuf encoder + TileJSON), all over one engine. A raster viewer at
 `/viewer` and a cyan-on-black **"X-ray"** vector-tile inspector at `/xray`.
 
 ## CLI
@@ -154,13 +153,14 @@ constraint can't drift, because CI fails the moment a banned crate appears.
 - **I/O is the bottleneck, not the math.** Throughput is won in fetch scheduling + the tile cache, not
   micro-optimized arithmetic.
 - **GPU-capable, CPU-first.** `RenderBackend` stays batch-first so a `wgpu` backend is a port, not a rewrite.
-- **Correctness first** — validated against GDAL and PROJ as an *external* oracle (never linked):
+- **Correctness first** - validated against GDAL and PROJ as an *external* oracle (never linked):
   sub-pixel georegistration vs `gdalwarp`, exact point-values vs `gdallocationinfo`, plus OGC CITE.
 
 ## License
 
-**AGPL-3.0-or-later** — see [LICENSE](LICENSE). If you run a modified TerraServe as a network service,
-the AGPL requires you to offer your users the corresponding source. A commercial license is available
-from [TerraOps](https://terraops.org) for use that the AGPL doesn't fit.
+**MPL-2.0**  see [LICENSE](LICENSE). File-level copyleft: TerraServe can be used in a larger work
+under a license of your choice (including proprietary), but modifications to TerraServe's own source
+files stay under the MPL. This keeps the engine freely reusable — for example by the MIT-licensed
+[pygeoapi](https://pygeoapi.io) — while improvements to it come back to the project.
 
 © 2026 TerraOps. TerraServe™.

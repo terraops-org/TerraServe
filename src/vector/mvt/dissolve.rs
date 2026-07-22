@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
 //! `--mvt-dissolve` — on-the-fly per-tile same-class polygon dissolve by **edge-cancellation** on the

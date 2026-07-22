@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
 //! The vector Style IR + its JSON front-end (spec §9). The IR is the stable core; SLD (rung 7)
