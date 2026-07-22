@@ -40,13 +40,15 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: '2_28'
           args: --release --out dist
-          # The vendored PROJ build needs cmake + sqlite. AlmaLinux 8's cmake is 3.x, so no
-          # CMake-4 policy break here, but pin the minimum anyway for safety (see env below).
+          # The vendored PROJ build needs cmake + sqlite; proj-sys' bindgen needs libclang
+          # (clang-devel provides libclang.so in /usr/lib64, where clang-sys looks by default).
+          # AlmaLinux 8's cmake is 3.x, so no CMake-4 policy break, but pin the minimum anyway.
           before-script-linux: |
             (command -v cmake || yum install -y cmake || dnf install -y cmake)
-            (yum install -y sqlite-devel sqlite || dnf install -y sqlite-devel sqlite)
+            (yum install -y clang clang-devel sqlite-devel sqlite || dnf install -y clang clang-devel sqlite-devel sqlite)
         env:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+          LIBCLANG_PATH: /usr/lib64
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
