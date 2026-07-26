@@ -60,6 +60,11 @@ pub struct RenderArgs {
     /// Output PNG path.
     #[arg(long)]
     pub out: String,
+    /// The COG's own CRS, e.g. `EPSG:32629`. Optional and additive: when unset it defaults to the
+    /// sample grid `EPSG:3763`, so existing invocations are byte-for-byte unchanged. Set it to
+    /// render a source in any other projection (the `--bbox` window is still given in `--crs` units).
+    #[arg(long)]
+    pub src_crs: Option<String>,
 }
 
 /// `wms-handle` arguments — FROZEN.
@@ -94,7 +99,9 @@ pub fn run_render(args: &RenderArgs) -> Result<(), Error> {
         cog_path: &args.cog,
         bbox,
         crs: &args.crs,
-        src_crs: reproj::SRC_CRS,
+        // Optional --src-crs, defaulting to the sample grid EPSG:3763 so existing invocations are
+        // byte-for-byte unchanged; set it to render a source in any other projection.
+        src_crs: args.src_crs.as_deref().unwrap_or(reproj::SRC_CRS),
         width: args.width,
         height: args.height,
         resample,
@@ -118,6 +125,145 @@ fn parse_bbox(s: &str) -> Result<[f64; 4], Error> {
         return Err("--bbox needs exactly 4 comma-separated values".into());
     }
     Ok([parts[0], parts[1], parts[2], parts[3]])
+}
+
+#[cfg(test)]
+mod render_cli_tests {
+    use super::*;
+
+    const COG: &str = "../cogs/cascais.cog.deflate.tif";
+    const STYLE: &str = "fixtures/styles/rgb.json";
+    // A window known to hold real data, in the source CRS EPSG:3763 — the same window cog.rs renders
+    // in its lazy-vs-resident test, so it is guaranteed non-empty.
+    const W3763: [f64; 4] = [-112701.25, -106296.25, -112573.25, -106168.25];
+    const BBOX_3763: &str = "-112701.25,-106296.25,-112573.25,-106168.25";
+
+    // The COGs live in ../cogs and are NOT committed (too large), so CI runs without them. A test
+    // that needs one must self-skip when it is absent — mirrors cog.rs's cascais test.
+    fn cog_present(cog: &str) -> bool {
+        if std::path::Path::new(cog).exists() {
+            return true;
+        }
+        eprintln!("skipping: COG fixture {cog} absent");
+        false
+    }
+
+    // Render one 64×64 window through the CLI entry point and return the PNG bytes.
+    fn render_window(
+        cog: &str,
+        crs: &str,
+        bbox: &str,
+        src_crs: Option<&str>,
+        tag: &str,
+    ) -> Vec<u8> {
+        let out = std::env::temp_dir().join(format!("ts_render_srccrs_{tag}.png"));
+        let args = RenderArgs {
+            cog: cog.to_string(),
+            bbox: bbox.to_string(),
+            crs: crs.to_string(),
+            width: 64,
+            height: 64,
+            resample: "nearest".to_string(),
+            style: STYLE.to_string(),
+            out: out.to_string_lossy().into_owned(),
+            src_crs: src_crs.map(|s| s.to_string()),
+        };
+        run_render(&args).expect("render should succeed");
+        let bytes = std::fs::read(&out).expect("read rendered png");
+        let _ = std::fs::remove_file(&out);
+        bytes
+    }
+
+    #[test]
+    fn render_src_crs_defaults_to_the_sample_grid() {
+        // Omitting --src-crs must render exactly as passing the sample grid EPSG:3763 explicitly:
+        // the new optional flag preserves the frozen default behavior byte-for-byte.
+        if !cog_present(COG) {
+            return;
+        }
+        let default = render_window(COG, "EPSG:3763", BBOX_3763, None, "default");
+        let explicit = render_window(
+            COG,
+            "EPSG:3763",
+            BBOX_3763,
+            Some("EPSG:3763"),
+            "explicit3763",
+        );
+        assert_eq!(
+            default, explicit,
+            "explicit EPSG:3763 must match the omitted default"
+        );
+    }
+
+    #[test]
+    fn render_src_crs_is_actually_used() {
+        // Declaring a different source CRS must change the pixels, proving --src-crs threads through
+        // to the reprojection instead of being ignored. Treating the 3763 COG as 4326 maps the
+        // window off the data, so the correct render and the wrong one must differ.
+        if !cog_present(COG) {
+            return;
+        }
+        let correct = render_window(COG, "EPSG:3763", BBOX_3763, Some("EPSG:3763"), "correct");
+        let wrong = render_window(COG, "EPSG:3763", BBOX_3763, Some("EPSG:4326"), "wrong");
+        assert_ne!(
+            correct, wrong,
+            "a different --src-crs must produce different pixels"
+        );
+    }
+
+    #[test]
+    fn render_reprojects_a_non_standard_source_into_wgs84_and_web_mercator() {
+        // Cascais is EPSG:3763 (the Portuguese national grid), which is neither WGS84 nor Web
+        // Mercator. --src-crs must let render reproject that source INTO each standard CRS:
+        // declaring the true source CRS renders the scene, while declaring the wrong one (the output
+        // CRS itself, i.e. pretending the source is already in the output projection) maps the window
+        // off the data. The output window is the known 3763 data window reprojected into the target
+        // CRS, so the correct render is guaranteed to land on data and the two must differ.
+        if !cog_present(COG) {
+            return;
+        }
+        let [minx, miny, maxx, maxy] = W3763;
+        for out in ["EPSG:4326", "EPSG:3857"] {
+            let w = crate::reproj::crs_bounds("EPSG:3763", out, minx, miny, maxx, maxy)
+                .unwrap_or_else(|| panic!("reproject the 3763 window into {out}"));
+            let bbox = format!("{},{},{},{}", w[0], w[1], w[2], w[3]);
+            let epsg = &out[5..]; // "EPSG:4326" -> "4326", for a unique temp filename
+            let correct = render_window(COG, out, &bbox, Some("EPSG:3763"), &format!("{epsg}_ok"));
+            let wrong = render_window(COG, out, &bbox, Some(out), &format!("{epsg}_bad"));
+            assert_ne!(
+                correct, wrong,
+                "--src-crs must reproject 3763->{out}, not assume the source is already {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_src_crs_enables_a_utm_29n_source() {
+        // The flagship non-default-projection COG: a Sentinel-2 stack in EPSG:32629 (UTM 29N). It is
+        // not committed (~700 MB), so self-skip when it is absent — the same pattern the PRT .fgb
+        // test uses. Where present: an interior window rendered with the true --src-crs EPSG:32629
+        // lands on data (a fuller PNG), while declaring EPSG:3763 maps the window off the scene
+        // (near-empty). This is the real proof of the feature: --src-crs renders a source the old
+        // hardcoded EPSG:3763 default could never have handled.
+        const S2: &str = "../cogs/s2_stack.cog.tif";
+        if !cog_present(S2) {
+            return;
+        }
+        // An interior window of the 32629 extent (UL 600000,4200000 -> LR 700080,4099920).
+        let bbox = "620000,4120000,660000,4160000";
+        let correct = render_window(S2, "EPSG:32629", bbox, Some("EPSG:32629"), "s2_ok");
+        let wrong = render_window(S2, "EPSG:32629", bbox, Some("EPSG:3763"), "s2_bad");
+        assert_ne!(
+            correct, wrong,
+            "--src-crs EPSG:32629 must render the UTM source where EPSG:3763 cannot"
+        );
+        assert!(
+            correct.len() > wrong.len(),
+            "the correctly-projected render should carry data (larger PNG): {} vs {}",
+            correct.len(),
+            wrong.len()
+        );
+    }
 }
 
 /// Thin WMS wrapper. Parse the WMS KVP query; handle GetMap for **1.1.1 and 1.3.0**
@@ -1384,10 +1530,11 @@ fn build_vector_layer(
 /// build the shared-arc topology, print a report. No tiles, no storage, no serving.
 #[derive(Args)]
 pub struct BuildTopologyArgs {
-    /// Path to the vector coverage (.gpkg) to build shared-arc topology from.
+    /// Path to the vector coverage (.gpkg, .fgb or .geojson) to build shared-arc topology from.
     #[arg(long)]
     pub vector: String,
-    /// Optional layer name (GPKG); default = the source's auto-detected layer.
+    /// Optional layer name (GeoPackage only; ignored for a single-layer .fgb or .geojson); default =
+    /// the source's auto-detected layer.
     #[arg(long)]
     pub layer: Option<String>,
     /// Snap tolerance in source-CRS units. Fine default leaves a clean coverage untouched.
@@ -1439,6 +1586,45 @@ fn format_report(rep: &vector::topology::BuildReport) -> String {
     )
 }
 
+/// Load a coverage for `build-topology` as a `VectorSource`. A `.gpkg`/`.geojson` is read whole
+/// (`LoadAll`); a `.fgb` opens the windowed reader (`Windowed`) and the caller reads it across its
+/// full extent.
+fn load_topology_source(
+    path: &str,
+    layer: Option<&str>,
+) -> Result<vector::source::VectorSource, Error> {
+    if path.ends_with(".fgb") {
+        if layer.is_some() {
+            eprintln!(
+                "warning: --layer is ignored for a FlatGeoBuf source ({path}); it has a single layer"
+            );
+        }
+        // `.fgb` opens through `s3::AnySource` (local path or `s3://`), exactly as the serve path
+        // does, then wraps the windowed `FgbSource` as `VectorSource::Windowed`. The caller reads it
+        // across its full extent, so the whole coverage feeds the topology build.
+        let s3 = s3::S3Config::from_env();
+        let range = s3::AnySource::open(path, &s3).map_err(|e| format!("open {path}: {e}"))?;
+        let fgb = vector::fgb::FgbSource::open(range).map_err(|e| format!("fgb {path}: {e}"))?;
+        return Ok(vector::source::VectorSource::Windowed(std::sync::Arc::new(
+            fgb,
+        )));
+    }
+    if path.ends_with(".geojson") || path.ends_with(".json") {
+        if layer.is_some() {
+            eprintln!("warning: --layer is ignored for a GeoJSON source ({path})");
+        }
+        // GeoJSON is a whole-file read (no spatial index), so LoadAll like a `.gpkg`.
+        let src = vector::geojson::GeoJsonSource::load(path)?;
+        return Ok(vector::source::VectorSource::LoadAll(std::sync::Arc::new(
+            src,
+        )));
+    }
+    let src = vector::gpkg::GpkgSource::load(path, layer)?;
+    Ok(vector::source::VectorSource::LoadAll(std::sync::Arc::new(
+        src,
+    )))
+}
+
 /// Load a vector coverage, build its shared-arc topology, and print the diagnostic report.
 /// No tiles, no storage, no serving — SP1 is unwired to serving by design.
 pub fn run_build_topology(args: &BuildTopologyArgs) -> Result<(), Error> {
@@ -1446,12 +1632,10 @@ pub fn run_build_topology(args: &BuildTopologyArgs) -> Result<(), Error> {
     // `validate_tolerance` and `GpkgSource::load` `Result<_, String>`s directly (same as `run_serve`
     // line ~625).
     validate_tolerance(args.snap_tolerance)?;
-    let src = vector::gpkg::GpkgSource::load(&args.vector, args.layer.as_deref())?;
-    // Reads through the `VectorSource` seam (windowed-seam refactor): `src` isn't used again after
-    // this function's two whole-file reads, so it's moved into the wrapper once and read via
-    // `full_extent()` both times (LoadAll ignores the bbox arg; behavior-identical to the old direct
-    // `.features()` calls).
-    let vs = vector::source::VectorSource::LoadAll(std::sync::Arc::new(src));
+    // `.gpkg`/`.geojson` load whole (LoadAll); a `.fgb` opens the windowed reader (Windowed). Either
+    // way `vs` is read via `full_extent()` below (LoadAll ignores the bbox; Windowed queries the
+    // whole R-tree), so the topology build sees every feature.
+    let vs = load_topology_source(&args.vector, args.layer.as_deref())?;
     let (topo, rep) = vector::topology::build_topology(
         vs.features_in(vs.full_extent()).as_slice(),
         args.snap_tolerance,
@@ -1518,6 +1702,52 @@ mod build_topology_cli_tests {
     #[test]
     fn validate_tolerance_accepts_positive() {
         assert!(validate_tolerance(0.01).is_ok());
+    }
+
+    #[test]
+    fn load_topology_source_dispatches_by_extension() {
+        use crate::vector::source::VectorSource;
+        // A `.gpkg` reads whole; a `.fgb` opens the windowed reader; a `.geojson` reads whole.
+        let g = load_topology_source("fixtures/gpkg/mini.gpkg", None).expect("load gpkg");
+        assert!(matches!(g, VectorSource::LoadAll(_)), "gpkg → LoadAll");
+        let f = load_topology_source("fixtures/fgb/hole.fgb", None).expect("load fgb");
+        assert!(matches!(f, VectorSource::Windowed(_)), "fgb → Windowed");
+        let j = load_topology_source("fixtures/fgb/hole.geojson", None).expect("load geojson");
+        assert!(matches!(j, VectorSource::LoadAll(_)), "geojson → LoadAll");
+    }
+
+    #[test]
+    fn build_topology_reads_a_flatgeobuf_coverage() {
+        // hole.fgb is one polygon: a 10×10 square exterior ring with a 4×4 square hole cut out —
+        // so 1 feature and 2 rings. Building topology over the FlatGeoBuf's full extent must see
+        // both rings and produce at least one arc (proving features were actually decoded, not an
+        // empty read behind a 200).
+        let vs = load_topology_source("fixtures/fgb/hole.fgb", None).expect("load fgb");
+        let feats = vs.features_in(vs.full_extent());
+        let (_topo, rep) = crate::vector::topology::build_topology(feats.as_slice(), 0.01);
+        assert_eq!(rep.features_in, 1, "one polygon feature");
+        assert_eq!(rep.rings_in, 2, "exterior + hole");
+        assert!(
+            rep.arcs >= 1,
+            "topology built at least one arc, got {}",
+            rep.arcs
+        );
+    }
+
+    #[test]
+    fn build_topology_reads_a_geojson_coverage() {
+        // hole.geojson is the same donut as hole.fgb: one polygon, exterior + hole = 2 rings. The
+        // GeoJSON path must build the identical topology (1 feature / 2 rings / >=1 arc).
+        let vs = load_topology_source("fixtures/fgb/hole.geojson", None).expect("load geojson");
+        let feats = vs.features_in(vs.full_extent());
+        let (_topo, rep) = crate::vector::topology::build_topology(feats.as_slice(), 0.01);
+        assert_eq!(rep.features_in, 1, "one polygon feature");
+        assert_eq!(rep.rings_in, 2, "exterior + hole");
+        assert!(
+            rep.arcs >= 1,
+            "topology built at least one arc, got {}",
+            rep.arcs
+        );
     }
 }
 

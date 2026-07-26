@@ -100,13 +100,21 @@ at `/viewer` and a cyan-on-black **"X-ray"** vector-tile inspector at `/xray`.
 ## CLI
 
 ```bash
-# render one raster window to a PNG (the engine core, no server)
-terraserve render --cog ortho.cog.tif --bbox minx,miny,maxx,maxy --crs EPSG:3857 \
-  --width 512 --height 512 --resample bilinear --style fixtures/styles/rgb.json --out out.png
+# render a window of the Cascais orthophoto to a PNG (the engine core, no server).
+# --src-crs is the source projection (native EPSG:3763); the window reprojects into --crs.
+terraserve render --cog cascais.cog.deflate.tif --bbox -9.45,38.68,-9.38,38.72 \
+  --crs EPSG:4326 --src-crs EPSG:3763 --width 512 --height 512 --resample bilinear \
+  --style fixtures/styles/rgb.json --out cascais.png
 
 # native GeoPackage vector over WMS + MVT (auto-detects the layer CRS)
 terraserve serve --vector data.gpkg --vec-style fixtures/styles/cos2023.sld \
   --name mylayer --host 0.0.0.0 --port 8080
+
+# vector tiles on a non-Mercator national grid: the Swiss LV95 grid (EPSG:2056),
+# an OGC TileMatrixSet 2.0 JSON, served native 2056 with no reprojection to Web Mercator
+terraserve serve --vector roads.fgb --vec-style roads.style.json --src-crs EPSG:2056 \
+  --tms-grid fixtures/grids/swissLV95.json --name ch_roads --port 8080
+# tiles at /mvt/ch_roads/swissLV95/{z}/{x}/{y}.pbf
 
 # on-the-fly NDVI band-math from a Sentinel-2 COG
 terraserve serve --cog s2_stack.cog.tif --style fixtures/styles/ndvi.json --src-crs EPSG:32629 \
@@ -114,6 +122,9 @@ terraserve serve --cog s2_stack.cog.tif --style fixtures/styles/ndvi.json --src-
 
 # many layers from one process
 terraserve serve --config fixtures/layers.example.yaml --port 8080
+
+# report a coverage's shared-border topology (diagnostic, no tiles; .gpkg, .fgb or .geojson)
+terraserve build-topology --vector coverage.fgb --verify
 ```
 
 Full flag reference, the multi-layer YAML, and the **pitfalls** worth knowing before you deploy are at
@@ -128,6 +139,27 @@ reads, warp/resample kernels, WKB/GeoPackage decoder, spatial-index traversal, s
 protocol layer are all bespoke. Only codec and infra crates (flate2 / zstd / weezl / zune-jpeg / png,
 bundled `rusqlite`, tiny-skia) and the `proj` FFI (coordinate transforms only) are leaned on. The
 constraint can't drift, because CI fails the moment a banned crate appears.
+
+## Rendering
+
+Vector geometry (polygon fills, line strokes, point markers) is rasterized with **tiny-skia**, a
+pure-Rust port of Skia's rasterizer, the 2D engine behind Chrome, Android and Flutter. That buys
+production-grade, sub-pixel anti-aliasing with no C++ graphics dependency: no AGG, no cairo, no Skia
+over FFI. It is one of the few Rust-native infra crates the clean-room gate allows (it bans dataset
+readers, not a rasterizer), and it lives in a single file, `src/vector/raster.rs`.
+
+The raster path stays separate: Cloud-Optimized GeoTIFFs run through TerraServe's own decode, warp,
+resample and colorize kernels, so tiny-skia is only ever asked to draw vectors, the right rasterizer
+for each job.
+
+## Vector tiles
+
+The tile formats are written from scratch. Vector tiles (MVT) come out of a hand-rolled protobuf
+encoder, LEB128 varints, field tags and zigzag-delta geometry commands (`vector/mvt/wire.rs` +
+`geom.rs`), with tile clipping, simplification and same-class dissolve layered on top. PMTiles has its
+own reader and writer as well. There is no `prost`, no protobuf crate, no MVT or PMTiles library
+anywhere: the banned-crate gate forbids precisely those off-the-shelf tile readers, so the tile format
+is bespoke by design.
 
 ## Architecture (`src/`)
 
