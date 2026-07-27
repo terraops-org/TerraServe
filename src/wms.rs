@@ -1943,8 +1943,8 @@ mod tests {
             index_cache: crate::cache::new_index_cache(crate::cache::index_cache_bytes()),
             grids: Vec::new(),
             vector: None,
-            pmtiles: None,
-            overlay: None,
+            pmtiles: std::collections::BTreeMap::new(),
+            overlay: std::collections::BTreeMap::new(),
         }
     }
 

@@ -63,11 +63,57 @@ impl Projector {
     }
 
     /// Map (lon, lat) in the source CRS to an output pixel (x right, y down). `None` if the
-    /// transform fails; on-canvas checks are the caller's job (viewport-global culling).
+    /// transform fails, OR if it "succeeds" but yields a non-finite coordinate — the case an
+    /// INTERRUPTED projection (e.g. `+proj=igh`, Goode Homolosine) can produce for a vertex that
+    /// falls in a lobe gap: libproj doesn't always set an error code for a degenerate result, so the
+    /// finiteness has to be checked explicitly here rather than relying on `to_source`'s `Option`
+    /// alone. Without this, a NaN/inf `f32` silently saturates to `0` on the later cast to `i32`
+    /// (Rust's float→int cast is saturating, not panicking) — a garbage in-bounds tile coordinate,
+    /// not an obviously-wrong one. On-canvas checks are the caller's job (viewport-global culling).
     pub fn to_pixel(&self, lon: f64, lat: f64) -> Option<(f32, f32)> {
         let (gx, gy) = self.t.to_source(lon, lat)?;
         let px = ((gx - self.minx) / self.dx) as f32;
         let py = ((self.maxy - gy) / self.dy) as f32;
+        if !px.is_finite() || !py.is_finite() {
+            return None;
+        }
         Some((px, py))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Projector;
+
+    /// A vertex whose transform "succeeds" (no PROJ error — e.g. `to_source` returns a value at all)
+    /// but whose numeric result is non-finite must be DROPPED (`None`), never cast to a garbage
+    /// integer downstream. This is exactly what an interrupted projection (`+proj=igh`) can hand back
+    /// for a vertex that falls in a lobe gap. A NaN/inf INPUT through the identity transformer (no
+    /// libproj involved — src_crs == grid_crs) reaches the identical `to_pixel` arithmetic a real
+    /// non-finite `to_source` output would, so this isolates the exact guard without depending on
+    /// finding a live PROJ edge case (verified empirically: this system's libproj 9.6.0 does not
+    /// produce a non-finite `+proj=igh` forward transform anywhere on a 1° world grid).
+    #[test]
+    fn nan_safe_to_pixel_drops_non_finite_result() {
+        let proj =
+            Projector::new("EPSG:3857", "EPSG:3857", [0.0, 0.0, 100.0, 100.0], 256, 256).unwrap();
+        assert!(
+            proj.to_pixel(f64::NAN, 50.0).is_none(),
+            "non-finite x must be dropped, not cast to a garbage int"
+        );
+        assert!(
+            proj.to_pixel(50.0, f64::NAN).is_none(),
+            "non-finite y must be dropped"
+        );
+        assert!(
+            proj.to_pixel(f64::INFINITY, 50.0).is_none(),
+            "infinite x must be dropped"
+        );
+        assert!(
+            proj.to_pixel(50.0, f64::NEG_INFINITY).is_none(),
+            "infinite y must be dropped"
+        );
+        // Sanity: a normal finite vertex still round-trips (no regression on the default path).
+        assert!(proj.to_pixel(50.0, 50.0).is_some());
     }
 }

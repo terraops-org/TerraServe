@@ -290,11 +290,17 @@ impl Style {
     /// emit without an XML prolog, and an XML document saved under a non-`.sld` extension.
     pub fn load(path: &str) -> Result<Style, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        if path.ends_with(".sld") || looks_like_sld(&text) {
-            let doc = crate::sld::parse(&text).map_err(|e| format!("{path}: {}", e.0))?;
+        Self::parse(path, &text)
+    }
+
+    /// Build a Style from already-fetched text. `path` is used ONLY for the `.sld` extension hint
+    /// and error messages (so an s3:// URL ending in `.sld` still routes to the SLD parser).
+    pub fn parse(path: &str, text: &str) -> Result<Style, String> {
+        if path.ends_with(".sld") || looks_like_sld(text) {
+            let doc = crate::sld::parse(text).map_err(|e| format!("{path}: {}", e.0))?;
             crate::vector::sld_lower::lower(doc).map_err(|e| format!("{path}: {e}"))
         } else {
-            Style::from_json_str(&text).map_err(|e| format!("{path}: {e}"))
+            Style::from_json_str(text).map_err(|e| format!("{path}: {e}"))
         }
     }
 

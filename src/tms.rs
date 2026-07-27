@@ -214,6 +214,143 @@ impl TileMatrixSet {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct OgcTms {
+    id: String,
+    crs: String,
+    #[serde(rename = "tileMatrices")]
+    tile_matrices: Vec<OgcTileMatrix>,
+}
+
+#[derive(serde::Deserialize)]
+struct OgcTileMatrix {
+    #[serde(rename = "cellSize")]
+    cell_size: Option<f64>,
+    #[serde(rename = "scaleDenominator")]
+    scale_denominator: Option<f64>,
+    #[serde(rename = "pointOfOrigin")]
+    point_of_origin: [f64; 2],
+    #[serde(rename = "tileWidth")]
+    tile_width: u32,
+    #[serde(rename = "tileHeight")]
+    tile_height: u32,
+    #[serde(rename = "matrixWidth")]
+    matrix_width: u32,
+    #[serde(rename = "matrixHeight")]
+    matrix_height: u32,
+}
+
+/// Normalize an OGC CRS identifier (URI/URN/shortcode) to what libproj + the rest of the
+/// engine use. A bare proj string / WKT passes through untouched.
+fn normalize_crs(crs: &str) -> String {
+    // http://www.opengis.net/def/crs/EPSG/0/2056  ->  EPSG:2056
+    if let Some(rest) = crs.rsplit("/def/crs/").next().filter(|r| *r != crs) {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 3 {
+            let (auth, code) = (parts[0].to_uppercase(), parts[2]);
+            if auth == "OGC" && code.eq_ignore_ascii_case("CRS84") {
+                return "CRS:84".to_string();
+            }
+            return format!("{auth}:{code}");
+        }
+    }
+    crs.to_string()
+}
+
+/// Parse an OGC TileMatrixSet 2.0 JSON document into a `TileMatrixSet`.
+pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
+    let doc: OgcTms = serde_json::from_str(json).map_err(|e| format!("OGC TMS JSON: {e}"))?;
+    if doc.tile_matrices.is_empty() {
+        return Err("OGC TMS JSON: tileMatrices is empty".into());
+    }
+    let crs = normalize_crs(&doc.crs);
+    let mpu = meters_per_unit(&crs);
+    // OGC origin is shared across levels (single pointOfOrigin per matrix; take level 0's).
+    let origin = doc.tile_matrices[0].point_of_origin;
+    let tile_w = doc.tile_matrices[0].tile_width;
+    let tile_h = doc.tile_matrices[0].tile_height;
+    let levels = doc
+        .tile_matrices
+        .iter()
+        .enumerate()
+        .map(|(z, m)| {
+            // resolution (CRS units / px): cellSize if present, else scaleDenominator * 0.28mm / mpu.
+            let resolution = m
+                .cell_size
+                .or_else(|| m.scale_denominator.map(|sd| sd * 0.00028 / mpu))
+                .ok_or("OGC TMS JSON: tileMatrix needs cellSize or scaleDenominator")?;
+            Ok(TmLevel {
+                z: z as u32,
+                resolution,
+                matrix_w: m.matrix_width.max(1),
+                matrix_h: m.matrix_height.max(1),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(TileMatrixSet {
+        id: doc.id,
+        crs,
+        origin_x: origin[0],
+        origin_y: origin[1],
+        tile_w,
+        tile_h,
+        levels,
+    })
+}
+
+/// Inverse of `normalize_crs`'s URI shortcut: `EPSG:<n>` → the OGC CRS URI form. Everything else
+/// (a `CRS:84` shortcode, a proj string, WKT) passes through untouched — `from_ogc_json`'s
+/// `normalize_crs` only rewrites the `/def/crs/` URI shape, so a non-EPSG string already round-trips.
+fn to_ogc_crs_uri(crs: &str) -> String {
+    let trimmed = crs.trim();
+    if let Some(code) = trimmed
+        .strip_prefix("EPSG:")
+        .or_else(|| trimmed.strip_prefix("epsg:"))
+    {
+        if !code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) {
+            return format!("http://www.opengis.net/def/crs/EPSG/0/{code}");
+        }
+    }
+    trimmed.to_string()
+}
+
+/// `to_ogc_json`'s body, as a `serde_json::Value` — `pub(crate)` so `tms_http`'s `/tileMatrixSets/{id}`
+/// handler can inject the non-standard `"proj4"` convenience field without a stringify/reparse
+/// round-trip. Mirrors `from_ogc_json`'s field mapping in reverse: `id`=z (as a string, per the OGC
+/// schema), `cellSize`=resolution, `pointOfOrigin`=`[origin_x, origin_y]` (the ORIGIN IS SHARED across
+/// levels in this model — `from_ogc_json` takes it from level 0 only, so emitting it on every level
+/// is what makes the round-trip exact), `tileWidth`/`tileHeight`/`matrixWidth`/`matrixHeight` verbatim.
+pub(crate) fn to_ogc_value(tms: &TileMatrixSet) -> serde_json::Value {
+    let tile_matrices: Vec<serde_json::Value> = tms
+        .levels
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "id": l.z.to_string(),
+                "cellSize": l.resolution,
+                "pointOfOrigin": [tms.origin_x, tms.origin_y],
+                "tileWidth": tms.tile_w,
+                "tileHeight": tms.tile_h,
+                "matrixWidth": l.matrix_w,
+                "matrixHeight": l.matrix_h,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": tms.id,
+        "crs": to_ogc_crs_uri(&tms.crs),
+        "tileMatrices": tile_matrices,
+    })
+}
+
+/// Serialize a `TileMatrixSet` to OGC TileMatrixSet 2.0 JSON — the inverse of `from_ogc_json`
+/// (round-trips id/crs/origin/tile-size/levels; see the `tms.rs` test module). Served at
+/// `GET /tileMatrixSets/{id}` (`tms_http::tile_matrix_set_doc`) so a client (the X-ray viewer, Task 3)
+/// can read any published grid's CRS + tile geometry without hardcoding it.
+pub fn to_ogc_json(tms: &TileMatrixSet) -> String {
+    serde_json::to_string(&to_ogc_value(tms)).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Resolve a well-known preset id → a `TileMatrixSet`. An id may carry an explicit `_{tile_px}`
 /// size suffix (`WebMercatorQuad_256`) which overrides the `tile_px` argument (R3: lets one config
 /// entry pin its size, and lets a URL request the un-suffixed base name). Returns `None` for an
@@ -366,5 +503,104 @@ fn build_quad(
         tile_w: tile_px,
         tile_h: tile_px,
         levels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn from_ogc_json_cellsize_and_scaledenominator() {
+        // Minimal OGC TMS 2.0: two levels, one via cellSize, one via scaleDenominator.
+        let json = r#"{
+          "id": "TestQuad",
+          "crs": "http://www.opengis.net/def/crs/EPSG/0/2056",
+          "tileMatrices": [
+            { "id": "0", "cellSize": 4000.0, "pointOfOrigin": [2420000.0, 1350000.0],
+              "tileWidth": 256, "tileHeight": 256, "matrixWidth": 1, "matrixHeight": 1 },
+            { "id": "1", "scaleDenominator": 7142857.142857143, "pointOfOrigin": [2420000.0, 1350000.0],
+              "tileWidth": 256, "tileHeight": 256, "matrixWidth": 2, "matrixHeight": 1 }
+          ]
+        }"#;
+        let tms = super::from_ogc_json(json).expect("parse");
+        assert_eq!(tms.id, "TestQuad");
+        assert_eq!(tms.crs, "EPSG:2056"); // OGC CRS URI normalized to shortcode
+        assert_eq!(tms.tile_w, 256);
+        assert_eq!(tms.levels.len(), 2);
+        assert_eq!(tms.levels[0].z, 0);
+        assert!((tms.levels[0].resolution - 4000.0).abs() < 1e-6); // cellSize path
+        // scaleDenominator 7142857.14 * 0.00028 / meters_per_unit(EPSG:2056=1.0) = 2000.0
+        assert!((tms.levels[1].resolution - 2000.0).abs() < 1e-3);
+        assert_eq!(tms.origin_x, 2420000.0);
+        assert_eq!(tms.origin_y, 1350000.0);
+    }
+
+    #[test]
+    fn from_ogc_json_rejects_missing_tilematrices() {
+        let json = r#"{ "id": "X", "crs": "EPSG:2056", "tileMatrices": [] }"#;
+        assert!(super::from_ogc_json(json).is_err());
+    }
+
+    /// Task 2, Step 1: `to_ogc_json` is the INVERSE of `from_ogc_json` — the `WorldCRS84Quad` preset
+    /// serialized then parsed back yields an identical `TileMatrixSet` (id/crs/origin/tile/levels).
+    #[test]
+    fn to_ogc_json_round_trips_world_crs84_quad() {
+        let original = super::TileMatrixSet::world_crs84_quad(256);
+        let json = super::to_ogc_json(&original);
+        let round = super::from_ogc_json(&json).expect("to_ogc_json output must parse");
+
+        assert_eq!(round.id, original.id);
+        assert_eq!(round.crs, original.crs); // "EPSG:4326" -> OGC URI -> normalized back to "EPSG:4326"
+        assert_eq!(round.origin_x, original.origin_x);
+        assert_eq!(round.origin_y, original.origin_y);
+        assert_eq!(round.tile_w, original.tile_w);
+        assert_eq!(round.tile_h, original.tile_h);
+        assert_eq!(round.levels.len(), original.levels.len());
+        for (a, b) in original.levels.iter().zip(round.levels.iter()) {
+            assert_eq!(a.z, b.z);
+            assert!(
+                (a.resolution - b.resolution).abs() < 1e-9,
+                "resolution drift at z={}: {} vs {}",
+                a.z,
+                a.resolution,
+                b.resolution
+            );
+            assert_eq!(a.matrix_w, b.matrix_w);
+            assert_eq!(a.matrix_h, b.matrix_h);
+        }
+    }
+
+    /// The OGC `crs` field is the EPSG URI form when the id is `EPSG:<n>` (mirrors
+    /// `normalize_crs`'s inverse mapping) — verified directly on the JSON text, not just via the
+    /// round-trip (which would also pass if both sides silently agreed on a non-standard form).
+    #[test]
+    fn to_ogc_json_emits_the_epsg_uri_form_of_crs() {
+        let tms = super::TileMatrixSet::web_mercator_quad(256);
+        let json = super::to_ogc_json(&tms);
+        assert!(
+            json.contains("http://www.opengis.net/def/crs/EPSG/0/3857"),
+            "expected the OGC CRS URI in: {json}"
+        );
+    }
+
+    /// Task 5, Step 1: the Swiss LV95 fixture (`fixtures/grids/swissLV95.json`, the swisstopo
+    /// 27-level resolution ladder over the official CH extent) round-trips through `from_ogc_json`.
+    #[test]
+    fn from_ogc_json_round_trips_the_swiss_lv95_fixture() {
+        let json = std::fs::read_to_string("fixtures/grids/swissLV95.json")
+            .expect("fixture file readable");
+        let tms = super::from_ogc_json(&json).expect("swissLV95.json parses");
+        assert_eq!(tms.id, "swissLV95");
+        assert_eq!(tms.crs, "EPSG:2056"); // OGC CRS URI normalized to shortcode
+        assert_eq!(tms.origin_x, 2420000.0);
+        assert_eq!(tms.origin_y, 1350000.0);
+        assert_eq!(tms.tile_w, 256);
+        assert_eq!(tms.tile_h, 256);
+        assert_eq!(tms.levels.len(), 27);
+        assert!((tms.levels[0].resolution - 4000.0).abs() < 1e-9);
+        assert_eq!(tms.levels[0].matrix_w, 1);
+        assert_eq!(tms.levels[0].matrix_h, 1);
+        assert!((tms.levels[26].resolution - 0.5).abs() < 1e-9);
+        assert_eq!(tms.levels[26].matrix_w, 3750);
+        assert_eq!(tms.levels[26].matrix_h, 2500);
     }
 }

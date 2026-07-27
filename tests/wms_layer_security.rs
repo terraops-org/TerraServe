@@ -41,8 +41,8 @@ fn layer_named(name: &str) -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 
@@ -136,8 +136,8 @@ fn capabilities_native_crs_token_is_escaped() {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }];
     let r = terraserve::wms::handle_layers(
         &layers,

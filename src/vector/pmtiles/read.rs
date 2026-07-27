@@ -81,6 +81,19 @@ impl PmtilesReader {
         &self.metadata
     }
 
+    /// The `grid_id` this archive was baked on, read from its metadata JSON (design commitment 2).
+    /// Absent (a legacy archive baked before generic grids, e.g. the existing cos2023/vida ones) ⇒
+    /// `WebMercatorQuad` — the only grid `build-pmtiles` could produce then.
+    pub fn grid_id(&self) -> String {
+        serde_json::from_str::<serde_json::Value>(&self.metadata)
+            .ok()
+            .and_then(|v| {
+                v.get("grid_id")
+                    .and_then(|g| g.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "WebMercatorQuad".to_string())
+    }
+
     /// Decompressed MVT bytes for (z,x,y), or None on a miss.
     pub fn get(&self, z: u32, x: u32, y: u32) -> PmResult<Option<Vec<u8>>> {
         if z > 26 {

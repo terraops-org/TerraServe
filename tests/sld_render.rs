@@ -36,8 +36,8 @@ fn sld_vector_layer() -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 

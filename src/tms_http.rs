@@ -64,6 +64,13 @@ fn pick_grid<'a>(layer: &'a Layer, grid_id: &Option<String>) -> Option<&'a Publi
 pub fn tilemapservice_xml(state: &ServeState, root: &str) -> String {
     let mut maps = String::new();
     for layer in &state.layers {
+        // A vector (label) layer serves no RASTER tiles — `render_tms_tile` gates on `layer.cog`
+        // and 400s unconditionally, even when the layer publishes tile grids (the MVT/WMTS-MVT
+        // path). Skip it so the TMS root never advertises an always-400 <TileMap> href; it is
+        // discovered instead via the `/mvt` route + TileJSON.
+        if layer.vector.is_some() {
+            continue;
+        }
         for g in &layer.grids {
             maps.push_str(&format!(
                 "    <TileMap title=\"{n}\" srs=\"{crs}\" profile=\"{prof}\" href=\"{root}/{n}@{gid}\"/>\n",
@@ -191,16 +198,66 @@ pub fn render_tms_tile(
     TileFactory::render_tile(&req).map_err(|e| (500u16, e))
 }
 
-/// proj4 definition for the CRSs the built-in viewer needs (OpenLayers ships 3857/4326; the polar
-/// stereographic CRSs must be registered). `None` ⇒ rely on OL's built-in (or the viewer can't
-/// project a truly custom CRS — a convenience-viewer limitation, not a service one).
-fn proj4_def(crs: &str) -> Option<&'static str> {
+/// `GET /tileMatrixSets/{id}` — OGC TileMatrixSet 2.0 JSON for a published grid (Task 2; the first
+/// foothold of OGC API - Tiles, so a client can read a grid's CRS + tile geometry without hardcoding
+/// it — the X-ray viewer, Task 3, is the first consumer). Resolved against the UNION of every layer's
+/// `grids`, not one layer — a grid published anywhere is servable here without the caller knowing
+/// which layer(s) publish it. Same asymmetric match rule as the tile routes (`pick_grid` above,
+/// `mvt_http::resolve_grid`, `wmts::get_tile`): exact id, OR the STORED id's `_{px}` size suffix
+/// stripped against the raw (unstripped) request id. A published/custom grid always wins first.
+/// When no layer publishes a match, falls back to the same 4 built-in presets the MVT/WMTS-MVT
+/// routes serve (`mvt_http::resolve_grid`, `wmts::get_tile_mvt`), but advertised at the STANDARD
+/// `tile_px = 256` — the served tile bboxes are byte-identical (tile geometry is `tile_w`-invariant;
+/// see the inline note at the fallback) while the advertised `cellSize`/`tileWidth` stay the
+/// well-known WebMercatorQuad values a 256-based client expects. A vector layer with an empty `grids` list (the
+/// common case — `fixtures/fgb/multi.yaml`, `fixtures/cite/*.yaml`, the live cos2023/vida deploy
+/// configs) still serves `WebMercatorQuad`/etc. MVT tiles purely via that preset fallback, so this
+/// endpoint must resolve the same ids or it 404s on a grid the layer actually serves. `Err((404,_))`
+/// only when neither a published grid nor a preset matches. Injects a non-standard top-level
+/// `"proj4"` convenience field (`reproj::crs_to_proj4`) alongside the canonical OGC body — `null`
+/// when libproj can't resolve the CRS, never an error (the OGC document itself is still valid
+/// without it).
+pub fn tile_matrix_set_doc(state: &ServeState, id: &str) -> Result<String, (u16, String)> {
+    let published = state
+        .layers
+        .iter()
+        .flat_map(|l| l.grids.iter())
+        .find(|g| g.tms.id == id || strip_size_suffix(&g.tms.id) == id)
+        .map(|g| g.tms.clone());
+    // Advertise the STANDARD 256-px quad (not the route's internal 4096). Tile GEOMETRY is
+    // `tile_w`-invariant — `span = tile_w · resolution`, and `build_quad` sets `resolution =
+    // base_span / tile_px`, so `preset(id, 256)` and `mvt_http::resolve_grid`'s `preset(id, 4096)`
+    // yield byte-identical tile bboxes for every (z,x,y). What `tile_px` DOES change is the
+    // advertised `cellSize`/`tileWidth`, which a client uses to pick a zoom: a 4096 tileWidth makes
+    // z0 cellSize 16x finer (9784 vs the canonical 156543 m/px) and shifts an OpenLayers/OGC
+    // client's tile selection 4 levels coarser (log2(4096/256)) — clamping the viewer's startup to
+    // the whole-world z0 tile. 256 is the well-known WebMercatorQuad definition and the resolution
+    // a 256-based View expects; the MVT encoder is unaffected (it uses a fixed 4096-unit EXTENT,
+    // `vector::mvt::tile::EXTENT`, independent of the grid's tile_w).
+    let tms = published
+        .or_else(|| crate::tms::preset(id, 256))
+        .ok_or((404u16, format!("no TileMatrixSet '{id}'")))?;
+    let mut value = crate::tms::to_ogc_value(&tms);
+    let proj4 = crate::reproj::crs_to_proj4(&tms.crs);
+    value["proj4"] = match proj4 {
+        Some(p) => serde_json::Value::String(p),
+        None => serde_json::Value::Null,
+    };
+    serde_json::to_string(&value).map_err(|e| (500u16, format!("internal: {e}")))
+}
+
+/// proj4 definition for the CRS the built-in viewer needs. The 4 polar stereographic CRSs are
+/// hardcoded first — keeps the polar `/viewer` byte-identical to before — else falls back to
+/// `reproj::crs_to_proj4`, a general libproj export that covers any CRS PROJ knows (e.g. LV95 /
+/// EPSG:2056). `None` ⇒ rely on OL's built-in (or the viewer can't project a truly custom CRS —
+/// a convenience-viewer limitation, not a service one).
+fn proj4_def(crs: &str) -> Option<String> {
     match crs.to_ascii_uppercase().as_str() {
-        "EPSG:3413" => Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:3031" => Some("+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:5041" => Some("+proj=stere +lat_0=90 +lat_ts=90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:5042" => Some("+proj=stere +lat_0=-90 +lat_ts=-90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs"),
-        _ => None,
+        "EPSG:3413" => Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:3031" => Some("+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:5041" => Some("+proj=stere +lat_0=90 +lat_ts=90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:5042" => Some("+proj=stere +lat_0=-90 +lat_ts=-90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs".to_string()),
+        _ => crate::reproj::crs_to_proj4(crs),
     }
 }
 
@@ -216,7 +273,7 @@ fn vector_viewer_html(base_url: &str, layer: &crate::server::Layer) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
-<title>TerraServe — {name} (vector)</title>
+<title>TerraServe · {name} (vector)</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}
@@ -286,7 +343,7 @@ pub fn viewer_html(state: &ServeState) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
-<title>TerraServe — {name} ({gid})</title>
+<title>TerraServe · {name} ({gid})</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}

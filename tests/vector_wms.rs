@@ -1,7 +1,8 @@
 //! Integration: the WMS surface serving a vector (label) layer.
 
 use std::sync::Arc;
-use terraserve::server::{Layer, VectorLayer};
+use terraserve::server::{Layer, PublishedGrid, VectorLayer};
+use terraserve::tms::TileMatrixSet;
 use terraserve::vector::geojson::GeoJsonSource;
 use terraserve::vector::shape::Shaper;
 use terraserve::vector::source::{FeatureSource, VectorSource};
@@ -34,9 +35,22 @@ fn vector_layer() -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
+}
+
+/// Like `vector_layer()`, but with a non-empty `grids` — the shape a vector layer has since Task 2
+/// gave the MVT/WMTS-MVT path published grids. A vector layer still serves no RASTER tiles, so it
+/// must stay excluded from the raster WMTS/TMS Contents regardless of `grids` (regression guard for
+/// the always-400 raster-tile-endpoint bug).
+fn vector_layer_with_grid() -> Layer {
+    let mut l = vector_layer();
+    l.grids = vec![PublishedGrid {
+        tms: TileMatrixSet::web_mercator_quad(256),
+        data_bounds: None,
+    }];
+    l
 }
 
 const EUROPE_3857: &str =
@@ -90,5 +104,35 @@ fn wmts_capabilities_omits_grid_less_vector_layer() {
     assert!(
         !xml.contains("<Layer>"),
         "vector layer must not appear as a WMTS <Layer>"
+    );
+}
+
+#[test]
+fn wmts_capabilities_omits_vector_layer_even_with_grids() {
+    // Regression: Task 2 gave vector layers non-empty `grids` (for the MVT/WMTS-MVT path). The
+    // WMTS Contents guard used to be `grids.is_empty()` only, so a vector layer WITH a grid slipped
+    // through and got listed with a raster `.png` <ResourceURL> — but `get_tile` gates on `l.cog`
+    // and 400s for every vector layer, so that was an advertised, always-400 raster tile endpoint.
+    let state =
+        terraserve::server::ServeState::new(vec![vector_layer_with_grid()], "http://h".into(), 4);
+    let xml = terraserve::wmts::capabilities_xml(&state, "http://h/wmts", "http://h/wmts/1.0.0");
+    assert!(
+        !xml.contains("<Layer>"),
+        "vector layer with grids must not appear as a WMTS <Layer> (raster tiles always 400)"
+    );
+}
+
+#[test]
+fn tms_root_omits_vector_layer_even_with_grids() {
+    // Same regression as above, for the TMS 1.0.0 root (`tilemapservice_xml`): a vector layer with
+    // published grids must not get a `<TileMap>` entry — `render_tms_tile` gates on `layer.cog` and
+    // 400s for every vector layer.
+    let state =
+        terraserve::server::ServeState::new(vec![vector_layer_with_grid()], "http://h".into(), 4);
+    let root = terraserve::tms_http::tms_root(&state.base_url);
+    let xml = terraserve::tms_http::tilemapservice_xml(&state, &root);
+    assert!(
+        !xml.contains("<TileMap "),
+        "vector layer with grids must not appear as a TMS <TileMap> (raster tiles always 400)"
     );
 }

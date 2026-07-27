@@ -54,8 +54,8 @@ fn vector_layer(style: Style) -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 

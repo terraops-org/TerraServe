@@ -46,8 +46,8 @@ fn countries_layer() -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 
@@ -155,6 +155,7 @@ fn build_pmtiles_uses_the_given_layer_name() {
         topology_dissolve: None,
         topology_dissolve_rollup: None,
         keep_fields: None,
+        grid: "WebMercatorQuad".into(),
     };
 
     terraserve::run_build_pmtiles(&args).unwrap();
@@ -163,6 +164,17 @@ fn build_pmtiles_uses_the_given_layer_name() {
     assert!(
         reader.metadata().contains("\"id\":\"roads\""),
         "metadata should carry the --name layer id: {}",
+        reader.metadata()
+    );
+    // Task 3 regression: `run_build_pmtiles` must stamp the BARE grid id an operator asked for
+    // (default `--grid` = "WebMercatorQuad") — not `tms::preset`'s internal `_4096`-px-suffixed id
+    // (an MVT-baking-resolution artifact). A live MVT request for this grid always asks for the bare
+    // name, so a suffixed stamp would make `serve --pmtiles`'s `grid_id -> reader` lookup silently
+    // miss this archive for the default, byte-identical, back-compat case.
+    assert_eq!(
+        reader.grid_id(),
+        "WebMercatorQuad",
+        "default --grid must stamp the bare preset id, not a tile_px-suffixed one: {}",
         reader.metadata()
     );
 

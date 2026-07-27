@@ -36,20 +36,40 @@ pub fn build_pmtiles(
         .vector
         .as_ref()
         .ok_or("build_pmtiles: not a vector layer")?;
-    let bbox3857 = reproj::crs_bounds(
+    // Reproject the WGS84 bbox into the GRID's CRS so `tile_limits` (which works in grid units) is
+    // correct for ANY grid, not just EPSG:3857. WebMercator → the same 4326->3857 as before
+    // (byte-identical); swissLV95 → 4326->2056; WorldCRS84Quad → 4326->4326 (identity).
+    let bbox_grid = reproj::crs_bounds(
         "EPSG:4326",
-        "EPSG:3857",
+        &grid.crs,
         bbox_wgs84[0],
         bbox_wgs84[1],
         bbox_wgs84[2],
         bbox_wgs84[3],
     )
-    .ok_or("build_pmtiles: cannot reproject bounds to EPSG:3857")?;
+    .ok_or_else(|| format!("build_pmtiles: cannot reproject bounds to {}", grid.crs))?;
     let mut w = PmtilesWriter::new(tmp_dir)?;
     for z in (min_zoom as u32)..=(max_zoom as u32) {
-        let Some((c0, c1, r0, r1)) = grid.tile_limits(bbox3857, z) else {
+        let Some((c0, c1, r0, r1)) = grid.tile_limits(bbox_grid, z) else {
             continue;
         };
+        // The PMTiles Hilbert TileID (`zxy_to_tileid`) addresses a SQUARE 2^z x 2^z quad, so a tile
+        // col/row at or beyond 2^z aliases another tile's id (surfaces as a "tile_id not ascending"
+        // panic in the writer). Square grids (WebMercatorQuad) and custom grids whose
+        // matrixWidth/Height stay below 2^z (e.g. swissLV95) are fine; a 2:1 grid like
+        // WorldCRS84Quad (matrixWidth = 2^(z+1)) is not — reject it up front with a clear message
+        // rather than panicking mid-bake. (A non-square TileID scheme is a possible follow-up.)
+        if (c1 as u64) >= (1u64 << z) || (r1 as u64) >= (1u64 << z) {
+            return Err(format!(
+                "build-pmtiles: grid '{}' at z{z} reaches tile col/row ({c1},{r1}), at or beyond \
+                 2^{z} = {} — its tile matrix is not a square 2^z quad (e.g. WorldCRS84Quad is 2:1), \
+                 which the PMTiles Hilbert TileID cannot address uniquely. Use WebMercatorQuad or a \
+                 custom grid whose matrixWidth/Height stay below 2^z (like swissLV95).",
+                grid.id,
+                1u64 << z
+            )
+            .into());
+        }
         // Per-zoom LOD: pick the zoom-appropriate feature pool (as the live routes do).
         let vs = v.source_for_zoom(z);
         // Enumerate the covered tiles and sort by Hilbert TileID — the writer requires strictly
@@ -106,7 +126,8 @@ pub fn build_pmtiles(
             e7((bbox_wgs84[1] + bbox_wgs84[3]) / 2.0),
         ),
     };
-    // Reuse the layer's TileJSON metadata (vector_layers) — the same shape the /mvt route serves.
-    let metadata = crate::mvt_http::pmtiles_metadata_json(layer);
+    // Reuse the layer's TileJSON metadata (vector_layers) — the same shape the /mvt route serves —
+    // and stamp the grid this pyramid was baked on so serve reads it only for matching-grid requests.
+    let metadata = crate::mvt_http::pmtiles_metadata_json(layer, Some(&grid.id));
     w.finish(hf, &metadata, out_path)
 }

@@ -337,11 +337,20 @@ pub struct ServeArgs {
     #[arg(long)]
     pub vector: Option<String>,
     /// Serve MVT tiles from a pre-built PMTiles archive (read-through); a tile not in the archive is
-    /// live-encoded from `--vector`. Requires `--vector`. Opt-in.
+    /// live-encoded from `--vector`. Requires `--vector`. Opt-in, repeatable — pass once per grid
+    /// (each archive self-describes the grid it was baked on via its `grid_id` metadata; serve
+    /// auto-maps grid -> archive, so there's no `grid=path` flag grammar). Two archives naming the
+    /// same grid is an error.
     #[arg(long)]
-    pub pmtiles: Option<String>,
+    pub pmtiles: Vec<String>,
     /// Enable the write-through cache: a tile not in --pmtiles is live-encoded then persisted to a
-    /// crash-safe overlay log beside it, so it's a hit next time. Requires --pmtiles + --vector.
+    /// crash-safe overlay log beside it, so it's a hit next time. Requires --pmtiles + --vector. One
+    /// overlay is opened per `--pmtiles` archive, keyed by the grid it self-describes (mirrors the
+    /// read-through `grid_id -> archive` map) — a miss for grid G persists only into G's overlay,
+    /// never a differently-gridded one, even though two grids' z/x/y can collide under
+    /// `zxy_to_tileid`. SIMPLIFICATION: under `--pmtiles-cache`, every `--pmtiles` path MUST already
+    /// exist on disk (its `grid_id` has to be readable to key its overlay) — unlike plain
+    /// (non-cache) `--pmtiles`, a not-yet-existing path is a startup error here, not an empty archive.
     #[arg(long)]
     pub pmtiles_cache: bool,
     /// Compact the write-through overlay into the `.pmtiles` every N seconds (0 = only on a size-cap
@@ -484,10 +493,10 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         println!("LRU tile cache: enabled ({} MiB per layer)", args.cache_lru);
     }
 
-    if args.pmtiles.is_some() && args.vector.is_none() {
+    if !args.pmtiles.is_empty() && args.vector.is_none() {
         return Err("--pmtiles requires --vector".into());
     }
-    if args.pmtiles_cache && (args.pmtiles.is_none() || args.vector.is_none()) {
+    if args.pmtiles_cache && (args.pmtiles.is_empty() || args.vector.is_none()) {
         return Err("--pmtiles-cache requires --pmtiles and --vector".into());
     }
 
@@ -506,36 +515,71 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
             .clone()
             .unwrap_or_else(|| "EPSG:4326".to_string());
         let name = args.name.clone().unwrap_or_else(|| "vector".to_string());
-        let mut layer = build_vector_layer(name, vec_path, vec_style, src_crs, font, args)?;
-        // Spec 2 write-through supersedes Spec 1 read-through when --pmtiles-cache is set: the
-        // overlay owns the (optional, swappable) base reader and Layer.pmtiles stays None. The
-        // base is optional so a not-yet-existing --pmtiles path starts the cache empty (fills up
-        // via write-through as tiles are requested) instead of erroring.
+        // CLI custom grids come only via --config, so an empty map here — the flags select
+        // presets/`from_cog` only (mirrors the `--cog` single-layer path below).
+        let no_custom_grids = std::collections::BTreeMap::new();
+        let mut layer = build_vector_layer(
+            name,
+            vec_path,
+            vec_style,
+            src_crs,
+            font,
+            &args.tms_grids,
+            args.tms_tile_px,
+            &no_custom_grids,
+            args,
+            &s3_env,
+            &args.pmtiles,
+        )?;
+        // Spec 2 write-through supersedes Spec 1 read-through when --pmtiles-cache is set: each
+        // overlay owns the (swappable) base reader for its own grid and Layer.pmtiles stays empty
+        // (the overlays own the bases instead). One overlay is opened PER --pmtiles archive, keyed
+        // by the grid_id that archive self-describes — mirrors build_vector_layer's read-through
+        // `pmtiles` map above, so a miss for grid G persists only into G's overlay (never a
+        // differently-gridded one, even though two grids' z/x/y can collide under `zxy_to_tileid`).
+        // SIMPLIFICATION: unlike plain --pmtiles (Spec 1, which tolerates a not-yet-existing path
+        // and reads through nothing until one appears), --pmtiles-cache requires every archive to
+        // already exist on disk — its grid_id has to be readable up front to key its overlay, so a
+        // missing path is a clear startup error here rather than an empty-cache no-op.
         if args.pmtiles_cache {
-            let p = args
-                .pmtiles
-                .as_deref()
-                .ok_or("--pmtiles-cache requires --pmtiles")?;
-            let base = if std::path::Path::new(p).exists() {
-                Some(std::sync::Arc::new(
-                    vector::pmtiles::read::PmtilesReader::open(std::path::Path::new(p))?,
-                ))
-            } else {
-                None
-            };
-            let wal = format!("{p}.wal");
-            let ov = std::sync::Arc::new(vector::pmtiles::overlay::TileOverlay::open(
-                std::path::Path::new(&wal),
-                base,
-            )?);
-            // Size-cap trigger (task 6): a `put` past this many bytes wakes the compaction controller.
-            ov.set_max_bytes(args.pmtiles_overlay_max_mib.saturating_mul(1024 * 1024));
-            ov.set_metadata(crate::mvt_http::pmtiles_metadata_json(&layer));
-            layer.pmtiles = None;
-            layer.overlay = Some(ov);
-        } else if let Some(path) = &args.pmtiles {
-            let reader = vector::pmtiles::read::PmtilesReader::open(std::path::Path::new(path))?;
-            layer.pmtiles = Some(std::sync::Arc::new(reader));
+            let mut overlays: std::collections::BTreeMap<
+                String,
+                std::sync::Arc<vector::pmtiles::overlay::TileOverlay>,
+            > = std::collections::BTreeMap::new();
+            for p in &args.pmtiles {
+                if !std::path::Path::new(p).exists() {
+                    return Err(format!(
+                        "--pmtiles-cache requires each --pmtiles archive to already exist \
+                         (its grid_id must be readable to key its overlay): '{p}' not found"
+                    )
+                    .into());
+                }
+                let base = std::sync::Arc::new(vector::pmtiles::read::PmtilesReader::open(
+                    std::path::Path::new(p),
+                )?);
+                let grid_id = base.grid_id();
+                if overlays.contains_key(&grid_id) {
+                    return Err(format!(
+                        "two --pmtiles archives both target grid '{grid_id}' under --pmtiles-cache: {p}"
+                    )
+                    .into());
+                }
+                let wal = format!("{p}.wal");
+                let ov = std::sync::Arc::new(vector::pmtiles::overlay::TileOverlay::open(
+                    std::path::Path::new(&wal),
+                    Some(base),
+                )?);
+                // Size-cap trigger (task 6): a `put` past this many bytes wakes the compaction
+                // controller for THIS grid's overlay.
+                ov.set_max_bytes(args.pmtiles_overlay_max_mib.saturating_mul(1024 * 1024));
+                ov.set_metadata(crate::mvt_http::pmtiles_metadata_json(
+                    &layer,
+                    Some(&grid_id),
+                ));
+                overlays.insert(grid_id, ov);
+            }
+            layer.pmtiles = std::collections::BTreeMap::new();
+            layer.overlay = overlays;
         }
         vec![layer]
     } else if let Some(cfg_path) = &args.config {
@@ -551,21 +595,40 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
                 let vstyle = lc.vec_style.as_deref().ok_or_else(|| {
                     format!("layer '{}': a `vector` layer needs a `vec_style`", lc.name)
                 })?;
+                let s3 = s3_env.clone().merge(s3::S3Config {
+                    endpoint: lc.s3_endpoint.clone(),
+                    region: lc.s3_region.clone(),
+                    ..Default::default()
+                });
                 build_vector_layer(
                     lc.name.clone(),
                     vpath,
                     vstyle,
                     lc.src_crs.clone(),
                     font,
+                    &lc.grids,
+                    lc.tile_px,
+                    &cfg.grids,
                     args,
+                    &s3,
+                    &lc.pmtiles,
                 )?
             } else {
                 let cog = lc.cog.as_deref().ok_or_else(|| {
                     format!("layer '{}': needs a `cog` or `vector` source", lc.name)
                 })?;
-                let style = style::Style::load(lc.style.as_deref().ok_or_else(|| {
-                    format!("layer '{}': a `cog` layer needs a `style`", lc.name)
-                })?)?;
+                // Same per-layer S3Config the COG open below uses (CLI-global env, overridden by
+                // this layer's `s3_endpoint`/`s3_region`) — the style path may itself be `s3://`.
+                let s3 = s3_env.clone().merge(s3::S3Config {
+                    endpoint: lc.s3_endpoint.clone(),
+                    region: lc.s3_region.clone(),
+                    ..Default::default()
+                });
+                let style_path = lc
+                    .style
+                    .as_deref()
+                    .ok_or_else(|| format!("layer '{}': a `cog` layer needs a `style`", lc.name))?;
+                let style = style::Style::parse(style_path, &read_config_string(style_path, &s3)?)?;
                 let band_math = match &lc.expression {
                     Some(e) => {
                         let names = lc.band_names_ordered();
@@ -580,11 +643,6 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
                     }
                     None => None,
                 };
-                let s3 = s3_env.clone().merge(s3::S3Config {
-                    endpoint: lc.s3_endpoint.clone(),
-                    region: lc.s3_region.clone(),
-                    ..Default::default()
-                });
                 build_layer(
                     lc.name.clone(),
                     cog.to_string(),
@@ -604,7 +662,8 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
     } else {
         // Single layer from flags.
         let cog = args.cog.clone().ok_or("serve needs --cog (or --config)")?;
-        let style = style::Style::load(args.style.as_deref().ok_or("serve needs --style")?)?;
+        let style_path = args.style.as_deref().ok_or("serve needs --style")?;
+        let style = style::Style::parse(style_path, &read_config_string(style_path, &s3_env)?)?;
         let src_crs = args
             .src_crs
             .clone()
@@ -630,7 +689,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
             style,
             src_crs,
             band_math,
-            s3_env,
+            s3_env.clone(),
             &grid_ids,
             args.tms_tile_px,
             &no_custom,
@@ -752,7 +811,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         );
     }
     if let Some(path) = &args.mvt_style {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("--mvt-style {path}: {e}"))?;
+        let text = read_config_string(path, &s3_env).map_err(|e| format!("--mvt-style {e}"))?;
         let val: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| format!("--mvt-style {path}: {e}"))?;
         println!("MVT style: {path} (served at /mvt/{{layer}}/style.json)");
@@ -775,7 +834,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
 /// pyramid can be baked with the identical generalization an operator would serve interactively.
 #[derive(Args, Debug)]
 pub struct BuildPmtilesArgs {
-    /// Vector source (.gpkg or GeoJSON) to bake into the pyramid.
+    /// Vector source (.gpkg, .fgb, or GeoJSON) to bake into the pyramid.
     #[arg(long)]
     pub vector: Option<String>,
     /// Output `.pmtiles` path.
@@ -836,6 +895,12 @@ pub struct BuildPmtilesArgs {
     pub topology_dissolve_rollup: Option<usize>,
     #[arg(long)]
     pub keep_fields: Option<String>,
+    /// TileMatrixSet to bake on: a preset id (`WebMercatorQuad` default, `WorldCRS84Quad`,
+    /// `UPSArcticWGS84Quad`, `UPSAntarcticWGS84Quad`) OR a path to an OGC TileMatrixSet 2.0 JSON
+    /// file (a custom national/regional grid, e.g. swissLV95). The archive is baked with THIS grid's
+    /// z/x/y and stamps its `grid_id` into metadata, so serve reads it only for matching-grid requests.
+    #[arg(long, default_value = "WebMercatorQuad")]
+    pub grid: String,
 }
 
 /// Build a `.pmtiles` pyramid offline. Constructs the SAME `Layer` + `MvtOptimizations` `run_serve`
@@ -880,7 +945,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         s3_region: None,
         name: args.name.clone(),
         vector: args.vector.clone(),
-        pmtiles: None,
+        pmtiles: Vec::new(),
         pmtiles_cache: false,
         pmtiles_flush_interval: 0,
         pmtiles_overlay_max_mib: 0,
@@ -926,13 +991,24 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         .clone()
         .unwrap_or_else(|| "EPSG:4326".to_string());
     let layer_name = args.name.clone().unwrap_or_else(|| "vector".to_string());
+    // build-pmtiles has no --config / custom-grid flags of its own; `serve_args.tms_grids` was
+    // reconstructed empty above, so this mirrors the single --vector CLI path (no custom grids).
+    let no_custom_grids = std::collections::BTreeMap::new();
+    // build-pmtiles has no --s3-endpoint/--s3-region flags of its own (BuildPmtilesArgs carries
+    // none), so env-only — same as `run_serve`'s `s3_env` before its CLI overlay is applied.
+    let s3 = s3::S3Config::from_env();
     let layer = build_vector_layer(
         layer_name,
         vector_path,
         vec_style,
         src_crs,
         font,
+        &serve_args.tms_grids,
+        serve_args.tms_tile_px,
+        &no_custom_grids,
         &serve_args,
+        &s3,
+        &serve_args.pmtiles,
     )?;
 
     // Build the optimization set the SAME way `run_serve` does: a minimal ServeState carrying the
@@ -952,7 +1028,31 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     let vlayer = layer.vector.as_ref().unwrap();
     let opts = crate::vector::mvt::MvtOptimizations::for_layer(&state, vlayer);
 
-    let grid = tms::preset("WebMercatorQuad", 4096).ok_or("no WebMercatorQuad preset")?;
+    // Load the requested grid: a preset id, else a path to an OGC TileMatrixSet 2.0 JSON file.
+    // Presets use tile_px 4096 (the MVT encode extent); the tile bbox is tile_w-invariant, so the
+    // default `WebMercatorQuad` stays byte-identical. A custom JSON loads exactly as serve's
+    // `--config grids:` do (`from_ogc_json`), so a baked tile matches the live one for that grid.
+    let grid = match tms::preset(&args.grid, 4096) {
+        // `tms::preset` suffixes `.id` with the tile_px it actually built (4096 — the MVT-baking
+        // resolution passed above, unrelated to any client-facing grid-size convention) whenever
+        // that differs from 256, e.g. "WebMercatorQuad" -> "WebMercatorQuad_4096". A live MVT
+        // request for the SAME grid always asks for the bare preset name (`resolve_grid`'s preset
+        // fallback in mvt_http.rs resolves it at 4096 too, but the REQUEST string stays whatever the
+        // client sent). Stamping the suffixed id would make Task 3's `grid_id -> reader` lookup
+        // silently miss the archive for exactly the default/back-compat grid this whole pipeline
+        // exists to keep byte-identical — so stamp the id the operator actually asked for
+        // (`args.grid`) instead. `.id` isn't read anywhere else in `build_pmtiles` (only in the
+        // metadata stamp — see `generate.rs`), so overwriting it here is safe.
+        Some(mut g) => {
+            g.id = args.grid.clone();
+            g
+        }
+        None => {
+            let json = std::fs::read_to_string(&args.grid)
+                .map_err(|e| format!("--grid {}: {e}", args.grid))?;
+            tms::from_ogc_json(&json).map_err(|e| format!("--grid {}: {e}", args.grid))?
+        }
+    };
     let bbox = bbox_override.unwrap_or(layer.bounds_wgs84);
     let tmp = args
         .tmpdir
@@ -979,6 +1079,28 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         counts.addressed as f64 / counts.contents.max(1) as f64,
     );
     Ok(())
+}
+
+/// Read a small startup config asset (style / font / mvt-style) from a local path OR an `s3://`
+/// URL. Whole-object fetch (not windowed) — S3 uses one no-Range GET.
+pub(crate) fn read_config_bytes(path: &str, s3: &s3::S3Config) -> Result<Vec<u8>, Error> {
+    if s3::is_s3_url(path) {
+        Ok(s3::S3RangeSource::open(path, s3)
+            .map_err(|e| format!("{path}: {e}"))?
+            .read_whole()
+            .map_err(|e| format!("{path}: {e}"))?)
+    } else {
+        std::fs::read(path).map_err(|e| format!("{path}: {e}").into())
+    }
+}
+
+pub(crate) fn read_config_string(path: &str, s3: &s3::S3Config) -> Result<String, Error> {
+    if s3::is_s3_url(path) {
+        String::from_utf8(read_config_bytes(path, s3)?)
+            .map_err(|e| format!("{path}: not valid UTF-8: {e}").into())
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}").into())
+    }
 }
 
 /// Compile a band-math expression against band names in physical order.
@@ -1076,23 +1198,83 @@ fn build_layer(
         index_cache,
         grids,
         vector: None,
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     })
 }
 
 /// Build a **vector** (label) layer: parse the source once (GeoJSON, or a native GeoPackage when
 /// `geojson_path` ends in `.gpkg`), load the vec-style + font, derive bounds from the feature
-/// extent. Served over WMS GetMap only (no tile grids).
+/// extent. Served over WMS GetMap (always) plus, when `grid_ids` resolves any, tiled MVT/WMTS
+/// (`grid_ids`/`tile_px`/`custom_grids` mirror `build_layer`'s raster grid-publishing params).
+#[allow(clippy::too_many_arguments)]
 fn build_vector_layer(
     name: String,
     geojson_path: &str,
     vec_style_path: &str,
     src_crs: String,
     font_path: &str,
+    grid_ids: &[String],
+    tile_px: u32,
+    custom_grids: &std::collections::BTreeMap<String, config::GridConfig>,
     args: &ServeArgs,
+    s3: &s3::S3Config,
+    pmtiles_paths: &[String],
 ) -> Result<server::Layer, Error> {
     use vector::source::FeatureSource;
+    // Resolve the layer's tile grids ONCE, up front — a vector layer has no COG, so `from_cog`
+    // (raster's native-pyramid grid) is meaningless here; `resolve_grids_presets` is the no-COG
+    // variant of `build_layer`'s `resolve_grids` and correctly rejects a `from_cog` id if it
+    // reaches it. But `grid_ids` here is usually `LayerConfig.grids`/`ServeArgs.tms_grids`, whose
+    // shared default (`config::default_grids()` = `["from_cog"]`) is written for the raster `cog:`
+    // branch and reaches every `vector:` layer that doesn't override `grids:` too — unfiltered,
+    // that would hard-error at startup on `from_cog` for every pre-existing vector config (e.g.
+    // `fixtures/cite/wms13-layers.yaml`, `fixtures/fgb/multi.yaml`), none of which set `grids:`
+    // explicitly. `from_cog` can never apply to a vector layer (there's no COG, ever — not just by
+    // default), so drop it here unconditionally rather than erroring; any OTHER unknown/invalid id
+    // still fails loudly below, unchanged.
+    let grid_ids: Vec<String> = grid_ids
+        .iter()
+        .filter(|id| *id != "from_cog")
+        .cloned()
+        .collect();
+    // Unlike the raster path, this doesn't depend on the layer's (possibly auto-detected-below)
+    // `src_crs`, so it can run before the format-specific branching and be moved into whichever of
+    // the 3 return sites below actually executes. `data_bounds` stays `None` (no COG geo to
+    // reproject) — the TMS `<BoundingBox>` / empty-tile early-out for vector grids is a later task,
+    // per the brief.
+    let grids: Vec<server::PublishedGrid> =
+        config::resolve_grids_presets(&grid_ids, tile_px, custom_grids)
+            .map_err(|e| format!("layer '{name}': {e}"))?
+            .into_iter()
+            .map(|tms| server::PublishedGrid {
+                tms,
+                data_bounds: None,
+            })
+            .collect();
+    // Open every `--pmtiles` archive and file it under the grid it self-describes (design commitment
+    // 2: an archive's metadata carries its own `grid_id`; serve auto-maps grid -> archive, no
+    // `grid=path` flag grammar). Independent of the format-specific branching below, so resolved once
+    // up front for all 3 return sites. Two archives naming the SAME grid is a startup config error
+    // (design commitment 1: one archive per grid — silently picking one would hide a real mistake).
+    let mut pmtiles: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<vector::pmtiles::read::PmtilesReader>,
+    > = std::collections::BTreeMap::new();
+    let mut pmtiles_path_by_grid: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for p in pmtiles_paths {
+        let reader = vector::pmtiles::read::PmtilesReader::open(std::path::Path::new(p))?;
+        let gid = reader.grid_id();
+        if let Some(first_path) = pmtiles_path_by_grid.get(&gid) {
+            return Err(format!(
+                "two --pmtiles archives both target grid '{gid}': {first_path} and {p}"
+            )
+            .into());
+        }
+        pmtiles_path_by_grid.insert(gid.clone(), p.clone());
+        pmtiles.insert(gid, std::sync::Arc::new(reader));
+    }
     // Flag-consistency: --topology-dissolve-rollup only means something when --topology-dissolve is
     // also set (it rolls up the dissolve field's class codes). Warn on the silent no-op rather than
     // ignoring it, matching the --mvt-cell-field / validate_cell_flags pattern.
@@ -1116,15 +1298,17 @@ fn build_vector_layer(
     // build below: a typo'd style or font path used to only error out after loading the gpkg and
     // building topology, wasting real wall-clock time on a real build (~2.7 min on a COS-sized
     // coverage) for a mistake that's knowable in milliseconds.
-    let style = vector::style::Style::load(vec_style_path)?;
-    let font = std::fs::read(font_path).map_err(|e| format!("font {font_path}: {e}"))?;
+    let style =
+        vector::style::Style::parse(vec_style_path, &read_config_string(vec_style_path, s3)?)?;
+    let font = read_config_bytes(font_path, s3).map_err(|e| format!("font {e}"))?;
     let shaper = std::sync::Arc::new(vector::shape::Shaper::from_font_bytes(&font)?);
 
     // FlatGeoBuf: the windowed-seam reader (FGB batch Task 5) — an early return, since none of
     // the GPKG-only knobs below (topology-simplify/-dissolve, keep-fields, in-RAM LOD) apply to
     // a windowed source that never holds the whole coverage in memory. Extension sniff only —
-    // `config::LayerConfig` gains no new field. Local path only for now (a `LocalFileRangeSource`);
-    // `s3://*.fgb` is a noted follow-up, same as the `.gpkg`/GeoJSON paths were local-only first.
+    // `config::LayerConfig` gains no new field. Opens via `s3::AnySource` (local or `s3://`) —
+    // every byte already flows through `RangeSource`, so this reader was S3-capable by
+    // construction; the local-only restriction was just the opener.
     if geojson_path.ends_with(".fgb") {
         if args.topology_simplify.is_some()
             || args.topology_dissolve.is_some()
@@ -1134,7 +1318,10 @@ fn build_vector_layer(
                 "WARNING: --topology-simplify/--topology-dissolve/--keep-fields apply only to .gpkg vector sources; ignored for {geojson_path}"
             );
         }
-        let range_src = cog::LocalFileRangeSource::open(geojson_path)
+        if s3::is_s3_url(geojson_path) {
+            println!("layer '{name}': S3 {geojson_path}");
+        }
+        let range_src = s3::AnySource::open(geojson_path, s3)
             .map_err(|e| format!("open {geojson_path}: {e}"))?;
         let fgb = vector::fgb::FgbSource::open(range_src)
             .map_err(|e| format!("fgb {geojson_path}: {e}"))?;
@@ -1155,14 +1342,32 @@ fn build_vector_layer(
         } else {
             src_crs
         };
-        let source = vector::source::VectorSource::Windowed(std::sync::Arc::new(fgb));
-        let ext = source.full_extent();
+        // `fgb.full_extent()` (the inherent method) rather than going through `source` here —
+        // `source` isn't built yet, since the resident-index warning below still needs `fgb` by
+        // value (it's moved into `source` right after).
+        let ext = fgb.full_extent();
         let bounds_wgs84 = if resolved_crs == "EPSG:4326" || resolved_crs == "CRS:84" {
             ext
         } else {
             reproj::wgs84_bounds(&resolved_crs, ext[0], ext[1], ext[2], ext[3])
                 .unwrap_or([-180.0, -90.0, 180.0, 90.0])
         };
+        if fgb.index_is_resident() && fgb.index_size() > 16 * 1024 * 1024 {
+            let idx_mib = fgb.index_size() as f64 / (1024.0 * 1024.0);
+            match std::fs::metadata(geojson_path).ok().map(|m| m.len()) {
+                Some(total) if total > 0 => eprintln!(
+                    "WARNING: layer '{name}': FlatGeoBuf R-tree index resident in RAM: {idx_mib:.1} MiB \
+                     (~{:.0}% of the .fgb). Set TERRASERVE_FGB_INDEX_RESIDENT=0 to read it windowed \
+                     (bounded RAM, more S3 round-trips).",
+                    100.0 * fgb.index_size() as f64 / total as f64
+                ),
+                _ => eprintln!(
+                    "WARNING: layer '{name}': FlatGeoBuf R-tree index resident in RAM: {idx_mib:.1} MiB. \
+                     Set TERRASERVE_FGB_INDEX_RESIDENT=0 to read it windowed (bounded RAM, more round-trips)."
+                ),
+            }
+        }
+        let source = vector::source::VectorSource::Windowed(std::sync::Arc::new(fgb));
         println!(
             "layer '{name}': vector (windowed .fgb)  bounds W {:.4} S {:.4} E {:.4} N {:.4}  (WMS GetMap only)",
             bounds_wgs84[0],
@@ -1189,7 +1394,7 @@ fn build_vector_layer(
             bounds_wgs84,
             tile_cache: None,
             index_cache: cache::new_index_cache(cache::index_cache_bytes()),
-            grids: Vec::new(),
+            grids,
             vector: Some(server::VectorLayer {
                 fields,
                 area_scale,
@@ -1198,8 +1403,8 @@ fn build_vector_layer(
                 shaper,
                 lod: None,
             }),
-            pmtiles: None,
-            overlay: None,
+            pmtiles: pmtiles.clone(),
+            overlay: std::collections::BTreeMap::new(),
         });
     }
 
@@ -1268,7 +1473,7 @@ fn build_vector_layer(
             bounds_wgs84,
             tile_cache: None,
             index_cache: cache::new_index_cache(cache::index_cache_bytes()),
-            grids: Vec::new(),
+            grids,
             vector: Some(server::VectorLayer {
                 fields,
                 area_scale,
@@ -1277,8 +1482,8 @@ fn build_vector_layer(
                 shaper,
                 lod: None,
             }),
-            pmtiles: None,
-            overlay: None,
+            pmtiles: pmtiles.clone(),
+            overlay: std::collections::BTreeMap::new(),
         });
     }
 
@@ -1512,7 +1717,7 @@ fn build_vector_layer(
         // Never touched (a vector layer has no COG), but the field is unconditional — cheap to
         // build regardless (`cache::new_index_cache` is just a `moka::sync::Cache::builder()`).
         index_cache: cache::new_index_cache(cache::index_cache_bytes()),
-        grids: Vec::new(),
+        grids,
         vector: Some(server::VectorLayer {
             fields,
             area_scale,
@@ -1521,8 +1726,8 @@ fn build_vector_layer(
             shaper,
             lod,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles,
+        overlay: std::collections::BTreeMap::new(),
     })
 }
 
@@ -1586,9 +1791,8 @@ fn format_report(rep: &vector::topology::BuildReport) -> String {
     )
 }
 
-/// Load a coverage for `build-topology` as a `VectorSource`. A `.gpkg`/`.geojson` is read whole
-/// (`LoadAll`); a `.fgb` opens the windowed reader (`Windowed`) and the caller reads it across its
-/// full extent.
+/// Load a coverage for `build-topology` as a `VectorSource`. A `.gpkg` is read whole (`LoadAll`);
+/// a `.fgb` opens the windowed reader (`Windowed`) and the caller reads it across its full extent.
 fn load_topology_source(
     path: &str,
     layer: Option<&str>,
@@ -1707,7 +1911,7 @@ mod build_topology_cli_tests {
     #[test]
     fn load_topology_source_dispatches_by_extension() {
         use crate::vector::source::VectorSource;
-        // A `.gpkg` reads whole; a `.fgb` opens the windowed reader; a `.geojson` reads whole.
+        // A `.gpkg` reads whole; a `.fgb` opens the windowed reader.
         let g = load_topology_source("fixtures/gpkg/mini.gpkg", None).expect("load gpkg");
         assert!(matches!(g, VectorSource::LoadAll(_)), "gpkg → LoadAll");
         let f = load_topology_source("fixtures/fgb/hole.fgb", None).expect("load fgb");
@@ -1787,7 +1991,7 @@ mod windowed_gpkg_dispatch_tests {
             s3_region: None,
             name: None,
             vector: None,
-            pmtiles: None,
+            pmtiles: Vec::new(),
             pmtiles_cache: false,
             pmtiles_flush_interval: 0,
             pmtiles_overlay_max_mib: 0,
@@ -1819,13 +2023,19 @@ mod windowed_gpkg_dispatch_tests {
     #[test]
     fn plain_raw_serve_of_an_rtree_gpkg_takes_the_windowed_path() {
         let args = base_serve_args();
+        let s3 = crate::s3::S3Config::from_env();
         let layer = build_vector_layer(
             "mini".to_string(),
             MINI,
             VEC_STYLE,
             "EPSG:4326".to_string(),
             FONT,
+            &[],
+            512,
+            &std::collections::BTreeMap::new(),
             &args,
+            &s3,
+            &[],
         )
         .unwrap();
         let vector = layer.vector.expect("vector layer");
@@ -1840,13 +2050,19 @@ mod windowed_gpkg_dispatch_tests {
     fn topology_simplify_falls_through_to_load_all_even_with_an_rtree() {
         let mut args = base_serve_args();
         args.topology_simplify = Some(1.0);
+        let s3 = crate::s3::S3Config::from_env();
         let layer = build_vector_layer(
             "mini".to_string(),
             MINI,
             VEC_STYLE,
             "EPSG:4326".to_string(),
             FONT,
+            &[],
+            512,
+            &std::collections::BTreeMap::new(),
             &args,
+            &s3,
+            &[],
         )
         .unwrap();
         let vector = layer.vector.expect("vector layer");
@@ -1860,13 +2076,19 @@ mod windowed_gpkg_dispatch_tests {
     fn keep_fields_falls_through_to_load_all_even_with_an_rtree() {
         let mut args = base_serve_args();
         args.keep_fields = Some("name".to_string());
+        let s3 = crate::s3::S3Config::from_env();
         let layer = build_vector_layer(
             "mini".to_string(),
             MINI,
             VEC_STYLE,
             "EPSG:4326".to_string(),
             FONT,
+            &[],
+            512,
+            &std::collections::BTreeMap::new(),
             &args,
+            &s3,
+            &[],
         )
         .unwrap();
         let vector = layer.vector.expect("vector layer");
@@ -1880,19 +2102,172 @@ mod windowed_gpkg_dispatch_tests {
     fn topology_dissolve_falls_through_to_load_all_even_with_an_rtree() {
         let mut args = base_serve_args();
         args.topology_dissolve = Some("name".to_string());
+        let s3 = crate::s3::S3Config::from_env();
         let layer = build_vector_layer(
             "mini".to_string(),
             MINI,
             VEC_STYLE,
             "EPSG:4326".to_string(),
             FONT,
+            &[],
+            512,
+            &std::collections::BTreeMap::new(),
             &args,
+            &s3,
+            &[],
         )
         .unwrap();
         let vector = layer.vector.expect("vector layer");
         assert!(
             matches!(vector.source, VectorSource::LoadAll(_)),
             "--topology-dissolve must fall through to load-all even on an rtree-indexed .gpkg"
+        );
+    }
+
+    /// Task 2: a vector layer built with a custom grid id must resolve it and populate
+    /// `layer.grids` — mirroring `build_layer`'s (raster) grid publishing, which this test would
+    /// have caught was silently skipped for every vector layer (`grids: Vec::new()` unconditionally
+    /// at all 3 `build_vector_layer` return sites).
+    #[test]
+    fn vector_layer_custom_grid_grids_non_empty() {
+        let args = base_serve_args();
+        // A small, deliberately level-invariant (dyadic) custom grid — LV95-like (a real projected
+        // CRS id, EPSG:2056), 512km square, tile_px 256, halving resolutions 1000..125 m/px.
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(
+            "testgrid".to_string(),
+            crate::config::GridConfig {
+                crs: "EPSG:2056".to_string(),
+                origin: [0.0, 512_000.0],
+                extent: [0.0, 0.0, 512_000.0, 512_000.0],
+                tile_px: 256,
+                resolutions: vec![1000.0, 500.0, 250.0, 125.0],
+            },
+        );
+        let grid_ids = vec!["testgrid".to_string()];
+        let s3 = crate::s3::S3Config::from_env();
+        let layer = build_vector_layer(
+            "mini".to_string(),
+            MINI,
+            VEC_STYLE,
+            "EPSG:4326".to_string(),
+            FONT,
+            &grid_ids,
+            512,
+            &custom,
+            &args,
+            &s3,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            layer.grids.iter().any(|g| g.tms.id == "testgrid"),
+            "expected a resolved 'testgrid' grid, got {:?}",
+            layer
+                .grids
+                .iter()
+                .map(|g| g.tms.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// `read_config_{bytes,string}` — the s3:// / local dispatch used to load style/font/mvt-style
+/// config assets on the serve path (Task 2).
+#[cfg(test)]
+mod read_config_tests {
+    #[test]
+    fn read_config_string_local_matches_fs() {
+        // A local path must load byte-for-byte the same via read_config_string as via std::fs.
+        let path = "fixtures/styles/rgb.json"; // an existing committed style fixture
+        let s3 = crate::s3::S3Config::from_env();
+        let via_helper = crate::read_config_string(path, &s3).expect("read_config_string local");
+        let via_fs = std::fs::read_to_string(path).expect("fs read");
+        assert_eq!(via_helper, via_fs);
+    }
+
+    #[test]
+    fn read_config_string_missing_local_path_errors_with_path() {
+        let path = "fixtures/does/not/exist-read-config-string.json";
+        let s3 = crate::s3::S3Config::default();
+        let err = crate::read_config_string(path, &s3)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(path),
+            "expected the path in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_config_bytes_missing_local_path_errors_with_path() {
+        let path = "fixtures/does/not/exist-read-config-bytes.bin";
+        let s3 = crate::s3::S3Config::default();
+        let err = crate::read_config_bytes(path, &s3).unwrap_err().to_string();
+        assert!(
+            err.contains(path),
+            "expected the path in the error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_config_bytes_missing_local_path_error_has_no_verb_prefix() {
+        // Pins the "{path}: {cause}" format (no "open "/"read " verb) — the message must
+        // start with the path itself, not a verb.
+        let path = "fixtures/does/not/exist-no-verb.bin";
+        let s3 = crate::s3::S3Config::default();
+        let err = crate::read_config_bytes(path, &s3).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("{path}: ")),
+            "expected '{path}: ...', got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_config_bytes_s3_without_endpoint_errors_before_any_network_call() {
+        // S3Config::default() has NO endpoint, so S3RangeSource::open must fail on
+        // validation before issuing any HTTP request — proves the s3 arm surfaces a
+        // clean, path-prefixed error with no network I/O. Runs unconditionally (no
+        // TERRASERVE_S3_TEST_URL / creds needed).
+        let path = "s3://some-bucket/some/key.json";
+        let s3 = crate::s3::S3Config::default();
+        let err = crate::read_config_bytes(path, &s3).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!("{path}: ")),
+            "expected '{path}: ...', got: {err}"
+        );
+        assert!(
+            err.contains("missing S3 endpoint"),
+            "expected the missing-endpoint cause, got: {err}"
+        );
+    }
+
+    #[test]
+    fn font_prefix_composes_with_read_config_bytes_error() {
+        // The "font " prefix is added at the build_vector_layer call site, which needs a
+        // live serve() to reach — so this pins the composition directly, the way run_serve
+        // actually builds it: format!("font {e}") over read_config_bytes's error.
+        let path = "/no/such/font.ttf";
+        let s3 = crate::s3::S3Config::default();
+        let composed = format!("font {}", crate::read_config_bytes(path, &s3).unwrap_err());
+        assert!(
+            composed.contains(&format!("font {path}:")),
+            "expected 'font {path}: ...', got: {composed}"
+        );
+    }
+
+    #[test]
+    fn mvt_style_prefix_composes_with_read_config_string_error() {
+        // Same idea for the --mvt-style call site in run_serve.
+        let path = "/no/such/style.json";
+        let s3 = crate::s3::S3Config::default();
+        let composed = format!(
+            "--mvt-style {}",
+            crate::read_config_string(path, &s3).unwrap_err()
+        );
+        assert!(
+            composed.contains(&format!("--mvt-style {path}:")),
+            "expected '--mvt-style {path}: ...', got: {composed}"
         );
     }
 }

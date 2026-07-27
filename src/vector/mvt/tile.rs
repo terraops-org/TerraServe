@@ -1034,4 +1034,49 @@ mod tests {
     fn budget_zero_is_empty() {
         assert!(sampled_positions(100, 0).is_empty());
     }
+
+    // ---- Task 4: NaN-safe encode for interrupted projections ----
+
+    #[test]
+    fn nan_safe_encode_drops_feature_with_non_finite_vertex() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        use crate::vector::feature::{Feature, Geometry, Props};
+        // A rectangle like `rect_feature`, but its 4th corner is corrupted to NaN — simulating what
+        // an interrupted projection (`+proj=igh`) can hand back for a vertex that falls in a lobe
+        // gap. The OTHER 4 vertices still give the ring a normal, in-tile bbox, so the cheap
+        // source-CRS bbox pre-filter does NOT trivially reject the whole feature before projection is
+        // ever reached (a whole-NaN Point feature would be — Geometry::compute_bbox ignores a NaN
+        // vertex entirely, so that path never even exercises the guard under test). This one
+        // survives the pre-filter and reaches real per-vertex projection, where the corrupted vertex
+        // must be caught.
+        let ring = vec![
+            [-100_000.0, 4.6e6],
+            [100_000.0, 4.6e6],
+            [100_000.0, 4.8e6],
+            [f64::NAN, 4.8e6],
+            [-100_000.0, 4.6e6],
+        ];
+        let feat = Feature::new(Geometry::Polygon(vec![ring]), Props::new(), 1);
+        let src = VecSource {
+            feats: vec![feat],
+            extent: [-100_000.0, 4.6e6, 100_000.0, 4.8e6],
+        };
+        let grid = crate::tms::preset("WebMercatorQuad", 4096).unwrap();
+        let bytes = encode_tile_opt(
+            src.features(),
+            &grid,
+            6,
+            32,
+            24,
+            "EPSG:3857",
+            "t",
+            &MvtOptimizations::defaults(),
+        );
+        assert!(
+            bytes.is_empty(),
+            "a feature with one non-finite vertex must be dropped whole (the existing skip/None \
+             contract `project_ring`/`project_rings` already implement via `Option::collect`), never \
+             partially encoded with a garbage/rounded-to-zero coordinate"
+        );
+    }
 }

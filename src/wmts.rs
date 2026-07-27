@@ -267,11 +267,12 @@ pub fn get_tile(
 }
 
 /// Render a WMTS-MVT tile (`FORMAT=application/vnd.mapbox-vector-tile`, Task 5): same `{tms}/{z}/
-/// {row}/{col}` addressing as `get_tile` (no y-flip), but for a **vector** layer — which publishes
-/// no `grids` (see `server::Layer::grids` doc; tiled vector serving predates only WMS GetMap) — so
-/// `{tms}` is resolved against the MVT preset grid (`crate::tms::preset`, the encoder's fixed
-/// 4096-unit local extent) instead of the layer's `grids`, and encoded via `vector::mvt::encode_tile`
-/// instead of the raster render path.
+/// {row}/{col}` addressing as `get_tile` (no y-flip), but for a **vector** layer, encoded via
+/// `vector::mvt::encode_tile` instead of the raster render path. `{tms}` resolves against the
+/// layer's OWN published grids first (Task 2/3 — `server::Layer::grids` IS populated for vector
+/// layers too), falling back to the MVT preset grid (`crate::tms::preset`, the encoder's fixed
+/// 4096-unit local extent) for the 4 built-ins — same lookup-then-preset order as `get_tile` above
+/// and `mvt_http::resolve_grid`.
 pub fn get_tile_mvt(
     state: &crate::server::ServeState,
     layer: &str,
@@ -301,8 +302,22 @@ pub fn get_tile_mvt(
         text: "layer is not a vector layer — MVT requires --vector".into(),
         locator: None,
     })?;
-    let grid = crate::tms::preset(tms, 4096)
-        .ok_or_else(|| ipv(format!("no TileMatrixSet '{tms}'"), "TILEMATRIXSET"))?;
+    // Task 3: the layer's OWN published grids (Task 2's `l.grids`, e.g. a custom `--grid`/`--config`
+    // grid) first — mirrors `get_tile`'s raster grid lookup above EXACTLY (asymmetric: only the
+    // stored id is stripped, compared against the raw request id, so an explicit `_{px}` suffix on
+    // the request never matches a bare-id stored grid — per R3 it falls through to the preset's own
+    // suffix handling) — falling back to the MVT preset (4096-unit local extent) for the 4 built-ins,
+    // matching `mvt_http::resolve_grid`.
+    let grid = if let Some(g) = l
+        .grids
+        .iter()
+        .find(|g| g.tms.id == tms || strip_size_suffix(&g.tms.id) == tms)
+    {
+        g.tms.clone()
+    } else {
+        crate::tms::preset(tms, 4096)
+            .ok_or_else(|| ipv(format!("no TileMatrixSet '{tms}'"), "TILEMATRIXSET"))?
+    };
     let lvl = grid
         .level(z)
         .ok_or_else(|| ipv(format!("no TileMatrix {z}"), "TILEMATRIX"))?;
@@ -536,10 +551,12 @@ pub fn capabilities_xml(state: &ServeState, kvp_base: &str, rest_base: &str) -> 
 
     let mut layers_xml = String::new();
     for l in &state.layers {
-        // A vector (label) layer publishes no tile grids — advertising it here would emit a
-        // schema-invalid <Layer> (0 TileMatrixSetLink) whose every GetTile 400s. Skip it; it is
-        // served over WMS GetMap.
-        if l.grids.is_empty() {
+        // A vector (label) layer serves no RASTER tiles — its `get_tile` gates on `l.cog` and
+        // 400s unconditionally. Skip it here even when it publishes tile grids (a vector layer
+        // may have `grids` non-empty for the MVT/WMTS-MVT path): advertising it in this raster
+        // Contents would emit an always-400 <ResourceURL>. It is discovered instead via the
+        // `/mvt` route + TileJSON, and served over WMS GetMap for imagery.
+        if l.grids.is_empty() || l.vector.is_some() {
             continue;
         }
         let [w, s, e, n] = l.bounds_wgs84;

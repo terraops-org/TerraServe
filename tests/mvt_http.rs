@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use terraserve::config::GridConfig;
 use terraserve::mvt_http;
-use terraserve::server::{self, Layer, ServeState, VectorLayer};
+use terraserve::server::{self, Layer, PublishedGrid, ServeState, VectorLayer};
 use terraserve::vector::geojson::GeoJsonSource;
 use terraserve::vector::shape::Shaper;
 use terraserve::vector::source::{FeatureSource, VectorSource};
@@ -48,13 +49,33 @@ fn vector_layer() -> Layer {
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 
 fn state() -> ServeState {
     ServeState::new(vec![vector_layer()], "http://h/wms".into(), 16)
+}
+
+/// Task 3: `vector_layer()` plus a CUSTOM grid `testgrid` (Task 2's `layer.grids`, built the same
+/// way `src/lib.rs`'s `vector_layer_custom_grid_grids_non_empty` test builds one) — covers the fixture's
+/// own extent ([-30,-30,30,30], see `fixtures/vector/mini_mvt.geojson`) at z0, so z0/0/0 returns the
+/// whole layer.
+fn vector_layer_with_custom_grid() -> Layer {
+    let mut l = vector_layer();
+    let grid_cfg = GridConfig {
+        crs: "EPSG:4326".to_string(),
+        origin: [-30.0, 30.0],
+        extent: [-30.0, -30.0, 30.0, 30.0],
+        tile_px: 256,
+        resolutions: vec![60.0 / 256.0, 30.0 / 256.0],
+    };
+    l.grids = vec![PublishedGrid {
+        tms: grid_cfg.to_tms("testgrid"),
+        data_bounds: None,
+    }];
+    l
 }
 
 #[test]
@@ -90,6 +111,20 @@ fn xyz_tile_unknown_tms_is_4xx_not_panic() {
     let st = state();
     let err = mvt_http::render_mvt_tile(&st, LAYER, "NoSuchGrid", 0, 0, 0).unwrap_err();
     assert!((400..500).contains(&err.0));
+}
+
+#[test]
+fn xyz_tile_custom_grid_is_200_and_nonempty() {
+    // Task 3: `/mvt/{layer}/testgrid/...` must resolve the layer's OWN published grid, not just the
+    // 4 built-in presets — before this task this 404'd with "no TileMatrixSet 'testgrid'".
+    let st = ServeState::new(
+        vec![vector_layer_with_custom_grid()],
+        "http://h/wms".into(),
+        16,
+    );
+    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0)
+        .expect("custom grid 'testgrid' should resolve, not 404");
+    assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
 }
 
 #[test]
@@ -145,7 +180,8 @@ fn tilejson_unknown_tms_is_4xx_not_panic() {
 #[test]
 fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
     let st = state();
-    let doc = mvt_http::style_json(&st, LAYER, Some("192.168.1.121:8081")).unwrap();
+    let doc =
+        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("192.168.1.121:8081")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["version"], 8, "MapLibre GL style spec version");
     // The source references the layer's TileJSON on the REQUEST host (not 0.0.0.0 / base_url).
@@ -186,8 +222,23 @@ fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
 #[test]
 fn style_json_unknown_layer_is_404() {
     let st = state();
-    let err = mvt_http::style_json(&st, "nope", None).unwrap_err();
+    let err = mvt_http::style_json(&st, "nope", "WebMercatorQuad", None).unwrap_err();
     assert_eq!(err.0, 404);
+}
+
+#[test]
+fn style_json_source_url_is_parametrized_by_grid_id() {
+    // Task 4: the embedded vector source's TileJSON must reference the REQUESTED grid, not always
+    // WebMercatorQuad — a style asked for a different TileMatrixSet must point at that grid's
+    // TileJSON (even though MapLibre itself can only ever render Web Mercator — a client concern,
+    // not this server's).
+    let st = state();
+    let doc = mvt_http::style_json(&st, LAYER, "WorldCRS84Quad", Some("host:8081")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    assert_eq!(
+        v["sources"]["terraserve"]["url"],
+        "http://host:8081/mvt/mini/WorldCRS84Quad.json"
+    );
 }
 
 #[test]
@@ -215,6 +266,25 @@ fn wmts_gettile_mvt_format_matches_the_xyz_route() {
     assert_eq!(
         wmts_bytes, xyz_bytes,
         "WMTS-MVT must match the XYZ route byte-for-byte"
+    );
+}
+
+#[test]
+fn wmts_gettile_mvt_custom_grid_matches_the_xyz_route() {
+    // Task 3: `wmts::get_tile_mvt` must resolve the layer's OWN published grid too (same
+    // lookup-then-preset order as `mvt_http::resolve_grid`), and produce byte-identical output to
+    // the `/mvt` XYZ route on the same `layer/tms/z/x/y` key.
+    let st = ServeState::new(
+        vec![vector_layer_with_custom_grid()],
+        "http://h/wms".into(),
+        16,
+    );
+    let wmts_bytes = wmts::get_tile_mvt(&st, LAYER, "default", "testgrid", 0, 0, 0)
+        .expect("custom grid 'testgrid' should resolve, not 404");
+    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0).unwrap();
+    assert_eq!(
+        wmts_bytes, xyz_bytes,
+        "WMTS-MVT must match the XYZ route byte-for-byte on a custom grid too"
     );
 }
 

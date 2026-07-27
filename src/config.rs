@@ -69,6 +69,11 @@ pub struct LayerConfig {
     /// Tile pixel size for the preset / `from_cog` grids this layer names (128/256/512). Default 512.
     #[serde(default = "default_tile_px")]
     pub tile_px: u32,
+    /// Pre-built PMTiles archive path(s) for this layer (read-through; a tile not in the matching-grid
+    /// archive is live-encoded). Each archive self-describes its grid via `grid_id` metadata, so this
+    /// is just a plain path list — one entry per grid, never mixed (design commitment 1). Default empty.
+    #[serde(default)]
+    pub pmtiles: Vec<String>,
 }
 
 /// A config-defined custom TileMatrixSet: explicit CRS + top-left origin + full extent + tile size
@@ -133,12 +138,42 @@ pub fn default_tile_px() -> u32 {
 /// Resolve ONE grid id → a validated `TileMatrixSet`. `cog` supplies the COG+CRS for `from_cog`
 /// (None ⇒ `from_cog` errors — used by COG-less unit tests). Fails loudly if the id is unknown or the
 /// resolved grid is not TMS-indexable (matrix·tile·resolution not level-invariant — the blocker class).
+///
+/// An id ENDING IN `.json` is a path to an OGC TileMatrixSet 2.0 document (read relative to the
+/// process CWD — the same convention `--cog`/`--vector`/`--mvt-style` already use for a local path,
+/// no `s3://` support here), loaded via `tms::from_ogc_json`. That path is checked FIRST (before
+/// `from_cog`/preset/custom-map), and returns straight from the JSON without running the
+/// level-invariance gate below: unlike a `GridConfig`, whose `matrixWidth`/`matrixHeight` are
+/// DERIVED here from an extent + a resolution ladder (the gate exists to catch a bad derivation),
+/// an OGC-JSON document's `matrixWidth`/`matrixHeight` are already explicit, authoritative, per-level
+/// values straight from the file — there is no derivation step to protect. Real-world WMTS grids
+/// (e.g. swisstopo's own LV95 pyramid, `fixtures/grids/swissLV95.json`) are routinely NOT
+/// level-invariant (a non-dyadic resolution ladder over a fixed extent), which the single-`<Origin>`
+/// TMS 1.0.0 client-indexing concern the gate protects against doesn't apply to — WMTS/MVT tile
+/// lookups (`TileMatrixSet::tile_bounds`) read each level's own `matrix_w`/`matrix_h` and are correct
+/// regardless of invariance; only a TMS 1.0.0 client computing tile position from Y + resolution
+/// alone (without per-level dims) would care, and that front-end already only advertises `full_extent`
+/// (level 0) for such a grid, a pre-existing, documented limitation (not one this task changes).
+///
+/// CAVEAT scoping the "correct regardless of invariance" claim above: only tile GEOMETRY is
+/// invariance-agnostic. The OPT-IN, WebMercator-calibrated MVT feature-size heuristics —
+/// `--mvt-min-feature-px` and the per-zoom LOD tolerance, both routed through
+/// `vector::mvt::tile::merc_m_per_px` (a hardcoded `2^z` ladder) — ASSUME dyadic level doubling, so
+/// on a non-dyadic `.json` grid they over/under-thin features by the ratio between the real
+/// `cellSize` and the Mercator `2^z` resolution (an ~84x error at some `swissLV95` levels). This
+/// knob is OFF by default (`min_feature_px = 0.0`) and never affects tile geometry or the default
+/// path; the design spec declares these heuristics out-of-scope for v1. Fast-follow fix: make
+/// `min_area_src_for_zoom`/the LOD tolerance read `level(z).resolution` instead of `2^z`.
 fn resolve_one(
     id: &str,
     tile_px: u32,
     cog: Option<(&Cog, &str)>,
     custom: &BTreeMap<String, GridConfig>,
 ) -> Result<TileMatrixSet, String> {
+    if id.ends_with(".json") {
+        let json = std::fs::read_to_string(id).map_err(|e| format!("grid '{id}': {e}"))?;
+        return crate::tms::from_ogc_json(&json).map_err(|e| format!("grid '{id}': {e}"));
+    }
     let tms = if id == "from_cog" {
         let (cog, crs) = cog.ok_or("grid 'from_cog' requires a COG")?;
         TileMatrixSet::from_cog(cog, crs, tile_px)

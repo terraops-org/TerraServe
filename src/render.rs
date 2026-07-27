@@ -31,11 +31,13 @@ pub fn io_concurrency() -> usize {
         .unwrap_or(32)
 }
 
-/// The dedicated I/O pool (built once, lazily). Tile *reads* run here via `install()`; decode /
-/// warp / colorize stay on rayon's default (CPU) pool. This keeps a request's blocking network
-/// reads from occupying the ~cores−2 CPU threads and starving decode of the same fanned-out
-/// request — the two kinds of work no longer compete for the same threads.
-fn io_pool() -> &'static rayon::ThreadPool {
+/// The dedicated I/O pool (built once, lazily), `pub(crate)` so the FGB windowed feature fetch
+/// (`vector::fgb::FgbSource::query_capped`) can also dispatch its per-feature range reads here.
+/// Tile *reads* run here via `install()`; decode / warp / colorize stay on rayon's default (CPU)
+/// pool. This keeps a request's blocking network reads from occupying the ~cores−2 CPU threads
+/// and starving decode of the same fanned-out request — the two kinds of work no longer compete
+/// for the same threads.
+pub(crate) fn io_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
