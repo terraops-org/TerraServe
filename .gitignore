@@ -1,4 +1,6 @@
-/target/
+# Unanchored: `/target/` only covered the ROOT crate, so building bindings/python left
+# 743 MB of untracked build output in `git status`.
+target/
 tmp/
 *.log
 .DS_Store
