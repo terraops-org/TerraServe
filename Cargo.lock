@@ -1740,6 +1740,7 @@ dependencies = [
  "moka",
  "png",
  "proj",
+ "proj-sys",
  "rayon",
  "roxmltree",
  "rusqlite",
