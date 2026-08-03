@@ -196,8 +196,8 @@ fn style_json_prefers_configured_public_url_over_the_request_host() {
     st.public_url = Some("https://terraserve.io/demo/vida/wms".to_string());
     // Host says something else entirely, and there is no X-Forwarded-Proto: the configured
     // public URL must still win, keeping BOTH the https scheme and the /demo/vida prefix.
-    let doc = mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("terraserve.io"), None)
-        .unwrap();
+    let doc =
+        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("terraserve.io"), None).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(
         v["sources"]["terraserve"]["url"],
@@ -212,8 +212,14 @@ fn style_json_prefers_configured_public_url_over_the_request_host() {
 #[test]
 fn tilejson_takes_the_scheme_from_forwarded_proto() {
     let st = state();
-    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", Some("example.org"), Some("https"))
-        .unwrap();
+    let doc = mvt_http::tilejson_doc(
+        &st,
+        LAYER,
+        "WebMercatorQuad",
+        Some("example.org"),
+        Some("https"),
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     let tpl = v["tiles"][0].as_str().expect("tiles[0]");
     assert!(
@@ -225,8 +231,14 @@ fn tilejson_takes_the_scheme_from_forwarded_proto() {
 #[test]
 fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
     let st = state();
-    let doc =
-        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("192.168.1.121:8081"), None).unwrap();
+    let doc = mvt_http::style_json(
+        &st,
+        LAYER,
+        "WebMercatorQuad",
+        Some("192.168.1.121:8081"),
+        None,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["version"], 8, "MapLibre GL style spec version");
     // The source references the layer's TileJSON on the REQUEST host (not 0.0.0.0 / base_url).

@@ -13,12 +13,12 @@
 use crate::server::{Layer, PublishedGrid, ServeState};
 use crate::tms::{strip_size_suffix, TileFactory, TileMatrixSet, TileRequest};
 
-/// The TMS root URL, derived from the advertised WMS base (`…/wms` → `…/tms/1.0.0`).
-pub fn tms_root(base_url: &str) -> String {
-    let origin = base_url
-        .strip_suffix("/wms")
-        .unwrap_or(base_url)
-        .trim_end_matches('/');
+/// The TMS service root, composed on an ALREADY-DERIVED origin.
+///
+/// This used to take `base_url` and derive the origin itself, which is why TMS could not
+/// honour `X-Forwarded-Proto`: it never saw the request. Derivation now lives in exactly one
+/// place, `ServeState::advertised_origin`, and this only appends the path.
+pub fn tms_root(origin: &str) -> String {
     format!("{origin}/tms/1.0.0")
 }
 
@@ -308,15 +308,19 @@ var map = new ol.Map({{
     )
 }
 
-pub fn viewer_html(state: &ServeState) -> String {
-    let root = tms_root(&state.base_url);
+/// `origin` is the request's advertised origin (`ServeState::advertised_origin`), NOT
+/// `state.base_url`. The viewer templates ABSOLUTE tile and WMS URLs into its HTML, so behind a
+/// reverse proxy those must carry the public scheme and path prefix or every request the page
+/// makes lands on the origin root and 404s.
+pub fn viewer_html(state: &ServeState, origin: &str) -> String {
+    let root = tms_root(origin);
     let Some(layer) = state.layers.first() else {
         return "<!doctype html><meta charset=utf-8><title>TerraServe</title><p>No layers published.".to_string();
     };
     // A vector (label) layer has no tile grids — serve it as a single WMS GetMap image
     // (OpenLayers ImageWMS) over an OSM basemap so the labels are visible.
     if layer.vector.is_some() {
-        return vector_viewer_html(&state.base_url, layer);
+        return vector_viewer_html(&format!("{origin}/wms"), layer);
     }
     let Some(pg) = layer.grids.first() else {
         return format!(

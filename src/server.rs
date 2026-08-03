@@ -219,6 +219,49 @@ pub struct ServeState {
 }
 
 impl ServeState {
+    /// The origin every advertised URL hangs off: `https://host[/prefix]`, with no trailing
+    /// slash and no `/wms` suffix.
+    ///
+    /// This is THE single derivation. It used to exist four times, once per front-end
+    /// (`wms::online_resource`, `wmts::bases`, `tms_http::tms_root`, `mvt_http`), and the four
+    /// copies had drifted: only the MVT one learned about `X-Forwarded-Proto`, so TMS and WMTS
+    /// could not construct an `https` URL from a request at all and depended entirely on
+    /// `--public-url` being set. One of the copies also hardcoded `http://`, which shipped
+    /// broken tile URLs to production.
+    ///
+    /// Precedence, and why:
+    ///
+    /// 1. An explicitly configured `--public-url` WINS. It is the only source carrying both
+    ///    the public scheme and the reverse-proxy path prefix; no request header carries the
+    ///    prefix at all.
+    /// 2. Otherwise derive from the request, because `base_url` has then fallen back to the
+    ///    BIND address (`http://127.0.0.1:8080/wms`), which is useless to an external client.
+    ///    The scheme comes from `X-Forwarded-Proto`: a TLS-terminating proxy means the
+    ///    connection this process sees is always plain HTTP, so the scheme cannot be inferred
+    ///    from it. A proxy chain sends a comma-separated list whose FIRST entry is the
+    ///    original client-facing scheme.
+    /// 3. With no Host header either, fall back to `base_url`.
+    pub fn advertised_origin(
+        &self,
+        request_host: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> String {
+        if let Some(pu) = self.public_url.as_deref() {
+            return trim_origin(pu);
+        }
+        match request_host {
+            Some(h) if !h.is_empty() => {
+                let scheme = forwarded_proto
+                    .and_then(|p| p.split(',').next())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("http");
+                format!("{scheme}://{h}")
+            }
+            _ => trim_origin(&self.base_url),
+        }
+    }
+
     /// Build the service state with an admission-control limiter of `max_inflight` permits (min 1).
     /// `mvt_max_features` starts at the default; callers that expose the flag set it afterwards.
     pub fn new(layers: Vec<Layer>, base_url: String, max_inflight: usize) -> ServeState {
@@ -544,17 +587,21 @@ fn status_response(status: u16, msg: String) -> Response {
 }
 
 /// `GET /tms/1.0.0/` — the TileMapService document (all layer×grid TileMaps).
-async fn tms_service_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let root = crate::tms_http::tms_root(&state.base_url);
+async fn tms_service_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let root = crate::tms_http::tms_root(&origin_of(&state, &headers));
     xml_response(crate::tms_http::tilemapservice_xml(&state, &root))
 }
 
 /// `GET /tms/1.0.0/{layer}[@{grid}]` — a TileMap document.
 async fn tms_tilemap_handler(
     State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
     Path(layerspec): Path<String>,
 ) -> Response {
-    let root = crate::tms_http::tms_root(&state.base_url);
+    let root = crate::tms_http::tms_root(&origin_of(&state, &headers));
     match crate::tms_http::tilemap_doc(&state, &layerspec, &root) {
         Ok(xml) => xml_response(xml),
         Err((status, msg)) => status_response(status, msg),
@@ -674,6 +721,25 @@ async fn mvt_flush_handler(
     }
 }
 
+/// A configured URL reduced to the origin that advertised paths hang off: drop the
+/// conventional `/wms` endpoint suffix and any trailing slash, so composing `{origin}/mvt/...`
+/// or `{origin}/tms/1.0.0` never doubles a separator. A URL without the `/wms` suffix is left
+/// alone apart from the trailing slash.
+fn trim_origin(url: &str) -> String {
+    url.strip_suffix("/wms")
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The advertised origin for THIS request: pulls `Host` and `X-Forwarded-Proto` off the
+/// header map and hands them to the single shared derivation. Every front-end that emits an
+/// absolute URL goes through here, so a proxied deployment gets one consistent answer.
+fn origin_of(state: &ServeState, headers: &axum::http::HeaderMap) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    state.advertised_origin(host, forwarded_proto(headers))
+}
+
 /// The client-facing scheme, as reported by the reverse proxy's `X-Forwarded-Proto`.
 ///
 /// Traefik terminates TLS in front of us (see `deploy/vps/`), so the connection this process
@@ -760,9 +826,13 @@ fn wmts_exception_response(e: crate::wmts::WmtsErr) -> Response {
 }
 
 /// `GET /wmts?…` — WMTS KVP binding (GetCapabilities / GetTile / OWS exception).
-async fn wmts_kvp_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery) -> Response {
+async fn wmts_kvp_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
     let query = q.unwrap_or_default();
-    let (kvp_base, rest_base) = crate::wmts::bases(&state.base_url);
+    let (kvp_base, rest_base) = crate::wmts::bases(&origin_of(&state, &headers));
     match crate::wmts::parse_kvp(&query) {
         crate::wmts::WmtsRequest::GetCapabilities => {
             xml_response(crate::wmts::capabilities_xml(&state, &kvp_base, &rest_base))
@@ -855,8 +925,11 @@ async fn wmts_kvp_handler(State(state): State<Arc<ServeState>>, RawQuery(q): Raw
 }
 
 /// `GET /wmts/1.0.0/WMTSCapabilities.xml` — WMTS RESTful GetCapabilities.
-async fn wmts_caps_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let (kvp_base, rest_base) = crate::wmts::bases(&state.base_url);
+async fn wmts_caps_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (kvp_base, rest_base) = crate::wmts::bases(&origin_of(&state, &headers));
     xml_response(crate::wmts::capabilities_xml(&state, &kvp_base, &rest_base))
 }
 
@@ -885,8 +958,11 @@ async fn wmts_rest_tile_handler(
 }
 
 /// `GET /viewer` — the built-in map viewer (filled in Task 6).
-async fn viewer_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let html = crate::tms_http::viewer_html(&state);
+async fn viewer_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let html = crate::tms_http::viewer_html(&state, &origin_of(&state, &headers));
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
@@ -974,6 +1050,71 @@ async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// the call site) so it's directly unit-testable without spinning an HTTP server.
 pub fn xray_html() -> &'static str {
     include_str!("xray.html")
+}
+
+#[cfg(test)]
+mod advertised_origin_tests {
+    use super::ServeState;
+
+    fn state_with(public_url: Option<&str>, base_url: &str) -> ServeState {
+        let mut st = ServeState::new(vec![], base_url.into(), 1);
+        st.public_url = public_url.map(str::to_string);
+        st
+    }
+
+    /// The TMS and WMTS front-ends derive their advertised roots from this. Before the
+    /// extraction each of them had its OWN copy of the origin logic taking only `base_url`,
+    /// so neither could see `X-Forwarded-Proto` and neither could emit an `https` URL from
+    /// the request. Only the MVT copy had been fixed; this is the shared one they now use.
+    #[test]
+    fn honours_forwarded_proto_so_tms_and_wmts_can_emit_https() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            st.advertised_origin(Some("example.org"), Some("https")),
+            "https://example.org"
+        );
+    }
+
+    #[test]
+    fn explicit_public_url_outranks_the_host_header() {
+        let st = state_with(
+            Some("https://terraserve.io/demo/vida/wms"),
+            "http://127.0.0.1:8080/wms",
+        );
+        assert_eq!(
+            st.advertised_origin(Some("terraserve.io"), None),
+            "https://terraserve.io/demo/vida"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_http_host_then_to_base_url() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            st.advertised_origin(Some("localhost:8080"), None),
+            "http://localhost:8080"
+        );
+        assert_eq!(st.advertised_origin(None, None), "http://127.0.0.1:8080");
+    }
+
+    /// The TMS/WMTS path builders now only append to an already-derived origin, so a
+    /// proxied deployment gets the right scheme and prefix in its advertised roots.
+    #[test]
+    fn tms_and_wmts_roots_compose_on_the_shared_origin() {
+        let st = state_with(Some("https://terraserve.io/demo/swiss/wms"), "unused");
+        let origin = st.advertised_origin(Some("terraserve.io"), Some("https"));
+        assert_eq!(
+            crate::tms_http::tms_root(&origin),
+            "https://terraserve.io/demo/swiss/tms/1.0.0"
+        );
+        assert_eq!(
+            crate::wmts::bases(&origin),
+            (
+                "https://terraserve.io/demo/swiss/wmts".to_string(),
+                "https://terraserve.io/demo/swiss/wmts/1.0.0".to_string()
+            )
+        );
+    }
 }
 
 #[cfg(test)]

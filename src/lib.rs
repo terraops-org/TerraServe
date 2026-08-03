@@ -31,6 +31,7 @@ pub mod tms_http;
 pub mod vector;
 pub mod wms;
 pub mod wmts;
+pub mod xml;
 
 use clap::Args;
 use std::io::Write;
@@ -1302,6 +1303,17 @@ fn build_vector_layer(
     // build below: a typo'd style or font path used to only error out after loading the gpkg and
     // building topology, wasting real wall-clock time on a real build (~2.7 min on a COS-sized
     // coverage) for a mistake that's knowable in milliseconds.
+    // Reject an unknown source SCHEME before anything else. Without this an unrecognised
+    // scheme falls through the format branches to the GeoPackage opener, which then fails deep
+    // inside SQLite complaining about a file that was never a file -- an error naming the wrong
+    // format entirely. `postgis://` lands here today; supporting it means adding a branch, not
+    // another extension test.
+    if let vector::uri::SourceKind::Unsupported(scheme) = vector::uri::classify(geojson_path) {
+        return Err(format!(
+            "layer '{name}': unsupported vector source scheme `{scheme}://` in {geojson_path}.              Supported: a local path or `s3://` pointing at .fgb, .gpkg or .geojson."
+        )
+        .into());
+    }
     let style =
         vector::style::Style::parse(vec_style_path, &read_config_string(vec_style_path, s3)?)?;
     let font = read_config_bytes(font_path, s3).map_err(|e| format!("font {e}"))?;
@@ -1313,7 +1325,10 @@ fn build_vector_layer(
     // `config::LayerConfig` gains no new field. Opens via `s3::AnySource` (local or `s3://`) —
     // every byte already flows through `RangeSource`, so this reader was S3-capable by
     // construction; the local-only restriction was just the opener.
-    if geojson_path.ends_with(".fgb") {
+    if matches!(
+        vector::uri::classify(geojson_path),
+        vector::uri::SourceKind::FlatGeoBuf
+    ) {
         if args.topology_simplify.is_some()
             || args.topology_dissolve.is_some()
             || args.keep_fields.is_some()
@@ -1420,8 +1435,10 @@ fn build_vector_layer(
     // early-return only fires when none of them are requested AND the file actually has a usable
     // rtree (`gpkg_has_rtree` — a cheap sqlite_master probe, no feature read); otherwise this
     // falls through, UNCHANGED, to the load-all `.gpkg` arm below.
-    let windowed_gpkg = geojson_path.ends_with(".gpkg")
-        && args.topology_simplify.is_none()
+    let windowed_gpkg = matches!(
+        vector::uri::classify(geojson_path),
+        vector::uri::SourceKind::GeoPackage
+    ) && args.topology_simplify.is_none()
         && args.topology_dissolve.is_none()
         && args.keep_fields.is_none()
         && vector::gpkg::gpkg_has_rtree(geojson_path, None);
@@ -1491,9 +1508,10 @@ fn build_vector_layer(
         });
     }
 
-    let (src, src_crs): (std::sync::Arc<dyn FeatureSource>, String) = if geojson_path
-        .ends_with(".gpkg")
-    {
+    let (src, src_crs): (std::sync::Arc<dyn FeatureSource>, String) = if matches!(
+        vector::uri::classify(geojson_path),
+        vector::uri::SourceKind::GeoPackage
+    ) {
         let g = vector::gpkg::GpkgSource::load(geojson_path, None)?;
         let crs = if args.src_crs.is_none() {
             match g.crs() {
@@ -1801,7 +1819,14 @@ fn load_topology_source(
     path: &str,
     layer: Option<&str>,
 ) -> Result<vector::source::VectorSource, Error> {
-    if path.ends_with(".fgb") {
+    let kind = vector::uri::classify(path);
+    if let vector::uri::SourceKind::Unsupported(scheme) = &kind {
+        return Err(format!(
+            "unsupported vector source scheme `{scheme}://` in {path}.              Supported: a local path or `s3://` pointing at .fgb, .gpkg or .geojson."
+        )
+        .into());
+    }
+    if kind == vector::uri::SourceKind::FlatGeoBuf {
         if layer.is_some() {
             eprintln!(
                 "warning: --layer is ignored for a FlatGeoBuf source ({path}); it has a single layer"
@@ -1817,7 +1842,7 @@ fn load_topology_source(
             fgb,
         )));
     }
-    if path.ends_with(".geojson") || path.ends_with(".json") {
+    if kind == vector::uri::SourceKind::GeoJson {
         if layer.is_some() {
             eprintln!("warning: --layer is ignored for a GeoJSON source ({path})");
         }
@@ -1867,6 +1892,25 @@ pub fn run_build_topology(args: &BuildTopologyArgs) -> Result<(), Error> {
 
 #[cfg(test)]
 mod build_topology_cli_tests {
+    /// An unknown SCHEME must be rejected by name, up front. Before the URI registry it fell
+    /// through every extension test to the GeoPackage opener and failed inside SQLite,
+    /// reporting a file problem for something that was never a file. This is also the seam a
+    /// PostGIS reader attaches to, so the message must name what IS supported.
+    #[test]
+    fn unsupported_scheme_is_rejected_by_name() {
+        // `match`, not `expect_err`: the Ok type (`VectorSource`) is not `Debug`, by design -
+        // it holds trait objects.
+        let msg = match super::load_topology_source("postgis://user@host/db?table=roads", None) {
+            Ok(_) => panic!("an unknown scheme must not reach a file opener"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("postgis://"), "must name the scheme: {msg}");
+        assert!(
+            msg.contains(".fgb") && msg.contains(".gpkg"),
+            "must say what IS supported: {msg}"
+        );
+    }
+
     use super::*;
     use crate::vector::topology::BuildReport;
 

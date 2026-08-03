@@ -218,47 +218,14 @@ pub fn pmtiles_metadata_json(layer: &Layer, grid_id: Option<&str>) -> String {
 /// `Host` header (the address the client actually reached us on) so URLs are reachable even when the
 /// server binds `0.0.0.0` (whose literal address is not routable from another machine). Falls back
 /// to the configured `base_url` (e.g. an explicit `--public-url`) when there's no Host header.
+/// Thin delegate to the single shared derivation, `ServeState::advertised_origin`. Kept as a
+/// named function because this module's call sites and its regression tests read through it.
 fn advertised_origin(
     state: &ServeState,
     request_host: Option<&str>,
     forwarded_proto: Option<&str>,
 ) -> String {
-    // An explicitly configured `--public-url` is AUTHORITATIVE, and must outrank the Host header.
-    // It is the only source carrying both the public scheme and the path prefix that a reverse
-    // proxy mounts us under (`https://terraserve.io/demo/vida/wms`); a Host header carries
-    // neither. Preferring the header is what shipped `http://terraserve.io/mvt/vida/...` to
-    // production: wrong scheme (mixed-content blocked) AND no `/demo/vida` prefix (404).
-    // `deploy/vps/docker-compose.yml` already documents `--public-url` as load-bearing for the
-    // raster viewer, which reads it through `tms_http::tms_root`; this makes the MVT path agree.
-    if let Some(pu) = state.public_url.as_deref() {
-        return trim_origin(pu);
-    }
-    // No `--public-url`: derive from the request, since `base_url` is then only the BIND address
-    // (`http://127.0.0.1:8080/wms`) and useless to an external client. Take the scheme from
-    // `X-Forwarded-Proto` — Traefik terminates TLS, so the connection we see is always plain HTTP
-    // and the scheme cannot be inferred from it. A proxy chain sends a comma-separated list whose
-    // FIRST entry is the original client-facing scheme.
-    match request_host {
-        Some(h) if !h.is_empty() => {
-            let scheme = forwarded_proto
-                .and_then(|p| p.split(',').next())
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .unwrap_or("http");
-            format!("{scheme}://{h}")
-        }
-        _ => trim_origin(&state.base_url),
-    }
-}
-
-/// A configured URL reduced to the origin the tile paths hang off: drop the conventional `/wms`
-/// endpoint suffix and any trailing slash, so composing `{origin}/mvt/...` never doubles a
-/// separator. A URL without the `/wms` suffix is left alone apart from the trailing slash.
-fn trim_origin(url: &str) -> String {
-    url.strip_suffix("/wms")
-        .unwrap_or(url)
-        .trim_end_matches('/')
-        .to_string()
+    state.advertised_origin(request_host, forwarded_proto)
 }
 
 /// A **MapLibre/Mapbox GL Style JSON** (`version: 8`) for `{layer}` — the "one URL" a client

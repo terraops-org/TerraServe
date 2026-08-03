@@ -1283,6 +1283,72 @@ fn hexval(c: u8) -> Option<u8> {
     }
 }
 
+/// Everything from the XML declaration down to the root `<Layer>`'s `<Title>`: the document
+/// header, `<Service>`, `<Request>` and `<Exception>`.
+///
+/// This block was byte-identical in `capabilities` and `capabilities_multi`, which is 50 of
+/// the ~110 lines they shared. Two copies of a conformance-critical preamble is how a CITE
+/// fix gets applied to one document and not the other; the 1.1.1 and 1.3.0 variants differ in
+/// ways (`OGC:WMS` vs `WMS`, `application/vnd.ogc.wms_xml` vs `text/xml`,
+/// `application/vnd.ogc.se_xml` vs `XML`, and GML being a 1.1.1-only GetFeatureInfo format)
+/// that are easy to get subtly wrong twice.
+///
+/// The two generators still differ AFTER this point: the single-layer one emits a fixed inner
+/// `<Layer>`, the multi-layer one emits N of them. Merging those too would mean giving the
+/// single-COG path a `Layer` to describe itself with, which is a caller change, not a
+/// template change, and is deliberately left alone here.
+fn capabilities_preamble(version: &str, service_or: &str, dcp: &str) -> String {
+    if version.starts_with("1.1") {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE WMT_MS_Capabilities SYSTEM "http://schemas.opengis.net/wms/1.1.1/WMS_MS_Capabilities.dtd">
+<WMT_MS_Capabilities version="1.1.1">
+  <Service>
+    <Name>OGC:WMS</Name>
+    <Title>TerraServe WMS</Title>{service_or}
+  </Service>
+  <Capability>
+    <Request>
+      <GetCapabilities><Format>application/vnd.ogc.wms_xml</Format>{dcp}</GetCapabilities>
+      <GetMap><Format>image/png</Format>{dcp}</GetMap>
+      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format><Format>application/vnd.ogc.gml</Format>{dcp}</GetFeatureInfo>
+    </Request>
+    <Exception><Format>application/vnd.ogc.se_xml</Format></Exception>
+    <Layer>
+      <Title>TerraServe</Title>
+"#
+        )
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.opengis.net/wms http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd">
+  <Service>
+    <Name>WMS</Name>
+    <Title>TerraServe WMS</Title>{service_or}
+  </Service>
+  <Capability>
+    <Request>
+      <GetCapabilities><Format>text/xml</Format>{dcp}</GetCapabilities>
+      <GetMap><Format>image/png</Format>{dcp}</GetMap>
+      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format>{dcp}</GetFeatureInfo>
+    </Request>
+    <Exception><Format>XML</Format></Exception>
+    <Layer>
+      <Title>TerraServe</Title>
+"#
+        )
+    }
+}
+
+/// The matching close for `capabilities_preamble`.
+fn capabilities_epilogue(version: &str) -> &'static str {
+    if version.starts_with("1.1") {
+        "    </Layer>\n  </Capability>\n</WMT_MS_Capabilities>\n"
+    } else {
+        "    </Layer>\n  </Capability>\n</WMS_Capabilities>\n"
+    }
+}
+
 fn capabilities(
     version: &str,
     base_url: Option<&str>,
@@ -1310,25 +1376,11 @@ fn capabilities(
     // (no base_url) we fall back to a placeholder href so the document stays schema-valid.
     let (service_or, dcp) = online_resource(base_url);
 
+    let preamble = capabilities_preamble(version, &service_or, &dcp);
+    let epilogue = capabilities_epilogue(version);
     if version.starts_with("1.1") {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE WMT_MS_Capabilities SYSTEM "http://schemas.opengis.net/wms/1.1.1/WMS_MS_Capabilities.dtd">
-<WMT_MS_Capabilities version="1.1.1">
-  <Service>
-    <Name>OGC:WMS</Name>
-    <Title>TerraServe WMS</Title>{service_or}
-  </Service>
-  <Capability>
-    <Request>
-      <GetCapabilities><Format>application/vnd.ogc.wms_xml</Format>{dcp}</GetCapabilities>
-      <GetMap><Format>image/png</Format>{dcp}</GetMap>
-      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format><Format>application/vnd.ogc.gml</Format>{dcp}</GetFeatureInfo>
-    </Request>
-    <Exception><Format>application/vnd.ogc.se_xml</Format></Exception>
-    <Layer>
-      <Title>TerraServe</Title>
-      <SRS>EPSG:4326</SRS>
+            r#"{preamble}      <SRS>EPSG:4326</SRS>
       <SRS>EPSG:3857</SRS>
       <SRS>EPSG:3763</SRS>
       <LatLonBoundingBox minx="{west}" miny="{south}" maxx="{east}" maxy="{north}"/>
@@ -1340,29 +1392,11 @@ fn capabilities(
         <SRS>EPSG:3763</SRS>{extra_srs}
         <LatLonBoundingBox minx="{west}" miny="{south}" maxx="{east}" maxy="{north}"/>
       </Layer>
-    </Layer>
-  </Capability>
-</WMT_MS_Capabilities>
-"#
+{epilogue}"#
         )
     } else {
         format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.opengis.net/wms http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd">
-  <Service>
-    <Name>WMS</Name>
-    <Title>TerraServe WMS</Title>{service_or}
-  </Service>
-  <Capability>
-    <Request>
-      <GetCapabilities><Format>text/xml</Format>{dcp}</GetCapabilities>
-      <GetMap><Format>image/png</Format>{dcp}</GetMap>
-      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format>{dcp}</GetFeatureInfo>
-    </Request>
-    <Exception><Format>XML</Format></Exception>
-    <Layer>
-      <Title>TerraServe</Title>
-      <CRS>EPSG:4326</CRS>
+            r#"{preamble}      <CRS>EPSG:4326</CRS>
       <CRS>EPSG:3857</CRS>
       <CRS>EPSG:3763</CRS>
       <EX_GeographicBoundingBox>
@@ -1381,10 +1415,7 @@ fn capabilities(
         <BoundingBox CRS="CRS:84" minx="{west}" miny="{south}" maxx="{east}" maxy="{north}"/>
         <BoundingBox CRS="EPSG:4326" minx="{south}" miny="{west}" maxx="{north}" maxy="{east}"/>
       </Layer>
-    </Layer>
-  </Capability>
-</WMS_Capabilities>
-"#
+{epilogue}"#
         )
     }
 }
@@ -1418,6 +1449,8 @@ fn online_resource(base_url: Option<&str>) -> (String, String) {
 /// with its own name, WGS84 bounds, and CRS list (standard + its native CRS).
 fn capabilities_multi(layers: &[Layer], version: &str, base_url: Option<&str>) -> String {
     let (service_or, dcp) = online_resource(base_url);
+    let preamble = capabilities_preamble(version, &service_or, &dcp);
+    let epilogue = capabilities_epilogue(version);
     let is_111 = version.starts_with("1.1");
     let tag = if is_111 { "SRS" } else { "CRS" };
 
@@ -1496,50 +1529,9 @@ fn capabilities_multi(layers: &[Layer], version: &str, base_url: Option<&str>) -
                 })
                 .unwrap_or_default()
         };
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE WMT_MS_Capabilities SYSTEM "http://schemas.opengis.net/wms/1.1.1/WMS_MS_Capabilities.dtd">
-<WMT_MS_Capabilities version="1.1.1">
-  <Service>
-    <Name>OGC:WMS</Name>
-    <Title>TerraServe WMS</Title>{service_or}
-  </Service>
-  <Capability>
-    <Request>
-      <GetCapabilities><Format>application/vnd.ogc.wms_xml</Format>{dcp}</GetCapabilities>
-      <GetMap><Format>image/png</Format>{dcp}</GetMap>
-      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format><Format>application/vnd.ogc.gml</Format>{dcp}</GetFeatureInfo>
-    </Request>
-    <Exception><Format>application/vnd.ogc.se_xml</Format></Exception>
-    <Layer>
-      <Title>TerraServe</Title>
-{top_crs}{root_llbb}{inner}    </Layer>
-  </Capability>
-</WMT_MS_Capabilities>
-"#
-        )
+        format!(r#"{preamble}{top_crs}{root_llbb}{inner}{epilogue}"#)
     } else {
-        format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.opengis.net/wms http://schemas.opengis.net/wms/1.3.0/capabilities_1_3_0.xsd">
-  <Service>
-    <Name>WMS</Name>
-    <Title>TerraServe WMS</Title>{service_or}
-  </Service>
-  <Capability>
-    <Request>
-      <GetCapabilities><Format>text/xml</Format>{dcp}</GetCapabilities>
-      <GetMap><Format>image/png</Format>{dcp}</GetMap>
-      <GetFeatureInfo><Format>text/plain</Format><Format>application/json</Format><Format>text/html</Format>{dcp}</GetFeatureInfo>
-    </Request>
-    <Exception><Format>XML</Format></Exception>
-    <Layer>
-      <Title>TerraServe</Title>
-{top_crs}{inner}    </Layer>
-  </Capability>
-</WMS_Capabilities>
-"#
-        )
+        format!(r#"{preamble}{top_crs}{inner}{epilogue}"#)
     }
 }
 
@@ -1651,10 +1643,11 @@ fn exception_with_code(version: &str, code: Option<&str>, message: &str) -> Stri
     }
 }
 
+/// Thin alias for the shared escaper (`crate::xml::escape`), kept so the many call sites in
+/// this file read unchanged. It used to cover only `& < >`, which was unsafe in the two
+/// ATTRIBUTE positions it feeds (`xlink:href=` and `code=`); see `crate::xml`.
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    crate::xml::escape(s)
 }
 
 /// WMS `BGCOLOR` = `0xRRGGBB` (hex). Absent or malformed -> white (the WMS default). Never errors.
@@ -1681,9 +1674,63 @@ fn parse_transparent(raw: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        first_undefined_layer, handle_layers, json_escape, negotiate_version, parse_bgcolor,
-        parse_transparent,
+        first_undefined_layer, handle_layers, json_escape, negotiate_version, online_resource,
+        parse_bgcolor, parse_transparent, xml_escape,
     };
+
+    /// XML escaping must be safe in ATTRIBUTE position, not just in text position.
+    ///
+    /// Two escapers existed side by side: `wms::xml_escape` covered `& < >`, and
+    /// `wmts::escape_xml` covered `& < > "`. Neither escaped `'`. `wms.rs` called BOTH
+    /// (lines 760/779 reach into `wmts::escape_xml`), and the WEAKER one was the one used to
+    /// build two attribute values: `xlink:href="{href}"` in `online_resource` and
+    /// `code="{...}"` in `exception_with_code`. A value containing a double quote therefore
+    /// closed the attribute early.
+    #[test]
+    fn xml_escape_is_safe_in_attribute_position() {
+        let got = xml_escape(r#"a"b'c&d<e>f"#);
+        assert!(
+            !got.contains('"'),
+            "raw double quote survives escaping: {got}"
+        );
+        assert!(
+            !got.contains('\''),
+            "raw apostrophe survives escaping: {got}"
+        );
+        assert_eq!(got, "a&quot;b&#39;c&amp;d&lt;e&gt;f");
+    }
+
+    /// The concrete consequence, at the call site that actually builds an attribute. A
+    /// `--public-url` containing a quote must not be able to close `xlink:href="` and inject
+    /// further attributes into GetCapabilities.
+    /// NOTE on how this is asserted. An earlier version of this test checked only that
+    /// `<injected` did not appear in the output, and it PASSED against the buggy escaper:
+    /// `<` was already escaped, so no markup was injected, yet the attribute still ended
+    /// early at the raw quote. Absence of markup is the wrong property.
+    ///
+    /// The right property is a ROUND TRIP: read the attribute value the way a parser would
+    /// (up to the next unescaped `"`), unescape it, and require the whole URL back. Under
+    /// the bug the value is truncated at the quote, so this fails.
+    #[test]
+    fn online_resource_href_cannot_break_out_of_its_attribute() {
+        let raw = r#"http://x/"><injected attr="#;
+        let (or, dcp) = online_resource(Some(raw));
+        for frag in [&or, &dcp] {
+            let after = frag.split("xlink:href=\"").nth(1).expect("href attribute");
+            let value = after.split('"').next().expect("attribute value");
+            let unescaped = value
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&");
+            assert_eq!(
+                unescaped,
+                format!("{raw}?"),
+                "attribute value was truncated, so it terminated the attribute early: {frag}"
+            );
+        }
+    }
 
     #[test]
     fn version_negotiation_clamps_to_supported_set() {
