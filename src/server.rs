@@ -155,6 +155,12 @@ pub struct ServeState {
     pub layers: Vec<Layer>,
     /// Advertised OnlineResource / GetMap endpoint (injected into GetCapabilities).
     pub base_url: String,
+    /// The operator's `--public-url`, kept SEPARATE from `base_url` so we can tell "the operator
+    /// declared the public URL" from "we defaulted to the bind address". `base_url` collapses the
+    /// two (it falls back to `http://{host}:{port}/wms`), and that ambiguity is what let
+    /// `mvt_http::advertised_origin` ignore a configured `--public-url` in favour of the Host
+    /// header, advertising `http://` tile URLs with the path prefix stripped. `None` = not set.
+    pub public_url: Option<String>,
     /// **Admission control:** caps the number of CONCURRENT renders. A request acquires a permit
     /// before its `spawn_blocking` render and holds it until the response is built, so peak memory =
     /// (permits × per-request render buffers) + the bounded caches — hard-bounded regardless of how
@@ -219,6 +225,7 @@ impl ServeState {
         ServeState {
             layers,
             base_url,
+            public_url: None,
             render_limiter: Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
@@ -667,6 +674,18 @@ async fn mvt_flush_handler(
     }
 }
 
+/// The client-facing scheme, as reported by the reverse proxy's `X-Forwarded-Proto`.
+///
+/// Traefik terminates TLS in front of us (see `deploy/vps/`), so the connection this process
+/// accepts is ALWAYS plain HTTP and the public scheme cannot be inferred from it. Without this
+/// header an HTTPS deployment advertises `http://` URLs, which browsers block as mixed content.
+/// `None` when absent (direct/local run) — callers fall back to `http`.
+fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+}
+
 /// `GET /mvt/{layer}/{tms}.json` — a TileJSON 3.0.0 document for the layer×grid.
 async fn mvt_tilejson_handler(
     State(state): State<Arc<ServeState>>,
@@ -675,7 +694,8 @@ async fn mvt_tilejson_handler(
 ) -> Response {
     let tms = tmsjson.strip_suffix(".json").unwrap_or(&tmsjson);
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    match crate::mvt_http::tilejson_doc(&state, &layer, tms, host) {
+    let proto = forwarded_proto(&headers);
+    match crate::mvt_http::tilejson_doc(&state, &layer, tms, host, proto) {
         Ok(json) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json))
@@ -698,12 +718,13 @@ async fn mvt_style_handler(
     Path(layer): Path<String>,
 ) -> Response {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    let proto = forwarded_proto(&headers);
     let grid_id = q
         .as_deref()
         .and_then(|qs| qs.split('&').find_map(|kv| kv.strip_prefix("tms=")))
         .map(crate::wms::percent_decode)
         .unwrap_or_else(|| "WebMercatorQuad".to_string());
-    match crate::mvt_http::style_json(&state, &layer, &grid_id, host) {
+    match crate::mvt_http::style_json(&state, &layer, &grid_id, host, proto) {
         Ok(json) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json))

@@ -717,6 +717,10 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
     };
     println!("admission control: max {max_inflight} concurrent renders (excess requests queue)");
     let mut state = server::ServeState::new(layers, base_url, max_inflight);
+    // Kept separate from `base_url` (which falls back to the bind address) so the MVT
+    // TileJSON/style.json origin can tell "operator declared the public URL" from "we guessed",
+    // and prefer the declared one over the request's Host header. See `ServeState.public_url`.
+    state.public_url = args.public_url.clone();
     state.pmtiles_flush_interval = args.pmtiles_flush_interval;
     state.mvt_max_features = args.mvt_max_features;
     state.mvt_min_feature_px = args.mvt_min_feature_px;
