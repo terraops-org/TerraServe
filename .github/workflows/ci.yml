@@ -1,0 +1,157 @@
+name: CI
+
+# Build, enforce the clean-room banned-crate gate, and run the FULL test suite on every
+# push and pull request.
+#
+# Why this exists: until 2026-08-03 this repository had no test CI at all, only the two
+# tag-triggered publish workflows. Everything merged here was verified by local runs only.
+# Two bugs reached production through that gap (a viewer that 404'd because the layer name
+# was hardcoded, and an MVT style.json advertising an http:// URL with the path prefix
+# stripped), and a signature change once landed with `tests/` left uncompilable.
+#
+# Two deliberate choices below, both learned from that:
+#
+#   1. `cargo test` with NO `--lib`. `cargo test --lib` builds only the in-crate unit tests
+#      and silently skips every file in `tests/`. A change that breaks an integration test's
+#      call site then passes locally and fails here -- or worse, passes both if this job
+#      copies the same mistake. Build the whole thing.
+#
+#   2. A live-server smoke step. The unit and integration tests exercise the handler
+#      FUNCTIONS; nothing proved the axum routes wire them up correctly, which is the layer
+#      both production bugs actually lived in. The smoke step starts a real server on a
+#      committed fixture and asserts what a client receives.
+#
+# The ~1 GB fixture COGs are not in the repository, so COG-dependent tests self-skip here
+# (they guard on `Path::exists`). The full fixture regression is `./score.sh`, run locally
+# where the fixtures are present.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PROJ (the `proj` crate is a thin FFI over system libproj)
+        run: sudo apt-get update && sudo apt-get install -y libproj-dev proj-data clang
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Banned-crate gate (no GDAL / TIFF / GeoTIFF / COG / FlatGeoBuf reader crate)
+        run: |
+          BANNED_RE='name = "(gdal|gdal-sys|tiff|geotiff|geotiff-rs|cog|cog-rs|async-tiff|tiff-decoder|libtiff-sys|geotiff2|flatgeobuf|flatbush)"'
+          if grep -qE "$BANNED_RE" Cargo.lock; then
+            echo "FAIL: a banned reader crate is present - the COG reader must stay bespoke:"
+            grep -nE "$BANNED_RE" Cargo.lock
+            exit 1
+          fi
+          echo "ok (no banned crates)"
+
+      - name: SLD module boundary (src/sld must depend on std + roxmltree only)
+        run: |
+          if grep -rqE 'use[[:space:]]+crate|crate::' src/sld/ 2>/dev/null; then
+            echo "FAIL: src/sld/ must not reach into the rest of the crate:"
+            grep -rnE 'use[[:space:]]+crate|crate::' src/sld/
+            exit 1
+          fi
+          echo "ok (sld module self-contained)"
+
+      # NOT `--lib`. See the header comment: `--lib` skips tests/ entirely.
+      - name: Test (unit + integration; COG-dependent tests self-skip without fixtures)
+        run: cargo test --release
+
+  smoke:
+    # Serves a committed fixture over real HTTP and checks what a CLIENT actually receives.
+    # Every assertion here corresponds to a bug that reached production.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install PROJ
+        run: sudo apt-get update && sudo apt-get install -y libproj-dev proj-data clang
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Start the server behind a simulated TLS-terminating proxy
+        run: |
+          # --public-url mirrors the production deployments: an https origin under a path
+          # prefix, which is exactly the shape the advertised-origin bug got wrong.
+          ./target/release/terraserve serve \
+            --host 127.0.0.1 --port 8080 \
+            --vector fixtures/vector/airports.geojson \
+            --vec-style fixtures/styles/airports.vec.json \
+            --name airports \
+            --public-url https://example.org/demo/air/wms &
+          echo $! > /tmp/ts.pid
+          for i in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8080/ && break
+            sleep 0.5
+          done
+          curl -sf -o /dev/null http://127.0.0.1:8080/ || { echo "server never came up"; exit 1; }
+
+      - name: WMS answers
+        run: |
+          curl -sf -o /dev/null "http://127.0.0.1:8080/wms?SERVICE=WMS&REQUEST=GetCapabilities" \
+            || { echo "FAIL: GetCapabilities"; exit 1; }
+          echo "ok GetCapabilities"
+
+      - name: Viewers are served (regression: /xray 404'd on any layer not named "vector")
+        run: |
+          for path in / /xray; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
+            [ "$code" = "200" ] || { echo "FAIL: $path returned $code"; exit 1; }
+            echo "ok $path"
+          done
+
+      - name: Advertised tile URLs honour --public-url (regression: shipped http:// + no prefix)
+        run: |
+          EXPECT_PREFIX="https://example.org/demo/air"
+
+          url=$(curl -s -H 'Host: example.org' -H 'X-Forwarded-Proto: https' \
+                  http://127.0.0.1:8080/mvt/airports/style.json \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["sources"]["terraserve"]["url"])')
+          echo "style.json  -> $url"
+          case "$url" in
+            "$EXPECT_PREFIX"/*) echo "ok style.json origin" ;;
+            *) echo "FAIL: expected an origin of $EXPECT_PREFIX, got $url"; exit 1 ;;
+          esac
+
+          tiles=$(curl -s -H 'Host: example.org' -H 'X-Forwarded-Proto: https' \
+                    http://127.0.0.1:8080/mvt/airports/WebMercatorQuad.json \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["tiles"][0])')
+          echo "tilejson    -> $tiles"
+          case "$tiles" in
+            "$EXPECT_PREFIX"/*) echo "ok tilejson origin" ;;
+            *) echo "FAIL: expected an origin of $EXPECT_PREFIX, got $tiles"; exit 1 ;;
+          esac
+
+          # The advertised URL must be FETCHABLE, not merely well-formed. Rewrite the public
+          # origin back to the local server, which is what the proxy does in production.
+          local_url=$(printf '%s' "$url" | sed "s#$EXPECT_PREFIX#http://127.0.0.1:8080#")
+          curl -sf -o /dev/null "$local_url" \
+            || { echo "FAIL: advertised TileJSON URL does not resolve ($local_url)"; exit 1; }
+          echo "ok advertised TileJSON resolves"
+
+      - name: A real vector tile renders
+        run: |
+          bytes=$(curl -s http://127.0.0.1:8080/mvt/airports/WebMercatorQuad/0/0/0.pbf | wc -c)
+          [ "$bytes" -gt 0 ] || { echo "FAIL: z0 tile was empty"; exit 1; }
+          echo "ok z0 tile ($bytes bytes)"
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat /tmp/ts.pid)" 2>/dev/null || true
