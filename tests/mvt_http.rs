@@ -147,7 +147,7 @@ fn xyz_tile_raster_layer_is_4xx_not_panic() {
 #[test]
 fn tilejson_document_has_the_expected_shape() {
     let st = state();
-    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", None).unwrap();
+    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", None, None).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["tilejson"], "3.0.0");
     let tiles = v["tiles"].as_array().expect("tiles array");
@@ -173,15 +173,60 @@ fn tilejson_document_has_the_expected_shape() {
 #[test]
 fn tilejson_unknown_tms_is_4xx_not_panic() {
     let st = state();
-    let err = mvt_http::tilejson_doc(&st, LAYER, "NoSuchGrid", None).unwrap_err();
+    let err = mvt_http::tilejson_doc(&st, LAYER, "NoSuchGrid", None, None).unwrap_err();
     assert!((400..500).contains(&err.0));
+}
+
+/// Regression for the bug that was LIVE on terraserve.io until 2026-08-03:
+///
+///   GET https://terraserve.io/demo/vida/mvt/vida/style.json
+///     -> "url": "http://terraserve.io/mvt/vida/WebMercatorQuad.json"   (404, mixed-content)
+///
+/// `advertised_origin` preferred the Host header unconditionally, so it hardcoded `http://`
+/// and rebuilt the origin from the host alone, discarding the `/demo/vida` path prefix. Since
+/// HTTP/1.1 ALWAYS sends Host, the configured-`--public-url` branch was dead code.
+///
+/// This asserts at the DOCUMENT level, not on the private helper: the unit tests in
+/// `src/mvt_http.rs` pin `advertised_origin` itself, but only a test that reads the emitted
+/// JSON proves the value actually reaches `sources.terraserve.url`. Both are needed - the
+/// unit tests would still pass if `style_json` stopped calling the helper.
+#[test]
+fn style_json_prefers_configured_public_url_over_the_request_host() {
+    let mut st = state();
+    st.public_url = Some("https://terraserve.io/demo/vida/wms".to_string());
+    // Host says something else entirely, and there is no X-Forwarded-Proto: the configured
+    // public URL must still win, keeping BOTH the https scheme and the /demo/vida prefix.
+    let doc = mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("terraserve.io"), None)
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    assert_eq!(
+        v["sources"]["terraserve"]["url"],
+        format!("https://terraserve.io/demo/vida/mvt/{LAYER}/WebMercatorQuad.json"),
+        "configured --public-url must win over the Host header, scheme and path prefix intact"
+    );
+}
+
+/// The other half: with no `--public-url`, the scheme comes from `X-Forwarded-Proto` rather
+/// than being assumed. Traefik terminates TLS, so the connection the server sees is always
+/// plain HTTP and an assumed scheme is always wrong behind a proxy.
+#[test]
+fn tilejson_takes_the_scheme_from_forwarded_proto() {
+    let st = state();
+    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", Some("example.org"), Some("https"))
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    let tpl = v["tiles"][0].as_str().expect("tiles[0]");
+    assert!(
+        tpl.starts_with("https://example.org/"),
+        "expected an https origin from X-Forwarded-Proto, got {tpl}"
+    );
 }
 
 #[test]
 fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
     let st = state();
     let doc =
-        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("192.168.1.121:8081")).unwrap();
+        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("192.168.1.121:8081"), None).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["version"], 8, "MapLibre GL style spec version");
     // The source references the layer's TileJSON on the REQUEST host (not 0.0.0.0 / base_url).
@@ -222,7 +267,7 @@ fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
 #[test]
 fn style_json_unknown_layer_is_404() {
     let st = state();
-    let err = mvt_http::style_json(&st, "nope", "WebMercatorQuad", None).unwrap_err();
+    let err = mvt_http::style_json(&st, "nope", "WebMercatorQuad", None, None).unwrap_err();
     assert_eq!(err.0, 404);
 }
 
@@ -233,7 +278,7 @@ fn style_json_source_url_is_parametrized_by_grid_id() {
     // TileJSON (even though MapLibre itself can only ever render Web Mercator — a client concern,
     // not this server's).
     let st = state();
-    let doc = mvt_http::style_json(&st, LAYER, "WorldCRS84Quad", Some("host:8081")).unwrap();
+    let doc = mvt_http::style_json(&st, LAYER, "WorldCRS84Quad", Some("host:8081"), None).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(
         v["sources"]["terraserve"]["url"],
