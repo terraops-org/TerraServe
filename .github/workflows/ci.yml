@@ -69,6 +69,62 @@ jobs:
       - name: Test (unit + integration; COG-dependent tests self-skip without fixtures)
         run: cargo test --release
 
+  # Windows exists to catch ONE thing: "does not compile on MSVC at all". That is not
+  # hypothetical - it is what happened. `default = ["jemalloc"]` plus a `tikv-jemalloc-sys` that
+  # does not build for x86_64-pc-windows-msvc meant a plain `cargo build --release` on Windows
+  # could never succeed, and we only learned it when an outside user opened issue #9 three weeks
+  # later. jemalloc now sits under a `cfg(not(target_env = "msvc"))` target table; this job is
+  # what keeps that true.
+  #
+  # Deliberately a BUILD, not the full suite: nobody deploys TerraServe on Windows, and running
+  # the tests here would roughly double CI wall-clock for a platform we only promise to compile
+  # on. Add the suite later if this proves stable and cheap.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # bindgen (via proj-sys and libsqlite3-sys) needs libclang. The runner ships LLVM, but
+      # pinning it here means a runner-image change cannot silently break the build - and a
+      # WRONG LIBCLANG_PATH is exactly what confused the reporter of #9, who pointed it at an
+      # env named after a package that did not exist.
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "17.0"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Point bindgen at that LLVM
+        shell: bash
+        run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/lib" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+
+      # `bundled-proj` builds PROJ from source. There is no usable system libproj on a Windows
+      # runner, and this is the same vendored path the Python wheels already use so they import
+      # on hosts without it. It makes the job slow; the cache above is what makes that bearable.
+      - name: Build
+        run: cargo build --release --features bundled-proj
+
+      # Prove it RUNS, not just links: `--help` exercises clap and the whole startup path
+      # without needing fixtures, a database, or a network.
+      - name: Smoke
+        run: |
+          ./target/release/terraserve.exe --help
+          ./target/release/terraserve.exe render --help
+
+      # Publish the executable so a Windows user can take a build from CI. This is a
+      # convenience, NOT a supported package (issue #9: no plans to package, but it must
+      # compile), hence the short retention.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraserve-windows-x86_64
+          path: target/release/terraserve.exe
+          retention-days: 14
+
   smoke:
     # Serves a committed fixture over real HTTP and checks what a CLIENT actually receives.
     # Every assertion here corresponds to a bug that reached production.
@@ -109,7 +165,7 @@ jobs:
             || { echo "FAIL: GetCapabilities"; exit 1; }
           echo "ok GetCapabilities"
 
-      - name: Viewers are served (regression: /xray 404'd on any layer not named "vector")
+      - name: 'Viewers are served (regression: /xray 404''d on any layer not named "vector")'
         run: |
           for path in / /xray; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
@@ -117,7 +173,7 @@ jobs:
             echo "ok $path"
           done
 
-      - name: Advertised tile URLs honour --public-url (regression: shipped http:// + no prefix)
+      - name: 'Advertised tile URLs honour --public-url (regression: shipped http:// + no prefix)'
         run: |
           EXPECT_PREFIX="https://example.org/demo/air"
 
