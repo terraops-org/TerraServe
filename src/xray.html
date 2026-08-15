@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<title>TerraServe — X-ray</title>
+<title>TerraServe · X-ray</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
 <style>
   html, body, #map { margin: 0; height: 100%; width: 100%; background: #05070a; }
@@ -201,9 +201,7 @@
   </div>
   <div class="field">
     <label for="tmsInput">tile grid</label>
-    <select id="tmsInput">
-      <option value="WebMercatorQuad">WebMercatorQuad (EPSG:3857)</option>
-    </select>
+    <select id="tmsInput"></select>
   </div>
   <button id="applyBtn" type="button">reload</button>
 
@@ -229,32 +227,71 @@
 <div id="spinner"><span class="ring"></span><span id="spinnerText">loading&hellip;</span></div>
 <div id="hud">TerraServe · X-ray MVT viewer</div>
 
+<script src="https://cdn.jsdelivr.net/npm/proj4@2/dist/proj4.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/ol@9/dist/ol.js"></script>
 <script>
-// The X-ray viewer is a fully client-side, self-contained page: the `{layer}`/`{tms}` it renders
-// come from the `?layer=`/`?tms=` query string (comma-separated for multiple layers), NOT from any
-// server-side templating — this same static file works for any layer(s) a `terraserve serve` is
-// currently publishing. WebMercatorQuad (EPSG:3857) is the default grid: it's the standard OL/XYZ
-// pyramid (z0 = 1x1 tile, doubling per level), so no custom tileGrid/tileUrlFunction is needed —
-// unlike WorldCRS84Quad, which needs its own projection wiring (see /viewer for that case).
+// The X-ray viewer is a fully client-side, self-contained page: the `{layer}`/`{grid}` it renders
+// come from the `?layer=`/`?grid=` query string (comma-separated layers), NOT from any server-side
+// templating — this same static file works for any layer(s)/grid a `terraserve serve` is currently
+// publishing, in ANY CRS. It is EPSG-agnostic the same way the raster `/viewer` is (tms_http.rs
+// `viewer_html`): on load it fetches `GET /tileMatrixSets/{grid}` (the OGC TileMatrixSet 2.0
+// document, Task 2) and builds the OL projection/tileGrid straight from that response — origin,
+// resolutions and tile size come from the SAME grid resolution the `/mvt` route itself uses (a
+// published per-layer grid, or the built-in preset fallback), so the map is never guessing at tile
+// geometry. WebMercatorQuad (EPSG:3857) stays the default grid — an existing caller that never sets
+// `?grid=` gets exactly the old behaviour, just resolved through the same code path as any other CRS.
 var params = new URLSearchParams(location.search);
 // The default is substituted by the server with its FIRST published layer (see
 // server.rs xray_handler). It used to be the literal 'vector', which broke the viewer
 // on any server whose layer was named anything else: tiles 404'd because /xray asked
 // for /mvt/vector/... while the layer was, say, 'airports'. The token below is replaced
 // at request time; it stays as a working fallback if substitution ever fails.
-var layerParam = params.get('layer') || params.get('layers') || '__TS_DEFAULT_LAYER__';
+// The token expands to a JSON string literal (e.g. "airports"), so it is assigned — not quoted —
+// here; the try/catch keeps an UNSUBSTITUTED template (a raw-file unit test) from throwing on the
+// bare identifier and falls back to 'vector'.
+var tsDefaultLayer = 'vector';
+try { tsDefaultLayer = __TS_DEFAULT_LAYER__; } catch (e) {}
+var layerParam = params.get('layer') || params.get('layers') || tsDefaultLayer;
 var layerNames = layerParam.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-var tms = params.get('tms') || 'WebMercatorQuad';
+// `?grid=` is the canonical query param for the tile grid; `?tms=` (the page's original param name,
+// still used by /mvt/{layer}/style.json?tms=) is accepted as an alias so an older bookmarked/scripted
+// URL keeps working. Absent either, WebMercatorQuad — the pre-Task-3 default — is unchanged.
+// Grids the server actually publishes (its CUSTOM grids first — e.g. `swissLV95` — then the 4
+// presets), injected by `xray_handler` as a JS array LITERAL (JSON is valid JS; the server encodes
+// it HTML/JS-safe via `inline_json`). Assigned inside a try/catch so an UNSUBSTITUTED page (a
+// raw-file unit test) falls back cleanly on the bare identifier instead of a hard error.
+var serverGrids;
+try { serverGrids = __TS_GRIDS__; } catch (e) {}
+if (!Array.isArray(serverGrids) || serverGrids.length === 0) serverGrids = ['WebMercatorQuad', 'WorldCRS84Quad'];
+// Default grid: an explicit `?grid=`/`?tms=`, else the server's first grid (a custom one when
+// present, so the Swiss demo defaults to `swissLV95`; a preset-only server still gets WebMercatorQuad).
+var gridId = params.get('grid') || params.get('tms') || serverGrids[0];
 
 document.getElementById('layerInput').value = layerNames.join(',');
-document.getElementById('tmsInput').value = tms;
+(function () {
+  var sel = document.getElementById('tmsInput');
+  serverGrids.forEach(function (g) {
+    var opt = document.createElement('option');
+    opt.value = g;
+    opt.textContent = g;
+    sel.appendChild(opt);
+  });
+  // Ensure the requested grid is present even if it isn't in the server list.
+  var known = Array.prototype.some.call(sel.options, function (o) { return o.value === gridId; });
+  if (!known) {
+    var opt = document.createElement('option');
+    opt.value = gridId;
+    opt.textContent = gridId;
+    sel.appendChild(opt);
+  }
+  sel.value = gridId;
+})();
 document.getElementById('applyBtn').addEventListener('click', function () {
   var l = document.getElementById('layerInput').value.trim();
   var t = document.getElementById('tmsInput').value;
   var qs = new URLSearchParams();
   if (l) qs.set('layer', l);
-  qs.set('tms', t);
+  qs.set('grid', t);
   location.search = qs.toString();
 });
 
@@ -343,6 +380,15 @@ function xrayStyle(feature) {
       })
     ];
   }
+  // Lines, themed: colour the stroke by the same data field as the polygons (roads by class,
+  // rivers, railways), with a soft casing so a line stays visible on top of any fill.
+  if (useWmsStyle && theme && (type === 'LineString' || type === 'MultiLineString')) {
+    var lcol = theme.lookup[feature.get(theme.field)] || theme.def;
+    return [
+      new ol.style.Style({ stroke: new ol.style.Stroke({ color: 'rgba(80, 80, 80, 0.45)', width: 2.6 }) }),
+      new ol.style.Style({ stroke: new ol.style.Stroke({ color: lcol, width: 1.3 }) })
+    ];
+  }
   // Lines: stroke only. Polygons: the same glowing outline PLUS a near-invisible cyan fill so the
   // whole interior is click/hit-detectable — OpenLayers `forEachFeatureAtPixel` only registers a hit
   // on RENDERED pixels, so a stroke-only polygon is clickable only ON its thin outline (that's why
@@ -356,88 +402,11 @@ function xrayStyle(feature) {
   return styles;
 }
 
-var olLayers = layerNames.map(function (name) {
-  var source = new ol.source.VectorTile({
-    format: new ol.format.MVT(),
-    url: 'mvt/' + encodeURIComponent(name) + '/' + tms + '/{z}/{x}/{y}.pbf'
-  });
-  return new ol.layer.VectorTile({
-    source: source,
-    style: xrayStyle,
-    properties: { name: name }
-  });
-});
-
-var map = new ol.Map({
-  target: 'map',
-  layers: olLayers,
-  view: new ol.View({ center: [0, 0], zoom: 2 })
-});
-
-// Debug status box: live zoom + view bbox (lon/lat) + the centre WebMercatorQuad tile z/x/y, so tile
-// seams can be pinned to exact coordinates.
-var viewStatusEl = document.getElementById('viewStatus');
-function updateViewStatus() {
-  var v = map.getView();
-  var z = v.getZoom();
-  if (z == null) return;
-  var zi = Math.round(z);
-  var ext = v.calculateExtent(map.getSize());
-  var ll = ol.proj.transformExtent(ext, 'EPSG:3857', 'EPSG:4326');
-  var c = ol.proj.toLonLat(v.getCenter());
-  var n = Math.pow(2, zi);
-  var tx = Math.floor((c[0] + 180) / 360 * n);
-  var lat = c[1] * Math.PI / 180;
-  var ty = Math.floor((1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2 * n);
-  viewStatusEl.classList.remove('empty');
-  viewStatusEl.innerHTML =
-    '<div>zoom <b style="color:#e8fdff">' + z.toFixed(2) + '</b> &middot; tiles z<b>' + zi + '</b></div>' +
-    '<div>centre tile <b style="color:#e8fdff">' + zi + '/' + tx + '/' + ty + '</b></div>' +
-    '<div style="margin-top:4px;color:#6fb8c4">bbox lon/lat</div>' +
-    '<div>' + ll[0].toFixed(4) + ', ' + ll[1].toFixed(4) + '</div>' +
-    '<div>' + ll[2].toFixed(4) + ', ' + ll[3].toFixed(4) + '</div>';
-}
-map.on('moveend', updateViewStatus);
-map.getView().on('change:resolution', updateViewStatus);
-updateViewStatus();
-
-// Click highlight: one selection overlay per layer that SHARES the layer's MVT source (no extra
-// fetch) and styles ONLY the clicked feature — matched by its stable, unique MVT feature id — with
-// a bright white outline + translucent fill. Drawn above the base layers.
-var selected = null; // { id, layer }
-// Fluorescent-red selection: a wide soft red halo (the "glow") under a thin bright neon-red line —
-// pops against the class-coloured underlay far better than the old washed-out white.
-var HL_RED = '#ff1744';
-var highlightStyle = [
-  new ol.style.Style({
-    stroke: new ol.style.Stroke({ color: 'rgba(255, 23, 68, 0.35)', width: 8 })
-  }),
-  new ol.style.Style({
-    stroke: new ol.style.Stroke({ color: HL_RED, width: 2.5 }),
-    fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.14)' }),
-    image: new ol.style.Circle({
-      radius: 7,
-      stroke: new ol.style.Stroke({ color: HL_RED, width: 2 }),
-      fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.35)' })
-    })
-  })
-];
-var selectionLayers = olLayers.map(function (lyr) {
-  return new ol.layer.VectorTile({
-    source: lyr.getSource(),
-    renderMode: 'vector',
-    style: function (feature) {
-      return (selected && selected.layer === lyr.get('name') && feature.getId() === selected.id)
-        ? highlightStyle : null;
-    }
-  });
-});
-selectionLayers.forEach(function (s) { map.addLayer(s); });
-
 // Tile-loading spinner: count in-flight tile requests across every layer's source (OL VectorTile
 // fires tileloadstart/end/error). BUPi's initial extent view fetches many tiles at once, so the
 // spinner is a "working" cue over the otherwise-black canvas; it also surfaces tile errors instead
 // of failing silently. A fresh load batch (inflight 0 -> 1) clears the prior batch's error tally.
+// Declared before the grid fetch below so the fetch's own error path can drive the same spinner.
 var spinnerEl = document.getElementById('spinner');
 var spinnerText = document.getElementById('spinnerText');
 var inflight = 0, tileErrors = 0;
@@ -454,185 +423,372 @@ function updateSpinner() {
     spinnerEl.classList.remove('on');
   }
 }
-olLayers.forEach(function (lyr) {
-  var s = lyr.getSource();
-  s.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
-  s.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
-  s.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
-});
 
-// (Layers list removed — the Source "layer(s)" field is the sole layer indication.)
-
-// Fit the view to the first layer's advertised bounds (from its TileJSON) once it resolves;
-// falls back to the initial world view (harmless) if the layer/tms doesn't exist.
-// `?center=lon,lat&zoom=N` pins the start view; without it we fit the layer's full extent.
-// Fitting is the wrong default for a layer whose interesting scale is far below its extent — e.g.
-// 14.9M building footprints spanning the Azores to the Canaries fit to ~z5, where each footprint
-// is ~0.0001 px: an empty-looking map, and in the band where `--mvt-max-features` sampling makes
-// per-tile density (hence visible seams) at that. Point such a layer at a city instead.
-var startCenter = null, startZoom = null;
-if (params.get('center')) {
-  var c = params.get('center').split(',').map(parseFloat);
-  if (c.length === 2 && isFinite(c[0]) && isFinite(c[1])) startCenter = c;
-}
-if (params.get('zoom')) {
-  var z = parseFloat(params.get('zoom'));
-  if (isFinite(z)) startZoom = z;
-}
-if (startCenter) {
-  map.getView().setCenter(ol.proj.fromLonLat(startCenter));
-  map.getView().setZoom(startZoom === null ? 13 : startZoom);
-} else if (layerNames.length > 0) {
-  fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/' + tms + '.json')
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (doc) {
-      if (doc && Array.isArray(doc.bounds) && doc.bounds.length === 4) {
-        var extent = ol.proj.transformExtent(doc.bounds, 'EPSG:4326', 'EPSG:3857');
-        map.getView().fit(extent, { padding: [40, 40, 40, 40], maxZoom: 17 });
-        if (startZoom !== null) map.getView().setZoom(startZoom);
-      }
-    })
-    .catch(function () {});
+// `http://www.opengis.net/def/crs/EPSG/0/2056` -> `EPSG:2056` (the inverse of tms.rs's
+// `to_ogc_crs_uri`). Registering the SHORT form as the primary proj4 code (rather than the long URI)
+// means an EPSG code OL already ships a built-in definition for (3857, 4326) keeps using that
+// definition's code identity — `ol.proj.proj4.register` only ADDS/overrides entries by code, it
+// doesn't remove OL's own — while any code PROJ can resolve but OL doesn't know yet (LV95/EPSG:2056,
+// the 4 polar stereographic CRSs, …) gets a working entry for the first time. The long URI form is
+// registered too (as an alias) so nothing that spells the CRS the other way breaks.
+function epsgAliasFromUri(crs) {
+  var m = /\/EPSG\/0\/(\d+)$/.exec(crs || '');
+  return m ? ('EPSG:' + m[1]) : null;
 }
 
-// Fetch the first layer's style.json: if it has a data-driven fill, theme the map + build the
-// legend; otherwise the map stays the cyan wireframe. Legend metadata (metadata.legend) is a list
-// of { color, label } entries carried by the style (e.g. the DGT COS2018 megaclasses).
-var legendEl = document.getElementById('legend');
-function renderLegend(styleDoc) {
-  var legend = styleDoc && styleDoc.metadata && styleDoc.metadata.legend;
-  var title = styleDoc && styleDoc.metadata && styleDoc.metadata.title;
-  // Fallback: an SLD-derived /style.json carries the class palette (a fill "match") but no
-  // metadata.legend. `theme` already holds the parsed value→colour map — build the legend from it so a
-  // thematic map always shows its classes (code + swatch), even without an operator --mvt-style legend.
-  if ((!Array.isArray(legend) || legend.length === 0) && theme && theme.lookup) {
-    legend = Object.keys(theme.lookup).map(function (code) {
-      return { code: code, color: theme.lookup[code] };
-    });
-    title = title || (theme.field + ' — ' + legend.length + ' classes');
-  }
-  if (!Array.isArray(legend) || legend.length === 0) {
-    legendEl.innerHTML = '<div class="empty">cyan wireframe (no thematic style)</div>';
-    return;
-  }
-  var rows = legend.map(function (e) {
-    return '<div class="lg-row"><span class="sw" style="background:' +
-      escapeHtml(String(e.color || '#888888')) + '"></span><span class="lg-label">' +
-      escapeHtml(String(e.label || e.code || '')) + '</span></div>';
-  }).join('');
-  legendEl.innerHTML = (title ? '<div class="lg-title">' + escapeHtml(String(title)) + '</div>' : '') + rows;
-}
-if (layerNames.length > 0) {
-  fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/style.json')
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (styleDoc) {
-      theme = parseFillMatch(styleDoc);
-      // "Use WMS style" is only meaningful once a class palette resolves (from --mvt-style or the
-      // SLD-derived /style.json); enable the tick box then and let it toggle wireframe <-> class fill.
-      var wmsStyleChk = document.getElementById('wmsStyleChk');
-      wmsStyleChk.disabled = !theme;
-      // `?wms_style=0` forces the cyan X-ray wireframe even when a class palette exists (the tick
-      // box still turns it back on). Companion to `?wms=0` — both toggles are URL-addressable so a
-      // deployment can pick its own defaults per layer without a code change.
-      if (params.get('wms_style') === '0' || params.get('wms_style') === 'false') {
-        wmsStyleChk.checked = false;
-      }
-      wmsStyleChk.addEventListener('change', function () {
-        useWmsStyle = wmsStyleChk.checked;
-        olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
-      });
-      // "Use WMS style" defaults ON: once the class palette resolves, apply it immediately.
-      if (theme && wmsStyleChk.checked) {
-        useWmsStyle = true;
-        olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
-      }
-      renderLegend(styleDoc);
-    })
-    .catch(function () {});
-}
-
-// Click inspector: forEachFeatureAtPixel -> show properties as a key/value table; empty click clears.
-var inspector = document.getElementById('inspector');
-function showProps(props) {
-  var keys = Object.keys(props).filter(function (k) { return k !== 'geometry'; });
-  if (keys.length === 0) {
-    inspector.innerHTML = '<div class="empty">(no attributes)</div>';
-    return;
-  }
-  var rows = keys.map(function (k) {
-    var v = props[k];
-    return '<tr><td class="key">' + escapeHtml(k) + '</td><td class="val">' + escapeHtml(String(v)) + '</td></tr>';
-  }).join('');
-  inspector.innerHTML = '<table>' + rows + '</table>';
-}
-function clearProps() {
-  inspector.innerHTML = '<div class="empty">click a feature&hellip;</div>';
-}
 function escapeHtml(s) {
   return s.replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
   });
 }
-map.on('singleclick', function (evt) {
-  var found = null, foundLayer = null;
-  map.forEachFeatureAtPixel(evt.pixel, function (f, layer) {
-    found = f;
-    foundLayer = layer;
-    return true;
-  }, {
-    hitTolerance: 4,
-    // Don't hit-test the selection overlays themselves — only the base layers.
-    layerFilter: function (l) { return selectionLayers.indexOf(l) === -1; }
-  });
-  if (found) {
-    selected = { id: found.getId(), layer: foundLayer ? foundLayer.get('name') : null };
-    showProps(found.getProperties());
-  } else {
-    selected = null;
-    clearProps();
-  }
-  // Re-render the overlays so the highlight follows the click.
-  selectionLayers.forEach(function (s) { s.changed(); });
-});
 
-// --- WMS raster underlay ("Add WMS layer") ---------------------------------------------------------
-// Stack the server's class-coloured `/wms` render UNDERNEATH the X-ray vector. Rasterising a
-// wall-to-wall coverage has no gaps, so this is a CRISP, HOLE-FREE, browser-light (small PNG per
-// tile) way to see a dense coverage's overview — the pragmatic alternative to a heavy vector overview.
-// It renders on the fly (projection-bound), so tiles can take seconds to appear at low zoom; browser
-// tile-caching makes revisits instant. Uses this same server's `/wms` for the first `?layer=`.
-var wmsLayer = null;
-var wmsChk = document.getElementById('wmsChk');
-var wmsName = layerNames[0] || 'vector';
-// `?wms=0` starts with the underlay OFF (the tick box still turns it on). The underlay is a LIVE
-// rasterize with no precomputed archive — `--pmtiles` only ever serves the MVT path — so on a
-// layer whose low-zoom GetMap decodes millions of features it costs seconds per tile and stalls
-// the whole viewport behind `--max-inflight`. Layers that are cheap to rasterize (e.g. one with a
-// `--topology-simplify` LOD) can leave it on; huge windowed layers should pass `?wms=0`.
-if (params.get('wms') === '0' || params.get('wms') === 'false') {
-  wmsChk.checked = false;
-}
-function setWmsUnderlay(on) {
-  if (on && !wmsLayer) {
-    var src = new ol.source.TileWMS({
-      url: 'wms',
-      params: { LAYERS: wmsName, VERSION: '1.3.0', FORMAT: 'image/png', TRANSPARENT: true },
-      // Each tile is a windowed GetMap → smaller tiles project fewer features → they trickle in.
-      crossOrigin: 'anonymous'
-    });
-    // Feed the existing spinner tally so the "rendering N tiles…" cue covers the WMS renders too.
-    src.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
-    src.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
-    src.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
-    wmsLayer = new ol.layer.Tile({ source: src, properties: { name: wmsName + ' (WMS raster)' } });
-    map.getLayers().insertAt(0, wmsLayer); // index 0 = BOTTOM of the stack → under the vector X-ray
-  } else if (!on && wmsLayer) {
-    map.removeLayer(wmsLayer);
-    wmsLayer = null;
+// Fluorescent-red selection: a wide soft red halo (the "glow") under a thin bright neon-red line —
+// pops against the class-coloured underlay far better than a washed-out white. Independent of the
+// grid/projection, so it's built once, outside `boot()`.
+var HL_RED = '#ff1744';
+var highlightStyle = [
+  new ol.style.Style({
+    stroke: new ol.style.Stroke({ color: 'rgba(255, 23, 68, 0.35)', width: 8 })
+  }),
+  new ol.style.Style({
+    stroke: new ol.style.Stroke({ color: HL_RED, width: 2.5 }),
+    fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.14)' }),
+    image: new ol.style.Circle({
+      radius: 7,
+      stroke: new ol.style.Stroke({ color: HL_RED, width: 2 }),
+      fill: new ol.style.Fill({ color: 'rgba(255, 23, 68, 0.35)' })
+    })
+  })
+];
+
+// --- Build the map from the SELECTED GRID's own tile-matrix geometry -------------------------------
+// EPSG-agnostic, the same way the raster `/viewer` is (tms_http.rs `viewer_html`): fetch this grid's
+// OGC TileMatrixSet 2.0 document (Task 2), register its proj4 string, and build the OL
+// projection/tileGrid/VectorTile source straight off the response — origin/resolutions/tile size come
+// from the SAME resolution the `/mvt` route itself uses (a layer's own published grid, or the preset
+// fallback), so tile addressing can never drift from what the server actually serves. This runs for
+// EVERY grid, including the default WebMercatorQuad — there is no separate hardcoded Mercator path.
+fetch('tileMatrixSets/' + encodeURIComponent(gridId))
+  .then(function (r) {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  })
+  .then(function (tmsDoc) { boot(tmsDoc); })
+  .catch(function (err) {
+    // The grid document didn't resolve (offline dev server predating Task 2, a typo'd `?grid=`, a
+    // network hiccup) — fall back to OL's own built-in EPSG:3857 handling (no custom tileGrid), i.e.
+    // exactly the page's pre-Task-3 behaviour, so the viewer still shows SOMETHING instead of staying
+    // a blank canvas. `boot(null)` takes that path.
+    spinnerText.textContent = 'grid "' + gridId + '" error: ' + (err && err.message ? err.message : err);
+    spinnerText.className = 'err';
+    spinnerEl.classList.add('on');
+    boot(null);
+  });
+
+function boot(tmsDoc) {
+  var matrices = (tmsDoc && Array.isArray(tmsDoc.tileMatrices) && tmsDoc.tileMatrices.length > 0)
+    ? tmsDoc.tileMatrices : null;
+  var crs = (tmsDoc && tmsDoc.crs) || 'EPSG:3857';
+  var code = epsgAliasFromUri(crs) || crs;
+  if (tmsDoc && tmsDoc.proj4 && typeof proj4 !== 'undefined') {
+    proj4.defs(code, tmsDoc.proj4);
+    if (code !== crs) proj4.defs(crs, tmsDoc.proj4);
+    ol.proj.proj4.register(proj4);
   }
+  var projection = ol.proj.get(code) || ol.proj.get('EPSG:3857');
+  code = projection.getCode();
+
+  var origin, resolutions, tileW, tileH, extent, tileGrid;
+  if (matrices) {
+    var m0 = matrices[0];
+    // Top-left corner, shared across every level (tms.rs `to_ogc_value`).
+    //
+    // `pointOfOrigin` is [x, y] ONLY when the document says so. OGC TMS 2.0 lets a document
+    // declare the order of its own coordinates via `orderedAxes`, and the registered
+    // EuropeanETRS89_LAEAQuad (EPSG:3035, northing-first) writes [northing, easting] with
+    // `orderedAxes: ["Y","X"]`. Reading that pair naively puts the origin 3.5 MILLION metres out
+    // and the map silently shows nothing. Our own /tileMatrixSets always emits x,y and says so, so
+    // this branch is inert against our server — it is here so a hand-supplied or third-party grid
+    // document works too.
+    var axes = tmsDoc.orderedAxes;
+    var northingFirst = !!(axes && axes.length && /^(y|n|lat|north|northing|latitude)$/i.test(String(axes[0]).trim()));
+    origin = northingFirst ? [m0.pointOfOrigin[1], m0.pointOfOrigin[0]] : m0.pointOfOrigin;
+    tileW = m0.tileWidth;
+    tileH = m0.tileHeight;
+    resolutions = matrices.map(function (m) { return m.cellSize; });
+    // Full grid extent from level 0 — mirrors `TileMatrixSet::full_extent` (Rust) / the raster
+    // `/viewer`'s `ext`: origin is top-left, so south/east follow from the coarsest level's own
+    // matrix dims. (A non-dyadic custom grid, e.g. swissLV95, isn't level-invariant across ALL
+    // levels — this extent is a conservative outer bound, not a per-level exact one; tile col/row
+    // are computed from `origin` + `resolutions[z]` directly, independent of this extent, so panning
+    // within the real data footprint is unaffected — see the raster `/viewer`'s identical approach.)
+    var spanX = m0.matrixWidth * tileW * m0.cellSize;
+    var spanY = m0.matrixHeight * tileH * m0.cellSize;
+    extent = [origin[0], origin[1] - spanY, origin[0] + spanX, origin[1]];
+    tileGrid = new ol.tilegrid.TileGrid({ origin: origin, resolutions: resolutions, tileSize: [tileW, tileH], extent: extent });
+  } else {
+    // No grid document — OL's own default EPSG:3857 world extent; `tileGrid` stays undefined so
+    // `ol.source.VectorTile` builds its own default XYZ grid (the pre-Task-3 behaviour).
+    extent = [-20037508.342789244, -20037508.342789244, 20037508.342789244, 20037508.342789244];
+    tileGrid = undefined;
+  }
+  // Mirrors the raster `/viewer`'s `if (proj) { proj.setExtent(extent); }` exactly — always apply
+  // this grid's extent, including on OL's own built-in EPSG:3857/4326 (whose defaults already match
+  // the world extent computed above, so this is a no-op for the two presets and load-bearing for
+  // anything else).
+  projection.setExtent(extent);
+
+  var olLayers = layerNames.map(function (name) {
+    var source = new ol.source.VectorTile({
+      format: new ol.format.MVT(),
+      projection: projection,
+      tileGrid: tileGrid,
+      url: 'mvt/' + encodeURIComponent(name) + '/' + gridId + '/{z}/{x}/{y}.pbf'
+    });
+    return new ol.layer.VectorTile({
+      source: source,
+      style: xrayStyle,
+      properties: { name: name }
+    });
+  });
+
+  var map = new ol.Map({
+    target: 'map',
+    layers: olLayers,
+    view: new ol.View({
+      projection: projection,
+      center: [(extent[0] + extent[2]) / 2, (extent[1] + extent[3]) / 2],
+      zoom: 2
+    })
+  });
+
+  // Debug status box: live zoom + view bbox (lon/lat) + the centre tile z/x/y, so tile seams can be
+  // pinned to exact coordinates. The centre tile is computed directly from THIS grid's own
+  // origin/tileSize/resolutions (not a Web-Mercator-only lon/lat formula), so it's correct for any
+  // CRS, dyadic or not.
+  var viewStatusEl = document.getElementById('viewStatus');
+  function updateViewStatus() {
+    var v = map.getView();
+    var z = v.getZoom();
+    if (z == null) return;
+    var res = v.getResolution();
+    var ext = v.calculateExtent(map.getSize());
+    var ll = ol.proj.transformExtent(ext, projection, 'EPSG:4326');
+    var lines =
+      '<div>zoom <b style="color:#e8fdff">' + z.toFixed(2) + '</b></div>';
+    if (tileGrid) {
+      var zi = tileGrid.getZForResolution(res);
+      var c = v.getCenter();
+      var span = tileW * resolutions[zi];
+      var tx = Math.floor((c[0] - origin[0]) / span);
+      var ty = Math.floor((origin[1] - c[1]) / span);
+      lines += '<div>tiles z<b>' + zi + '</b> &middot; centre tile <b style="color:#e8fdff">' + zi + '/' + tx + '/' + ty + '</b></div>';
+    }
+    lines +=
+      '<div style="margin-top:4px;color:#6fb8c4">bbox lon/lat</div>' +
+      '<div>' + ll[0].toFixed(4) + ', ' + ll[1].toFixed(4) + '</div>' +
+      '<div>' + ll[2].toFixed(4) + ', ' + ll[3].toFixed(4) + '</div>';
+    viewStatusEl.classList.remove('empty');
+    viewStatusEl.innerHTML = lines;
+  }
+  map.on('moveend', updateViewStatus);
+  map.getView().on('change:resolution', updateViewStatus);
+  updateViewStatus();
+
+  // Click highlight: one selection overlay per layer that SHARES the layer's MVT source (no extra
+  // fetch) and styles ONLY the clicked feature — matched by its stable, unique MVT feature id — with
+  // a bright white outline + translucent fill. Drawn above the base layers.
+  var selected = null; // { id, layer }
+  var selectionLayers = olLayers.map(function (lyr) {
+    return new ol.layer.VectorTile({
+      source: lyr.getSource(),
+      renderMode: 'vector',
+      style: function (feature) {
+        return (selected && selected.layer === lyr.get('name') && feature.getId() === selected.id)
+          ? highlightStyle : null;
+      }
+    });
+  });
+  selectionLayers.forEach(function (s) { map.addLayer(s); });
+
+  olLayers.forEach(function (lyr) {
+    var s = lyr.getSource();
+    s.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
+    s.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
+    s.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
+  });
+
+  // (Layers list removed — the Source "layer(s)" field is the sole layer indication.)
+
+  // Fit the view to the first layer's advertised bounds (from its TileJSON, always WGS84 lon/lat per
+  // the TileJSON 3.0.0 spec regardless of tile CRS) once it resolves; falls back to the initial grid
+  // extent view (harmless) if the layer/grid doesn't exist.
+  // `?center=lon,lat&zoom=N` pins the start view; without it we fit the layer's full extent.
+  // Fitting is the wrong default for a layer whose interesting scale is far below its extent — e.g.
+  // 14.9M building footprints spanning the Azores to the Canaries fit to ~z5, where each footprint
+  // is ~0.0001 px: an empty-looking map, and in the band where `--mvt-max-features` sampling makes
+  // per-tile density (hence visible seams) at that. Point such a layer at a city instead.
+  var startCenter = null, startZoom = null;
+  if (params.get('center')) {
+    var c0 = params.get('center').split(',').map(parseFloat);
+    if (c0.length === 2 && isFinite(c0[0]) && isFinite(c0[1])) startCenter = c0;
+  }
+  if (params.get('zoom')) {
+    var z0 = parseFloat(params.get('zoom'));
+    if (isFinite(z0)) startZoom = z0;
+  }
+  if (startCenter) {
+    map.getView().setCenter(ol.proj.fromLonLat(startCenter, projection));
+    map.getView().setZoom(startZoom === null ? 13 : startZoom);
+  } else if (layerNames.length > 0) {
+    fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/' + gridId + '.json')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (doc) {
+        if (doc && Array.isArray(doc.bounds) && doc.bounds.length === 4) {
+          var fitExtent = ol.proj.transformExtent(doc.bounds, 'EPSG:4326', projection);
+          map.getView().fit(fitExtent, { padding: [40, 40, 40, 40], maxZoom: 17 });
+          if (startZoom !== null) map.getView().setZoom(startZoom);
+        }
+      })
+      .catch(function () {});
+  }
+
+  // Fetch the first layer's style.json: if it has a data-driven fill, theme the map + build the
+  // legend; otherwise the map stays the cyan wireframe. Legend metadata (metadata.legend) is a list
+  // of { color, label } entries carried by the style (e.g. the DGT COS2018 megaclasses).
+  var legendEl = document.getElementById('legend');
+  function renderLegend(styleDoc) {
+    var legend = styleDoc && styleDoc.metadata && styleDoc.metadata.legend;
+    var title = styleDoc && styleDoc.metadata && styleDoc.metadata.title;
+    // Fallback: an SLD-derived /style.json carries the class palette (a fill "match") but no
+    // metadata.legend. `theme` already holds the parsed value→colour map — build the legend from it so a
+    // thematic map always shows its classes (code + swatch), even without an operator --mvt-style legend.
+    if ((!Array.isArray(legend) || legend.length === 0) && theme && theme.lookup) {
+      legend = Object.keys(theme.lookup).map(function (code) {
+        return { code: code, color: theme.lookup[code] };
+      });
+      title = title || (theme.field + ' · ' + legend.length + ' classes');
+    }
+    if (!Array.isArray(legend) || legend.length === 0) {
+      legendEl.innerHTML = '<div class="empty">cyan wireframe (no thematic style)</div>';
+      return;
+    }
+    var rows = legend.map(function (e) {
+      return '<div class="lg-row"><span class="sw" style="background:' +
+        escapeHtml(String(e.color || '#888888')) + '"></span><span class="lg-label">' +
+        escapeHtml(String(e.label || e.code || '')) + '</span></div>';
+    }).join('');
+    legendEl.innerHTML = (title ? '<div class="lg-title">' + escapeHtml(String(title)) + '</div>' : '') + rows;
+  }
+  if (layerNames.length > 0) {
+    fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/style.json')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (styleDoc) {
+        theme = parseFillMatch(styleDoc);
+        // "Use WMS style" is only meaningful once a class palette resolves (from --mvt-style or the
+        // SLD-derived /style.json); enable the tick box then and let it toggle wireframe <-> class fill.
+        var wmsStyleChk = document.getElementById('wmsStyleChk');
+        wmsStyleChk.disabled = !theme;
+        // `?wms_style=0` forces the cyan X-ray wireframe even when a class palette exists (the tick
+        // box still turns it back on). Companion to `?wms=0` — both toggles are URL-addressable so a
+        // deployment can pick its own defaults per layer without a code change.
+        if (params.get('wms_style') === '0' || params.get('wms_style') === 'false') {
+          wmsStyleChk.checked = false;
+        }
+        wmsStyleChk.addEventListener('change', function () {
+          useWmsStyle = wmsStyleChk.checked;
+          olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
+        });
+        // "Use WMS style" defaults ON: once the class palette resolves, apply it immediately.
+        if (theme && wmsStyleChk.checked) {
+          useWmsStyle = true;
+          olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
+        }
+        renderLegend(styleDoc);
+      })
+      .catch(function () {});
+  }
+
+  // Click inspector: forEachFeatureAtPixel -> show properties as a key/value table; empty click clears.
+  var inspector = document.getElementById('inspector');
+  function showProps(props) {
+    var keys = Object.keys(props).filter(function (k) { return k !== 'geometry'; });
+    if (keys.length === 0) {
+      inspector.innerHTML = '<div class="empty">(no attributes)</div>';
+      return;
+    }
+    var rows = keys.map(function (k) {
+      var v = props[k];
+      return '<tr><td class="key">' + escapeHtml(k) + '</td><td class="val">' + escapeHtml(String(v)) + '</td></tr>';
+    }).join('');
+    inspector.innerHTML = '<table>' + rows + '</table>';
+  }
+  function clearProps() {
+    inspector.innerHTML = '<div class="empty">click a feature&hellip;</div>';
+  }
+  map.on('singleclick', function (evt) {
+    var found = null, foundLayer = null;
+    map.forEachFeatureAtPixel(evt.pixel, function (f, layer) {
+      found = f;
+      foundLayer = layer;
+      return true;
+    }, {
+      hitTolerance: 4,
+      // Don't hit-test the selection overlays themselves — only the base layers.
+      layerFilter: function (l) { return selectionLayers.indexOf(l) === -1; }
+    });
+    if (found) {
+      selected = { id: found.getId(), layer: foundLayer ? foundLayer.get('name') : null };
+      showProps(found.getProperties());
+    } else {
+      selected = null;
+      clearProps();
+    }
+    // Re-render the overlays so the highlight follows the click.
+    selectionLayers.forEach(function (s) { s.changed(); });
+  });
+
+  // --- WMS raster underlay ("Add WMS layer") -------------------------------------------------------
+  // Stack the server's class-coloured `/wms` render UNDERNEATH the X-ray vector. Rasterising a
+  // wall-to-wall coverage has no gaps, so this is a CRISP, HOLE-FREE, browser-light (small PNG per
+  // tile) way to see a dense coverage's overview — the pragmatic alternative to a heavy vector overview.
+  // It renders on the fly (projection-bound), so tiles can take seconds to appear at low zoom; browser
+  // tile-caching makes revisits instant. Uses this same server's `/wms` for the first `?layer=`. OL's
+  // TileWMS source requests in whatever CRS the map VIEW is currently in (it doesn't need to be told
+  // the grid's projection explicitly), so this needs no grid-specific wiring.
+  var wmsLayer = null;
+  var wmsChk = document.getElementById('wmsChk');
+  var wmsName = layerNames[0] || 'vector';
+  // `?wms=0` starts with the underlay OFF (the tick box still turns it on). The underlay is a LIVE
+  // rasterize with no precomputed archive — `--pmtiles` only ever serves the MVT path — so on a
+  // layer whose low-zoom GetMap decodes millions of features it costs seconds per tile and stalls
+  // the whole viewport behind `--max-inflight`. Layers that are cheap to rasterize (e.g. one with a
+  // `--topology-simplify` LOD) can leave it on; huge windowed layers should pass `?wms=0`.
+  if (params.get('wms') === '0' || params.get('wms') === 'false') {
+    wmsChk.checked = false;
+  }
+  function setWmsUnderlay(on) {
+    if (on && !wmsLayer) {
+      var src = new ol.source.TileWMS({
+        url: 'wms',
+        params: { LAYERS: wmsName, VERSION: '1.3.0', FORMAT: 'image/png', TRANSPARENT: true },
+        // Each tile is a windowed GetMap → smaller tiles project fewer features → they trickle in.
+        crossOrigin: 'anonymous'
+      });
+      // Feed the existing spinner tally so the "rendering N tiles…" cue covers the WMS renders too.
+      src.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
+      src.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
+      src.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
+      wmsLayer = new ol.layer.Tile({ source: src, properties: { name: wmsName + ' (WMS raster)' } });
+      map.getLayers().insertAt(0, wmsLayer); // index 0 = BOTTOM of the stack → under the vector X-ray
+    } else if (!on && wmsLayer) {
+      map.removeLayer(wmsLayer);
+      wmsLayer = null;
+    }
+  }
+  wmsChk.addEventListener('change', function () { setWmsUnderlay(wmsChk.checked); });
+  setWmsUnderlay(wmsChk.checked); // checkbox is `checked` by default → underlay ON at start
 }
-wmsChk.addEventListener('change', function () { setWmsUnderlay(wmsChk.checked); });
-setWmsUnderlay(wmsChk.checked); // checkbox is `checked` by default → underlay ON at start
 
 // mobile: toolbar button toggles the offcanvas sidebar (Bootstrap-style); scrim/✕ close it.
 (function () {

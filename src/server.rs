@@ -66,26 +66,54 @@ pub struct Layer {
     /// unlike `tile_cache` which is opt-out.
     pub index_cache: crate::cache::IndexCache,
     /// Tile grids this layer publishes on (TMS/WMTS). May be empty for a WMS-only layer; the TMS
-    /// front-end + viewer use the first grid as the default. Empty for the MVP vector layer
-    /// (tiled vector serving is a later rung — vector is WMS GetMap only).
+    /// front-end + viewer use the first grid as the default. Populated for a vector layer too
+    /// (`build_vector_layer` resolves `grid_ids`/`custom_grids` the same way `build_layer` does for
+    /// raster), though `data_bounds` is always `None` there (no COG geo to reproject). The MVT
+    /// (`mvt_http::resolve_grid`) and WMTS-MVT (`wmts::get_tile_mvt`) routes resolve `{tms}` against
+    /// this list FIRST, falling back to the 4 built-in `tms::preset`s.
     pub grids: Vec<PublishedGrid>,
-    /// When set, this is a **vector** layer (features + labels, WMS GetMap only). Mutually
-    /// exclusive with `cog`/`source`/`style` being `Some`.
+    /// When set, this is a **vector** layer (features + labels). Served over WMS GetMap, MVT, and
+    /// — on any grid in `grids` — WMTS/TMS raster tiles via `VectorLayer::render_tile`; only the
+    /// GetMap path draws labels. Mutually exclusive with `cog`/`source`/`style` being `Some`.
     pub vector: Option<VectorLayer>,
-    /// When set, MVT tiles are served from this pre-built PMTiles archive first, falling back to live
-    /// encoding on a miss. `None` = live encode only. Opt-in via `serve --pmtiles`.
-    pub pmtiles: Option<std::sync::Arc<crate::vector::pmtiles::read::PmtilesReader>>,
-    /// Write-through overlay (Spec 2): when set, a miss is live-encoded then persisted here, and this
-    /// overlay owns the (swappable) base reader. `None` = no write-through. Opt-in via --pmtiles-cache.
-    pub overlay: Option<std::sync::Arc<crate::vector::pmtiles::overlay::TileOverlay>>,
+    /// Pre-built PMTiles archives this layer can read through, keyed by the `grid_id` each archive
+    /// self-describes in its metadata (design commitment: one archive per grid, never mixed). A
+    /// request on grid G checks `pmtiles.get(G)` first, falling back to live encoding on a miss (or
+    /// when no archive is registered for G). Empty = live encode only. Populated via one or more
+    /// (repeatable) `serve --pmtiles <path>`.
+    pub pmtiles: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<crate::vector::pmtiles::read::PmtilesReader>,
+    >,
+    /// Pre-baked **PNG** archives this layer's WMTS/TMS raster path reads through, keyed by the
+    /// PUBLISHED grid id the archive was matched to at startup (`WebMercatorQuad_512`, not the bare
+    /// name the archive stamps) — so a tile request looks up `raster_pmtiles.get(&pg.tms.id)` with
+    /// no re-derivation. Mirrors `pmtiles` above in every other respect: opt-in, one archive per
+    /// grid, a hit is a disk read and a miss renders live. Populated via `serve --raster-pmtiles`
+    /// (or a layer's `raster_pmtiles:` in `--config`); the archives are validated at startup to
+    /// declare `tile_type` PNG and to match a published grid at the same pixel size.
+    pub raster_pmtiles: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<crate::vector::pmtiles::read::PmtilesReader>,
+    >,
+    /// Write-through overlays (Spec 2 + Task 4 per-grid), keyed by `grid_id` — mirrors `pmtiles`
+    /// (design commitment 1: never mix grids in one archive, so a miss for grid G persists only into
+    /// G's overlay). A miss for grid G is live-encoded then persisted into `overlay[G]`, which owns
+    /// its own (swappable) base reader. Empty = no write-through for this layer. Opt-in via
+    /// `--pmtiles-cache`, one overlay per `--pmtiles` archive.
+    pub overlay: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<crate::vector::pmtiles::overlay::TileOverlay>,
+    >,
 }
 
 /// A vector + label layer (the label engine). Parsed once at startup; served over WMS GetMap.
 pub struct VectorLayer {
     /// The feature source (GeoJSON/GPKG today, load-all; FlatGeoBuf the future windowed reader) —
     /// the `VectorSource` seam every vector-serving path (WMS GetMap/GetFeatureInfo, `/mvt`, WMTS
-    /// GetTile) reads through via `features_in(bbox)`. Always `LoadAll` today; `Windowed` is
-    /// unblocked but has no real implementer yet.
+    /// GetTile) reads through — via `features_in(bbox)`, or `features_in_gated` on the paths that
+    /// apply the min-feature-size gate. Always `LoadAll` today; `Windowed` is unblocked but has no
+    /// real implementer yet.
     pub source: crate::vector::source::VectorSource,
     /// The vector style (rule-based Style IR: scale + filter rule selection → symbolizers).
     pub style: crate::vector::style::Style,
@@ -102,6 +130,14 @@ pub struct VectorLayer {
     /// recomputing it (removing the byte-lock duplication). `0.0` if not computable → the
     /// min-feature-size gate fails OPEN (see `mvt::min_area_src_for_zoom`).
     pub area_scale: f64,
+    /// `--mvt-min-feature-px` for this layer (`0.0` = gate off). The other half of the size gate:
+    /// with `area_scale` it turns a display-px² budget into a source-CRS area threshold. Carried on
+    /// the LAYER, not read off `ServeState` per request, because the RASTER paths that apply it do
+    /// not all see a `ServeState` — `wms::handle_layers` takes a bare `&[Layer]`, and the
+    /// `build-pmtiles --tile-format png` bake runs with no server at all. The MVT path still reads
+    /// `ServeState::mvt_min_feature_px` via `MvtOptimizations::for_layer`; both come from the same
+    /// flag, so they agree by construction (folding that read onto this field is a queued cleanup).
+    pub min_feature_px: f64,
     /// Optional per-zoom level-of-detail pools (topology serve): when `Some`, the MVT/WMTS/WMS paths
     /// pick a zoom/scale-appropriate `FeatureSource` from here instead of `source`. `None` = no LOD
     /// (serve `source` at all zooms — the raw / single-tolerance path).
@@ -132,6 +168,68 @@ impl VectorLayer {
             None => self.source.clone(),
         }
     }
+
+    /// Render one RASTER tile of this layer as a PNG — the single implementation behind both tile
+    /// front-ends (`tms_http::render_tms_tile` and `wmts::get_tile`). A tile IS a `GetMap` with a
+    /// bbox computed from the grid, so this does exactly what `wms::get_map_vector` does, through
+    /// the same `render_vector_from`: a second render path would drift, and drift here means two
+    /// different maps of the same data.
+    ///
+    /// Two deliberate differences from GetMap, both documented at their cause:
+    /// * **No labels** (`labels = false`) — see `vector::render::render_vector_from`.
+    /// * **Alpha is kept** — no `TRANSPARENT`/`BGCOLOR` flattening, matching the raster tile path
+    ///   (`tms::TileFactory::render_tile`), because tiles are composited by the client.
+    ///
+    /// LOD comes from `source_for_scale` on the tile's OWN pixel resolution, NOT `source_for_zoom`:
+    /// a 512-px grid packs twice the detail of a 256-px grid at the same `z`, and the point of
+    /// deriving the scale denominator is that a tile and the GetMap covering the same ground at the
+    /// same pixel size pick the SAME pool. (`/mvt` correctly uses `source_for_zoom` — its encoder
+    /// has a fixed 4096-unit extent, so zoom is its only resolution.)
+    ///
+    /// Note there is no empty-tile short-circuit here: `data_bounds` is `None` for every vector
+    /// layer, so a tile entirely outside the data still costs a source query (a real round trip for
+    /// PostGIS/S3). That is a caching/precompute concern, tracked in the plan's Task 5.
+    pub fn render_tile(
+        &self,
+        src_crs: &str,
+        grid: &crate::tms::TileMatrixSet,
+        z: u32,
+        col: u32,
+        row: u32,
+    ) -> Result<Vec<u8>, String> {
+        let bbox = grid
+            .tile_bounds(z, col, row)
+            .ok_or_else(|| format!("tile out of range: z={z} col={col} row={row}"))?;
+        let (tw, th) = (grid.tile_w, grid.tile_h);
+        // Per-zoom LOD: the scale denominator of THIS tile, exactly as `wms::get_map_vector`
+        // derives it for a GetMap. Skipping it would render full detail at z2 — the 34-second
+        // whole-country request the tile pyramid exists to avoid, once per tile.
+        let scale = crate::vector::render::request_scale_denominator(bbox, tw, &grid.crs);
+        let vs = self.source_for_scale(scale);
+        // Min-feature-size gate, derived from the SAME scale denominator the LOD pick above uses
+        // (`mvt::min_area_src_for_scale` shares the inversion), so a tile cannot thin at one
+        // effective zoom while its geometry pool was chosen at another. `0.0` unless the operator
+        // set `--mvt-min-feature-px`. This is the raster half of a gate that used to be MVT-only —
+        // the reason a z1 tile of a 107.9M-row PostGIS layer once fetched every row.
+        let min_area_src =
+            crate::vector::mvt::min_area_src_for_scale(scale, self.area_scale, self.min_feature_px);
+        // Truncation stays loud on this path: the per-query feature cap
+        // (TERRASERVE_{FGB,GPKG,PG}_MAX_QUERY_FEATURES) warns from inside `features_in`, which is
+        // where this read goes. A tile is not a reason for a dropped feature to go unlogged.
+        let rgba = crate::vector::render::render_vector_from(
+            &vs,
+            &self.style,
+            src_crs,
+            &grid.crs,
+            bbox,
+            tw,
+            th,
+            &self.shaper,
+            false,
+            min_area_src,
+        )?;
+        crate::pngio::encode_rgba(&rgba, tw, th)
+    }
 }
 
 /// Immutable shared state for the WMS service: the published layers plus the advertised URL.
@@ -140,6 +238,12 @@ pub struct ServeState {
     pub layers: Vec<Layer>,
     /// Advertised OnlineResource / GetMap endpoint (injected into GetCapabilities).
     pub base_url: String,
+    /// The operator's `--public-url`, kept SEPARATE from `base_url` so we can tell "the operator
+    /// declared the public URL" from "we defaulted to the bind address". `base_url` collapses the
+    /// two (it falls back to `http://{host}:{port}/wms`), and that ambiguity is what let
+    /// `mvt_http::advertised_origin` ignore a configured `--public-url` in favour of the Host
+    /// header, advertising `http://` tile URLs with the path prefix stripped. `None` = not set.
+    pub public_url: Option<String>,
     /// **Admission control:** caps the number of CONCURRENT renders. A request acquires a permit
     /// before its `spawn_blocking` render and holds it until the response is built, so peak memory =
     /// (permits × per-request render buffers) + the bounded caches — hard-bounded regardless of how
@@ -198,12 +302,56 @@ pub struct ServeState {
 }
 
 impl ServeState {
+    /// The origin every advertised URL hangs off: `https://host[/prefix]`, with no trailing
+    /// slash and no `/wms` suffix.
+    ///
+    /// This is THE single derivation. It used to exist four times, once per front-end
+    /// (`wms::online_resource`, `wmts::bases`, `tms_http::tms_root`, `mvt_http`), and the four
+    /// copies had drifted: only the MVT one learned about `X-Forwarded-Proto`, so TMS and WMTS
+    /// could not construct an `https` URL from a request at all and depended entirely on
+    /// `--public-url` being set. One of the copies also hardcoded `http://`, which shipped
+    /// broken tile URLs to production.
+    ///
+    /// Precedence, and why:
+    ///
+    /// 1. An explicitly configured `--public-url` WINS. It is the only source carrying both
+    ///    the public scheme and the reverse-proxy path prefix; no request header carries the
+    ///    prefix at all.
+    /// 2. Otherwise derive from the request, because `base_url` has then fallen back to the
+    ///    BIND address (`http://127.0.0.1:8080/wms`), which is useless to an external client.
+    ///    The scheme comes from `X-Forwarded-Proto`: a TLS-terminating proxy means the
+    ///    connection this process sees is always plain HTTP, so the scheme cannot be inferred
+    ///    from it. A proxy chain sends a comma-separated list whose FIRST entry is the
+    ///    original client-facing scheme.
+    /// 3. With no Host header either, fall back to `base_url`.
+    pub fn advertised_origin(
+        &self,
+        request_host: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> String {
+        if let Some(pu) = self.public_url.as_deref() {
+            return trim_origin(pu);
+        }
+        match request_host {
+            Some(h) if !h.is_empty() => {
+                let scheme = forwarded_proto
+                    .and_then(|p| p.split(',').next())
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("http");
+                format!("{scheme}://{h}")
+            }
+            _ => trim_origin(&self.base_url),
+        }
+    }
+
     /// Build the service state with an admission-control limiter of `max_inflight` permits (min 1).
     /// `mvt_max_features` starts at the default; callers that expose the flag set it afterwards.
     pub fn new(layers: Vec<Layer>, base_url: String, max_inflight: usize) -> ServeState {
         ServeState {
             layers,
             base_url,
+            public_url: None,
             render_limiter: Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
@@ -253,6 +401,9 @@ async fn serve(state: ServeState, host: &str, port: u16) -> Result<(), Error> {
         // MapLibre GL style JSON (static path wins over the `:tmsjson` param route below).
         .route("/mvt/:layer/style.json", get(mvt_style_handler))
         .route("/mvt/:layer/:tmsjson", get(mvt_tilejson_handler))
+        // OGC TileMatrixSet 2.0 JSON for a published grid (Task 2) — the first foothold of OGC
+        // API - Tiles; consumed by the X-ray viewer (Task 3) to render MVT on any CRS.
+        .route("/tileMatrixSets/:id", get(tile_matrix_sets_handler))
         .route("/viewer", get(viewer_handler))
         .route("/xray", get(xray_handler))
         .route(
@@ -265,17 +416,18 @@ async fn serve(state: ServeState, host: &str, port: u16) -> Result<(), Error> {
         )
         .with_state(state.clone());
 
-    // Write-through compaction (task 6): spawn one controller per `--pmtiles-cache` layer and collect
-    // the roster for the final shutdown compaction. Every cache layer publishes on WebMercatorQuad, so
-    // the compaction header zoom span is derived once here.
-    let (min_z, max_z) = pmtiles_grid_zoom_range();
+    // Write-through compaction (task 6, per-grid as of task 4): spawn one controller per
+    // (layer, grid) overlay and collect the roster for the final shutdown compaction. Each grid's
+    // own zoom span (not a hardcoded WebMercatorQuad one) drives its compaction header, so a
+    // non-Mercator archive's `.pmtiles` header reflects the grid it actually holds.
     let interval = state.pmtiles_flush_interval;
-    let mut cache_layers: Vec<(Arc<TileOverlay>, [f64; 4])> = Vec::new();
+    let mut cache_layers: Vec<(Arc<TileOverlay>, [f64; 4], (u8, u8))> = Vec::new();
     for layer in &state.layers {
-        if let Some(ov) = layer.overlay.clone() {
+        for (grid_id, ov) in &layer.overlay {
             let bounds = layer.bounds_wgs84;
-            cache_layers.push((ov.clone(), bounds));
-            let ctrl = ov;
+            let zoom_range = grid_zoom_range(layer, grid_id);
+            cache_layers.push((ov.clone(), bounds, zoom_range));
+            let ctrl = ov.clone();
             tokio::spawn(async move {
                 loop {
                     // Next trigger: the interval tick OR a size-cap/flush wake. With no interval, only
@@ -297,6 +449,7 @@ async fn serve(state: ServeState, host: &str, port: u16) -> Result<(), Error> {
                     // also serializes same-layer compactions so no two ever share the scratch file.
                     if ctrl.try_begin_compaction() {
                         let run = ctrl.clone();
+                        let (min_z, max_z) = zoom_range;
                         let _ = tokio::task::spawn_blocking(move || {
                             compact_overlay_layer(&run, bounds, min_z, max_z)
                         })
@@ -359,14 +512,14 @@ async fn serve(state: ServeState, host: &str, port: u16) -> Result<(), Error> {
     // atomic CAS replaces the old TOCTOU `is_compacting()` pre-check: it skips a layer a controller
     // tick still owns (it raced shutdown) AND serializes against it, so no two compactions ever share
     // the scratch file. Skip an empty overlay (nothing to fold in).
-    for (ov, bounds) in &cache_layers {
+    for (ov, bounds, (min_z, max_z)) in &cache_layers {
         if ov.snapshot_ids().is_empty() {
             continue;
         }
         if !ov.try_begin_compaction() {
             continue; // a controller/flush compaction already owns this layer -> don't double-write
         }
-        match compact_overlay_layer(ov, *bounds, min_z, max_z) {
+        match compact_overlay_layer(ov, *bounds, *min_z, *max_z) {
             Ok(c) => println!(
                 "shutdown compaction: addressed {} · entries {} · contents {} · {} bytes",
                 c.addressed, c.entries, c.contents, c.bytes
@@ -405,20 +558,38 @@ async fn shutdown_signal() {
     }
 }
 
-/// The WebMercatorQuad zoom span every `--pmtiles-cache` layer publishes on (min/max level `z`), for
-/// the compaction `HeaderFields`. Falls back to a full `0..=22` span if the preset is unavailable.
-fn pmtiles_grid_zoom_range() -> (u8, u8) {
-    crate::tms::preset("WebMercatorQuad", 4096)
-        .map(|g| {
+/// The zoom span (min/max level `z`) grid `grid_id` publishes, for a write-through overlay's
+/// compaction `HeaderFields` — one archive per grid (design commitment 1), so each grid's own span
+/// belongs in its own header, not a hardcoded WebMercatorQuad one. Resolution mirrors
+/// `mvt_http::resolve_grid`: the layer's own published grids first (exact id, or the stored id's
+/// `_{px}` size suffix stripped), falling back to `tms::preset(grid_id, 4096)` for the 4 built-ins.
+/// Falls back to a full `0..=22` span if neither resolves.
+fn grid_zoom_range(layer: &Layer, grid_id: &str) -> (u8, u8) {
+    let grid = layer
+        .grids
+        .iter()
+        .find(|g| g.tms.id == grid_id || crate::tms::strip_size_suffix(&g.tms.id) == grid_id)
+        .map(|g| g.tms.clone())
+        .or_else(|| crate::tms::preset(grid_id, 4096));
+    match grid {
+        Some(g) => {
             let lo = g.levels.iter().map(|l| l.z).min().unwrap_or(0) as u8;
             let hi = g.levels.iter().map(|l| l.z).max().unwrap_or(22) as u8;
             (lo, hi)
-        })
-        .unwrap_or((0, 22))
+        }
+        None => (0, 22),
+    }
 }
 
-async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery) -> Response {
+async fn wms_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
     let query = q.unwrap_or_default();
+    // Resolve the advertised endpoint HERE, while the request headers are still in scope — the
+    // render runs on a blocking worker that only sees what we move into it.
+    let base_url = wms_base(&state, &headers);
     // Log each incoming request so we can see exactly what a client (QGIS) sends.
     println!("--> WMS: {query}");
     // Admission control: acquire a render permit (queues under burst) so concurrent renders — and
@@ -441,7 +612,7 @@ async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery
                         content_type: Some("image/png".to_string()),
                     };
                 }
-                let r = wms::handle_layers(&st.layers, &query, Some(&st.base_url));
+                let r = wms::handle_layers(&st.layers, &query, Some(&base_url));
                 // Cache ONLY a successful PNG — never an exception XML (it'd be served as image/png).
                 if r.bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
                     cache.insert(query.clone(), Arc::new(r.bytes.clone()));
@@ -449,7 +620,7 @@ async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery
                 return r;
             }
         }
-        wms::handle_layers(&st.layers, &query, Some(&st.base_url))
+        wms::handle_layers(&st.layers, &query, Some(&base_url))
     })
     .await;
 
@@ -506,17 +677,21 @@ fn status_response(status: u16, msg: String) -> Response {
 }
 
 /// `GET /tms/1.0.0/` — the TileMapService document (all layer×grid TileMaps).
-async fn tms_service_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let root = crate::tms_http::tms_root(&state.base_url);
+async fn tms_service_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let root = crate::tms_http::tms_root(&origin_of(&state, &headers));
     xml_response(crate::tms_http::tilemapservice_xml(&state, &root))
 }
 
 /// `GET /tms/1.0.0/{layer}[@{grid}]` — a TileMap document.
 async fn tms_tilemap_handler(
     State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
     Path(layerspec): Path<String>,
 ) -> Response {
-    let root = crate::tms_http::tms_root(&state.base_url);
+    let root = crate::tms_http::tms_root(&origin_of(&state, &headers));
     match crate::tms_http::tilemap_doc(&state, &layerspec, &root) {
         Ok(xml) => xml_response(xml),
         Err((status, msg)) => status_response(status, msg),
@@ -572,9 +747,13 @@ async fn mvt_tile_handler(
     }
 }
 
-/// `POST /mvt/{layer}/flush` — force-compact the layer's write-through overlay into its `.pmtiles`
-/// now (task 6 admin route). `404` for an unknown layer, `400` if the layer has no write-through
-/// cache, `200` with the resulting `Counts`, or `500` on a compaction error.
+/// `POST /mvt/{layer}/flush` — force-compact EVERY grid's write-through overlay for the layer into
+/// its own `.pmtiles` now (task 6 admin route; per-grid as of task 4 — a layer can carry one overlay
+/// per grid, so a single flush walks all of them). `404` for an unknown layer, `400` if the layer has
+/// no write-through cache at all. Otherwise `200` with one result line per grid UNLESS at least one
+/// grid's compaction errored (`500`) — a grid whose overlay was already mid-compaction (another
+/// `/flush`, or an interval/shutdown run) is skipped and noted in the body rather than failing the
+/// whole request; if EVERY grid was busy the response is `409`.
 async fn mvt_flush_handler(
     State(state): State<Arc<ServeState>>,
     Path(layer): Path<String>,
@@ -582,34 +761,99 @@ async fn mvt_flush_handler(
     let Some(lyr) = state.layers.iter().find(|l| l.name == layer) else {
         return status_response(404, format!("unknown layer '{layer}'"));
     };
-    let Some(ov) = lyr.overlay.clone() else {
+    if lyr.overlay.is_empty() {
         return status_response(400, "layer has no write-through cache".into());
-    };
+    }
     let bounds = lyr.bounds_wgs84;
-    let (min_z, max_z) = pmtiles_grid_zoom_range();
-    // Atomic CAS: take compaction ownership IFF none is already running. A second concurrent
-    // compaction (another `/flush`, or an interval/shutdown run) would share `PmtilesWriter`'s
-    // PID-only scratch file and corrupt the intermediate, so refuse with 409 instead of starting one.
-    // While held, `put`'s compacting-skip (same inner lock) pauses write-through for the run.
-    if !ov.try_begin_compaction() {
-        return status_response(409, "compaction already in progress".into());
+    let mut lines: Vec<String> = Vec::new();
+    let (mut any_ok, mut any_error) = (false, false);
+    for (grid_id, ov) in &lyr.overlay {
+        // Atomic CAS: take compaction ownership of THIS grid's overlay IFF none is already running
+        // for it. A second concurrent compaction (another `/flush`, or an interval/shutdown run)
+        // would share `PmtilesWriter`'s PID-only scratch file and corrupt the intermediate, so skip
+        // it (noted below) instead of starting one. While held, `put`'s compacting-skip (same inner
+        // lock) pauses write-through for that grid only.
+        if !ov.try_begin_compaction() {
+            lines.push(format!("{grid_id}: compaction already in progress"));
+            continue;
+        }
+        let (min_z, max_z) = grid_zoom_range(lyr, grid_id);
+        let run = ov.clone();
+        let result =
+            tokio::task::spawn_blocking(move || compact_overlay_layer(&run, bounds, min_z, max_z))
+                .await;
+        ov.end_compaction(); // runs whether the compaction succeeded, errored, or the task panicked
+        match result {
+            Ok(Ok(c)) => {
+                any_ok = true;
+                lines.push(format!(
+                    "{grid_id}: compacted addressed {} entries {} contents {} bytes {}",
+                    c.addressed, c.entries, c.contents, c.bytes
+                ));
+            }
+            Ok(Err(e)) => {
+                any_error = true;
+                lines.push(format!("{grid_id}: compaction failed: {e}"));
+            }
+            Err(_) => {
+                any_error = true;
+                lines.push(format!("{grid_id}: compaction task panicked"));
+            }
+        }
     }
-    let run = ov.clone();
-    let result =
-        tokio::task::spawn_blocking(move || compact_overlay_layer(&run, bounds, min_z, max_z))
-            .await;
-    ov.end_compaction(); // runs whether the compaction succeeded, errored, or the task panicked
-    match result {
-        Ok(Ok(c)) => status_response(
-            200,
-            format!(
-                "compacted: addressed {} entries {} contents {} bytes {}",
-                c.addressed, c.entries, c.contents, c.bytes
-            ),
-        ),
-        Ok(Err(e)) => status_response(500, format!("compaction failed: {e}")),
-        Err(_) => status_response(500, "compaction task panicked".into()),
+    let body = lines.join("\n");
+    if any_error {
+        status_response(500, body)
+    } else if any_ok {
+        status_response(200, body)
+    } else {
+        status_response(409, body) // every grid's overlay was already mid-compaction
     }
+}
+
+/// A configured URL reduced to the origin that advertised paths hang off: drop the
+/// conventional `/wms` endpoint suffix and any trailing slash, so composing `{origin}/mvt/...`
+/// or `{origin}/tms/1.0.0` never doubles a separator. A URL without the `/wms` suffix is left
+/// alone apart from the trailing slash.
+fn trim_origin(url: &str) -> String {
+    url.strip_suffix("/wms")
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// The advertised origin for THIS request: pulls `Host` and `X-Forwarded-Proto` off the
+/// header map and hands them to the single shared derivation. Every front-end that emits an
+/// absolute URL goes through here, so a proxied deployment gets one consistent answer.
+fn origin_of(state: &ServeState, headers: &axum::http::HeaderMap) -> String {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    state.advertised_origin(host, forwarded_proto(headers))
+}
+
+/// The advertised WMS endpoint for THIS request: the shared origin plus the `/wms` path.
+///
+/// `wms::online_resource` (the `<OnlineResource xlink:href>` in GetCapabilities, and the one a
+/// client is supposed to append its KVP to) was the last front-end still reading
+/// `state.base_url` directly. Without `--public-url` that field has fallen back to the BIND
+/// address, so a proxied deployment published `http://127.0.0.1:8080/wms?` — a href QGIS
+/// follows straight to an unreachable host — while the MVT/TMS/WMTS roots on the same server,
+/// already routed through `origin_of`, published the real public URL. Going through the same
+/// derivation gives all four the same precedence: `--public-url` > `Host` + `X-Forwarded-Proto`
+/// > `base_url`.
+fn wms_base(state: &ServeState, headers: &axum::http::HeaderMap) -> String {
+    format!("{}/wms", origin_of(state, headers))
+}
+
+/// The client-facing scheme, as reported by the reverse proxy's `X-Forwarded-Proto`.
+///
+/// Traefik terminates TLS in front of us (see `deploy/vps/`), so the connection this process
+/// accepts is ALWAYS plain HTTP and the public scheme cannot be inferred from it. Without this
+/// header an HTTPS deployment advertises `http://` URLs, which browsers block as mixed content.
+/// `None` when absent (direct/local run) — callers fall back to `http`.
+fn forwarded_proto(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
 }
 
 /// `GET /mvt/{layer}/{tms}.json` — a TileJSON 3.0.0 document for the layer×grid.
@@ -620,7 +864,8 @@ async fn mvt_tilejson_handler(
 ) -> Response {
     let tms = tmsjson.strip_suffix(".json").unwrap_or(&tmsjson);
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    match crate::mvt_http::tilejson_doc(&state, &layer, tms, host) {
+    let proto = forwarded_proto(&headers);
+    match crate::mvt_http::tilejson_doc(&state, &layer, tms, host, proto) {
         Ok(json) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json))
@@ -629,15 +874,41 @@ async fn mvt_tilejson_handler(
     }
 }
 
-/// `GET /mvt/{layer}/style.json` — a MapLibre GL Style JSON (source + generic X-ray styling) so a
-/// client (QGIS's *Style URL*, MapLibre, the X-ray viewer) is configured from one URL.
+/// `GET /mvt/{layer}/style.json[?tms=GRID_ID]` — a MapLibre GL Style JSON (source + generic X-ray
+/// styling) so a client (QGIS's *Style URL*, MapLibre, the X-ray viewer) is configured from one
+/// URL. `?tms=` selects which TileMatrixSet the embedded `sources.terraserve.url` TileJSON points
+/// at — matching the `?tms=` the X-ray viewer already uses for the tile/TileJSON requests
+/// (`xray.html`) — and defaults to `WebMercatorQuad` when absent, so an existing caller that never
+/// asked for a grid sees byte-identical output. See `mvt_http::style_json`'s doc comment for why
+/// this only changes which TileJSON the STYLE references, not what MapLibre can actually render.
 async fn mvt_style_handler(
     State(state): State<Arc<ServeState>>,
     headers: axum::http::HeaderMap,
+    RawQuery(q): RawQuery,
     Path(layer): Path<String>,
 ) -> Response {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    match crate::mvt_http::style_json(&state, &layer, host) {
+    let proto = forwarded_proto(&headers);
+    let grid_id = q
+        .as_deref()
+        .and_then(|qs| qs.split('&').find_map(|kv| kv.strip_prefix("tms=")))
+        .map(crate::wms::percent_decode)
+        .unwrap_or_else(|| "WebMercatorQuad".to_string());
+    match crate::mvt_http::style_json(&state, &layer, &grid_id, host, proto) {
+        Ok(json) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json))
+            .unwrap(),
+        Err((status, msg)) => status_response(status, msg),
+    }
+}
+
+/// `GET /tileMatrixSets/{id}` — see `tms_http::tile_matrix_set_doc` for the resolution rule.
+async fn tile_matrix_sets_handler(
+    State(state): State<Arc<ServeState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match crate::tms_http::tile_matrix_set_doc(&state, &id) {
         Ok(json) => Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(json))
@@ -659,9 +930,13 @@ fn wmts_exception_response(e: crate::wmts::WmtsErr) -> Response {
 }
 
 /// `GET /wmts?…` — WMTS KVP binding (GetCapabilities / GetTile / OWS exception).
-async fn wmts_kvp_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery) -> Response {
+async fn wmts_kvp_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
     let query = q.unwrap_or_default();
-    let (kvp_base, rest_base) = crate::wmts::bases(&state.base_url);
+    let (kvp_base, rest_base) = crate::wmts::bases(&origin_of(&state, &headers));
     match crate::wmts::parse_kvp(&query) {
         crate::wmts::WmtsRequest::GetCapabilities => {
             xml_response(crate::wmts::capabilities_xml(&state, &kvp_base, &rest_base))
@@ -754,8 +1029,11 @@ async fn wmts_kvp_handler(State(state): State<Arc<ServeState>>, RawQuery(q): Raw
 }
 
 /// `GET /wmts/1.0.0/WMTSCapabilities.xml` — WMTS RESTful GetCapabilities.
-async fn wmts_caps_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let (kvp_base, rest_base) = crate::wmts::bases(&state.base_url);
+async fn wmts_caps_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let (kvp_base, rest_base) = crate::wmts::bases(&origin_of(&state, &headers));
     xml_response(crate::wmts::capabilities_xml(&state, &kvp_base, &rest_base))
 }
 
@@ -784,8 +1062,11 @@ async fn wmts_rest_tile_handler(
 }
 
 /// `GET /viewer` — the built-in map viewer (filled in Task 6).
-async fn viewer_handler(State(state): State<Arc<ServeState>>) -> Response {
-    let html = crate::tms_http::viewer_html(&state);
+async fn viewer_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let html = crate::tms_http::viewer_html(&state, &origin_of(&state, &headers));
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
@@ -796,6 +1077,21 @@ async fn viewer_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// page (`xray.html`, embedded at compile time — no per-request templating needed): it reads the
 /// `{layer}`/`{tms}` to display from the `?layer=`/`?tms=` query string client-side and requests
 /// tiles straight from `/mvt/{layer}/{tms}/{z}/{x}/{y}.pbf`, so no `ServeState` is needed here.
+/// Serialize `v` to JSON that is safe to embed DIRECTLY inside an inline `<script>` as a JS
+/// expression. serde's JSON is valid JS, but three characters can break out of / corrupt an inline
+/// script and are escaped here: `<` (so a value containing `</script>` or `<!--` can neither close
+/// the element nor open an HTML comment) and the U+2028 / U+2029 line separators (legal in a JSON
+/// string but illegal in a pre-ES2019 JS string literal). Used for the viewer's injected grid list
+/// and default layer name — both operator-controlled config values reaching an HTML/JS context.
+/// Falls back to `null` (a valid JS literal) if serialization somehow fails.
+fn inline_json<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string(v)
+        .unwrap_or_else(|_| "null".to_string())
+        .replace('<', "\\u003c")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
     // Substitute the server's FIRST layer as the viewer's default. Without this the page
     // defaulted to the literal "vector" and every tile 404'd whenever the layer was named
@@ -806,10 +1102,50 @@ async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
         .first()
         .map(|l| l.name.as_str())
         .unwrap_or("vector");
+    // Grids to offer in the viewer's picker: every CUSTOM grid any layer publishes (deduped, in
+    // config order) followed by the 4 built-in presets (always servable via the route fallback).
+    // Injected as a JSON array; without this the picker only listed the two hardcoded presets, so
+    // a custom grid like `swissLV95` could never be selected from the UI (only via `?grid=`).
+    let mut grids: Vec<String> = Vec::new();
+    for l in &state.layers {
+        for g in &l.grids {
+            if !grids.iter().any(|x| x == &g.tms.id) {
+                grids.push(g.tms.id.clone());
+            }
+        }
+    }
+    // Presets to offer, filtered by whether the data's WGS84 extent lies in their coverage: the two
+    // GLOBAL quads always; the POLAR UPS grids only for genuinely polar data (union the layers'
+    // north/south) — so a Swiss layer never advertises Arctic/Antarctic grids, but the Antarctic
+    // REMA demo still gets UPSAntarcticWGS84Quad.
+    let (mut south, mut north) = (90.0_f64, -90.0_f64);
+    for l in &state.layers {
+        south = south.min(l.bounds_wgs84[1]);
+        north = north.max(l.bounds_wgs84[3]);
+    }
+    let mut presets: Vec<&str> = vec!["WebMercatorQuad", "WorldCRS84Quad"];
+    if north > 60.0 {
+        presets.push("UPSArcticWGS84Quad");
+    }
+    if south < -60.0 {
+        presets.push("UPSAntarcticWGS84Quad");
+    }
+    for p in presets {
+        if !grids.iter().any(|x| x == p) {
+            grids.push(p.to_string());
+        }
+    }
+    // Both placeholders expand into an inline <script> as JS expressions, so encode them with
+    // `inline_json` (HTML/JS-context-safe) rather than raw substitution: a grid id or layer name is
+    // an operator-controlled config value that could otherwise close the <script> or break the JS.
+    let grids_json = inline_json(&grids);
+    let layer_json = inline_json(&default_layer);
     Response::builder()
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(
-            xray_html().replace("__TS_DEFAULT_LAYER__", default_layer),
+            xray_html()
+                .replace("__TS_DEFAULT_LAYER__", &layer_json)
+                .replace("__TS_GRIDS__", &grids_json),
         ))
         .unwrap()
 }
@@ -818,4 +1154,131 @@ async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
 /// the call site) so it's directly unit-testable without spinning an HTTP server.
 pub fn xray_html() -> &'static str {
     include_str!("xray.html")
+}
+
+#[cfg(test)]
+mod advertised_origin_tests {
+    use super::ServeState;
+
+    fn state_with(public_url: Option<&str>, base_url: &str) -> ServeState {
+        let mut st = ServeState::new(vec![], base_url.into(), 1);
+        st.public_url = public_url.map(str::to_string);
+        st
+    }
+
+    /// The TMS and WMTS front-ends derive their advertised roots from this. Before the
+    /// extraction each of them had its OWN copy of the origin logic taking only `base_url`,
+    /// so neither could see `X-Forwarded-Proto` and neither could emit an `https` URL from
+    /// the request. Only the MVT copy had been fixed; this is the shared one they now use.
+    #[test]
+    fn honours_forwarded_proto_so_tms_and_wmts_can_emit_https() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            st.advertised_origin(Some("example.org"), Some("https")),
+            "https://example.org"
+        );
+    }
+
+    #[test]
+    fn explicit_public_url_outranks_the_host_header() {
+        let st = state_with(
+            Some("https://terraserve.io/demo/vida/wms"),
+            "http://127.0.0.1:8080/wms",
+        );
+        assert_eq!(
+            st.advertised_origin(Some("terraserve.io"), None),
+            "https://terraserve.io/demo/vida"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_http_host_then_to_base_url() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            st.advertised_origin(Some("localhost:8080"), None),
+            "http://localhost:8080"
+        );
+        assert_eq!(st.advertised_origin(None, None), "http://127.0.0.1:8080");
+    }
+
+    /// `wms::online_resource` was the LAST front-end still reading `state.base_url` directly,
+    /// so a GetCapabilities behind a TLS-terminating proxy advertised the BIND address while
+    /// the MVT/TMS/WMTS roots on the SAME server advertised the public one. It composes on the
+    /// shared origin now, so all four agree.
+    #[test]
+    fn the_wms_endpoint_composes_on_the_shared_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "terraserve.io".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        // No --public-url: derived from the request, NOT from the useless bind address.
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(super::wms_base(&st, &headers), "https://terraserve.io/wms");
+
+        // An explicit --public-url still wins, path prefix and all.
+        let st = state_with(
+            Some("https://terraserve.io/demo/vida/wms"),
+            "http://127.0.0.1:8080/wms",
+        );
+        assert_eq!(
+            super::wms_base(&st, &headers),
+            "https://terraserve.io/demo/vida/wms"
+        );
+
+        // No Host header at all (a direct local run) still yields the old answer.
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            super::wms_base(&st, &axum::http::HeaderMap::new()),
+            "http://127.0.0.1:8080/wms"
+        );
+    }
+
+    /// The TMS/WMTS path builders now only append to an already-derived origin, so a
+    /// proxied deployment gets the right scheme and prefix in its advertised roots.
+    #[test]
+    fn tms_and_wmts_roots_compose_on_the_shared_origin() {
+        let st = state_with(Some("https://terraserve.io/demo/swiss/wms"), "unused");
+        let origin = st.advertised_origin(Some("terraserve.io"), Some("https"));
+        assert_eq!(
+            crate::tms_http::tms_root(&origin),
+            "https://terraserve.io/demo/swiss/tms/1.0.0"
+        );
+        assert_eq!(
+            crate::wmts::bases(&origin),
+            (
+                "https://terraserve.io/demo/swiss/wmts".to_string(),
+                "https://terraserve.io/demo/swiss/wmts/1.0.0".to_string()
+            )
+        );
+    }
+}
+
+#[cfg(test)]
+mod inline_json_tests {
+    use super::inline_json;
+
+    #[test]
+    fn escapes_script_breakout_and_line_separators() {
+        // Whole-branch review #5: operator-controlled grid ids / layer names are injected into the
+        // viewer's inline <script>. A value containing `</script>` must NOT be able to close the
+        // element — the `<` is escaped, so the raw sequence never appears in the output.
+        let out = inline_json(&vec!["a</script>b".to_string()]);
+        assert!(
+            !out.contains("</script>"),
+            "must not emit a raw </script>: {out}"
+        );
+        assert!(
+            out.contains("\\u003c/script>"),
+            "the < must be \\u003c-escaped: {out}"
+        );
+        // U+2028 / U+2029 are legal in a JSON string but illegal in a pre-ES2019 JS string literal;
+        // embedded as a JS expression they must be escaped or the script is a syntax error.
+        let ls = inline_json(&"x\u{2028}y".to_string());
+        assert!(!ls.contains('\u{2028}'), "U+2028 must be escaped: {ls:?}");
+        assert!(ls.contains("\\u2028"), "U+2028 must become \\u2028: {ls}");
+        // The output stays valid JSON (< is a valid JSON escape), so a JS engine parsing it as
+        // a literal recovers the original value exactly.
+        let parsed: Vec<String> = serde_json::from_str(&out).expect("still valid JSON");
+        assert_eq!(parsed, vec!["a</script>b".to_string()]);
+    }
 }

@@ -101,6 +101,144 @@ fn lines_of(rule: &Rule) -> impl Iterator<Item = &LineSym> {
     })
 }
 
+/// One feature's geometry, already projected to canvas pixels and viewport-culled.
+///
+/// Projection is a pure function of the geometry alone — it does not depend on the style, the
+/// rule, or the FeatureTypeStyle — so it can be computed for a batch of features IN PARALLEL and
+/// then consumed by the serial draw loop in the original order. That ordering is what keeps
+/// output byte-identical; only the trig moves.
+enum ProjGeom {
+    /// A Point, a feature the bbox pre-filter rejected, or a geometry with no drawable rings.
+    Skip,
+    /// `Polygon` / `LineString` / `MultiLineString` — one ring set (or `None` if culled).
+    Single(Option<Vec<Vec<[f32; 2]>>>),
+    /// `MultiPolygon` — one ring set per constituent polygon, each independently cullable.
+    Multi(Vec<Option<Vec<Vec<[f32; 2]>>>>),
+}
+
+/// The min-feature-size gate, as one predicate shared by BOTH passes of `render_vector_impl` (the
+/// geometry pass, via `project_batch`, and the marker/label pass, which walks `feats` on its own):
+/// a gated feature must vanish from both, or a building too small to draw would still plant a
+/// marker. Byte-for-byte the same test `encode_tile_opt` applies on the MVT path.
+///
+/// `min_area_src` is the per-layer/per-zoom CONSTANT from `mvt::min_area_src_for_scale` — no
+/// dependence on tile x/y, so a feature is kept or dropped in EVERY tile at a given resolution and
+/// the selection is seam-free. `0.0` = gate off. Zero-area geometry (points, lines) is EXEMPT: the
+/// gate is a polygon-coverage concept, and applying it to lines would blank a roads layer.
+///
+/// This is also what keeps `WindowedSource::query_gated`'s contract honest on the raster path. The
+/// pushdown (PostGIS puts the same threshold in the SQL `WHERE`) may only drop what this test would
+/// drop anyway; without the Rust half, a gated read and an ungated one would render *different*
+/// maps depending on which source backed the layer.
+#[inline]
+fn skip_below_min_area(f: &Feature, min_area_src: f64) -> bool {
+    min_area_src > 0.0 && f.area > 0.0 && f.area < min_area_src
+}
+
+/// Project a batch of features to pixels in parallel, one `Projector` per worker chunk.
+///
+/// This exists because a samply profile of a 1.14M-feature GetMap (2026-08-05) found ~62 % of the
+/// single busy thread inside libproj + libm, while 61 io-pool threads sat spinning in
+/// `sem_trywait`: feature DECODE was parallel but reprojection never was, so the trig ran serially
+/// on the request thread. The dataset that exposed it is EPSG:2056 (Hotine Oblique Mercator),
+/// which is trig-heavy per point, but any non-trivial source CRS pays this.
+///
+/// A `Projector` wraps a libproj `PJ`, which is NOT thread-safe, so each chunk builds its own.
+/// `outer` is the caller's already-built `Projector`, reused for the serial path so a small
+/// request pays ONE construction rather than two; each parallel worker still builds its own.
+/// A failed `Projector::new` yields `Skip` for that chunk rather than failing the request — the
+/// serial caller already treats an unprojectable feature as skippable.
+#[allow(clippy::too_many_arguments)]
+fn project_batch(
+    feats: &[Feature],
+    outer: &Projector,
+    src_crs: &str,
+    grid_crs: &str,
+    bbox: [f64; 4],
+    width: u32,
+    height: u32,
+    w: f32,
+    h: f32,
+    margin: f32,
+    filt: Option<[f64; 4]>,
+    min_area_src: f64,
+) -> Vec<ProjGeom> {
+    use rayon::prelude::*;
+
+    let project_one = |proj: &Projector, f: &Feature| -> ProjGeom {
+        if let Some(fb) = filt {
+            if !bbox_overlaps(f.bbox, fb) {
+                return ProjGeom::Skip;
+            }
+        }
+        if skip_below_min_area(f, min_area_src) {
+            return ProjGeom::Skip;
+        }
+        match &f.geom {
+            Geometry::Point(_) => ProjGeom::Skip,
+            Geometry::Polygon(rings) => {
+                ProjGeom::Single(project_and_cull(proj, rings, w, h, margin))
+            }
+            Geometry::MultiPolygon(polys) => ProjGeom::Multi(
+                polys
+                    .iter()
+                    .map(|rings| project_and_cull(proj, rings, w, h, margin))
+                    .collect(),
+            ),
+            Geometry::LineString(pts) => ProjGeom::Single(project_and_cull(
+                proj,
+                std::slice::from_ref(pts),
+                w,
+                h,
+                margin,
+            )),
+            Geometry::MultiLineString(lines) => {
+                ProjGeom::Single(project_and_cull(proj, lines, w, h, margin))
+            }
+        }
+    };
+
+    // `Projector::new` costs ~6.2 ms -- it builds a whole libproj pipeline (measured:
+    // `geom.rs::measure_projector_construction_cost`). That number DRIVES the chunking below: the
+    // Worse, those constructions do NOT overlap: libproj serializes them internally, so N workers
+    // cost N x 6.2 ms of WALL CLOCK before any projection starts. The worker count therefore has
+    // to scale with the WORK, not with the core count.
+    //
+    // Two ways this was got wrong, both measured, both worth not repeating:
+    //   - chunking finely for load balance => ~2200 constructions, ~13.8 s of setup, 3-4x SLOWER
+    //     than the serial code it replaced;
+    //   - one chunk per core regardless of size => a z13 tile (~6k features) paid 16 constructions
+    //     (~100 ms) to save ~30 ms of projection, regressing 118 ms -> 203 ms.
+    //
+    // Since `geom.rs`'s thread-local pipeline cache landed, a warm `Projector::new` costs ~0 ms
+    // (measured: 5.89 ms uncached -> 0.0000 ms cached), so a worker no longer has to earn back a
+    // pipeline build -- only rayon's fan-out, which is microseconds. MIN_PER_WORKER is therefore
+    // far lower than the 8192 that was needed while construction cost 6.2 ms. It is NOT zero: a
+    // handful of features per worker would still be pure overhead.
+    //
+    // ⚠ If the cache is ever removed or bypassed, this constant MUST go back up. The history:
+    //   - chunking finely for load balance => ~2200 constructions, ~13.8 s of setup, 3-4x SLOWER;
+    //   - one chunk per core regardless of size => a z13 tile paid 16 constructions (~100 ms) to
+    //     save ~30 ms of projection, regressing 118 ms -> 203 ms.
+    const MIN_PER_WORKER: usize = 1024;
+    let workers = (feats.len() / MIN_PER_WORKER).clamp(1, rayon::current_num_threads().max(1));
+    if workers == 1 {
+        return feats.iter().map(|f| project_one(outer, f)).collect();
+    }
+
+    let chunk = feats.len().div_ceil(workers);
+    let parts: Vec<Vec<ProjGeom>> = feats
+        .par_chunks(chunk)
+        .map(
+            |c| match Projector::new(src_crs, grid_crs, bbox, width, height) {
+                Ok(proj) => c.iter().map(|f| project_one(&proj, f)).collect(),
+                Err(_) => (0..c.len()).map(|_| ProjGeom::Skip).collect(),
+            },
+        )
+        .collect();
+    parts.into_iter().flatten().collect()
+}
+
 /// Project every vertex of `rings` (`Projector::to_pixel`, dropping any vertex whose transform
 /// fails or lands non-finite — a degenerate vertex, not a hard error), then cull the WHOLE
 /// geometry if its projected bounding box doesn't intersect the canvas+margin viewport (mirrors
@@ -235,14 +373,28 @@ pub fn render_vector(
         width,
         height,
         shaper,
+        true, // labels on: this is the untiled/whole-viewport entry point (see `render_vector_from`)
+        // No min-feature-size gate: this entry takes a bare `FeatureSource` with no layer
+        // `area_scale` to calibrate a threshold against, and its callers (the fixture tests, the
+        // `render` CLI) render one image rather than a pyramid. `render_vector_from` is where the
+        // serving paths pass a real threshold.
+        0.0,
     )
 }
 
 /// Same pipeline, reading through the `VectorSource` seam (windowed-seam refactor, the FlatGeoBuf
 /// plan's Task 1): `LoadAll` borrows the whole slice via `features_in` — byte-identical to
 /// `render_vector` above; a future `Windowed` source (e.g. FlatGeoBuf) would instead fetch only the
-/// request `bbox` window here, with zero further change to this pipeline. This is
-/// `wms::get_map_vector`'s entry point (the production WMS GetMap vector path).
+/// request `bbox` window here, with zero further change to this pipeline. This is the entry point
+/// for BOTH raster vector paths: `wms::get_map_vector` (untiled GetMap, `labels = true`) and
+/// `server::VectorLayer::render_tile` (WMTS/TMS raster tiles, `labels = false`).
+///
+/// `labels = false` suppresses `Text` symbolizers ONLY — fills, strokes and point markers render
+/// identically either way. A tile renderer cannot see past its own tile, so a label straddling a
+/// tile boundary would be clipped at the seam or drawn twice with the halves disagreeing; the
+/// decision (docs/postgis-layers.md, "Labels are WMS-only") is to draw no labels on tile paths
+/// rather than ship that. Passing the flag through the ONE renderer is deliberate: a second,
+/// label-free render path would drift, and drift here means two different maps of the same data.
 #[allow(clippy::too_many_arguments)]
 pub fn render_vector_from(
     src: &VectorSource,
@@ -253,6 +405,8 @@ pub fn render_vector_from(
     width: u32,
     height: u32,
     shaper: &Shaper,
+    labels: bool,
+    min_area_src: f64,
 ) -> Result<Vec<u8>, String> {
     // CRS fix: `bbox` is in `grid_crs` (the request/grid CRS), but `features_in` expects the layer's
     // source CRS — reproject via the same `source_filter_bbox` helper the per-feature pre-filter
@@ -262,7 +416,17 @@ pub fn render_vector_from(
     // lands here.
     let query_bbox =
         source_filter_bbox(grid_crs, src_crs, bbox).unwrap_or_else(|| src.full_extent());
-    let batch = src.features_in(query_bbox);
+    // Gated read: the threshold is OFFERED to the source, which may apply it where the data lives
+    // (PostGIS puts it in the SQL `WHERE`) and so never send or decode rows this render is about to
+    // discard. A source that ignores it behaves exactly as before — `render_vector_impl` re-applies
+    // the identical test per feature, so the two reads produce the same image either way. That
+    // pushdown is the point: without it, a low-zoom raster tile of a 107.9M-row layer fetches every
+    // row before dropping it.
+    // `?` rather than a silent empty batch: an `Err` here is a FAILED READ (a dropped PostGIS
+    // connection, a truncated S3 range read), not an empty window, and every caller of this
+    // function already turns the error into a 500 / OWS exception. Swallowing it is what used to
+    // produce a blank map behind a 200 OK.
+    let batch = src.features_in_gated(query_bbox, min_area_src)?;
     render_vector_impl(
         batch.as_slice(),
         style,
@@ -272,6 +436,8 @@ pub fn render_vector_from(
         width,
         height,
         shaper,
+        labels,
+        min_area_src,
     )
 }
 
@@ -285,6 +451,8 @@ fn render_vector_impl(
     width: u32,
     height: u32,
     shaper: &Shaper,
+    labels: bool,
+    min_area_src: f64,
 ) -> Result<Vec<u8>, String> {
     let proj = Projector::new(src_crs, grid_crs, bbox, width, height)?;
     let w = width as f32;
@@ -344,81 +512,101 @@ fn render_vector_impl(
     let mut geom_layer: Option<GeomLayer> = None;
     // Per-FeatureTypeStyle z-order: each FTS composites its geometry in document order (later FTS on
     // top); select_rules is scoped to the FTS so ElseFilter is per-FTS.
+    // Every feature is projected ONCE, up front, IN PARALLEL; the draw loop then consumes the
+    // result serially in the original order, so output stays byte-identical and only the trig
+    // moves off the request thread. Hoisted out of the FeatureTypeStyle loop too, since projection
+    // depends solely on geometry -- a multi-FTS style used to re-project every feature per pass.
+    let projected = project_batch(
+        feats,
+        &proj,
+        src_crs,
+        grid_crs,
+        bbox,
+        width,
+        height,
+        w,
+        h,
+        margin,
+        filt,
+        min_area_src,
+    );
     for fts in &style.feature_type_styles {
-        for f in feats {
-            if let Some(fb) = filt {
-                if !bbox_overlaps(f.bbox, fb) {
-                    continue; // out of the request footprint — skip before projecting
+        {
+            for (fi, f) in feats.iter().enumerate() {
+                let pg = &projected[fi];
+                if matches!(pg, ProjGeom::Skip) {
+                    continue; // point, filtered out, or unprojectable — nothing to draw here
                 }
-            }
-            if matches!(f.geom, Geometry::Point(_)) {
-                continue; // points are handled entirely by the marker/label loop below
-            }
-            // Additive rule selection within this FTS (OGC SLD 1.0 §11.4); no priority/scale declutter
-            // here — that shim is a point/label-only concept (Text symbolizer priority).
-            let rules = select_rules(&fts.rules, &f.props, scale);
-            for &rule in &rules {
-                match &f.geom {
-                    // T7: every Polygon symbolizer of the rule fills, in document order (project
-                    // once, then composite each). `syms` empty → geometry pass stays vacuous, so a
-                    // point-only style keeps `geom_layer` None (golden byte-identity).
-                    Geometry::Polygon(rings) => {
-                        let syms: Vec<&PolygonSym> = polygons_of(rule).collect();
-                        if !syms.is_empty() {
-                            if let Some(proj_rings) = project_and_cull(&proj, rings, w, h, margin) {
-                                let layer =
-                                    geom_layer.get_or_insert_with(|| GeomLayer::new(width, height));
-                                for sym in syms {
-                                    layer.fill_polygon(&proj_rings, sym);
-                                }
-                            }
-                        }
-                    }
-                    Geometry::MultiPolygon(polys) => {
-                        let syms: Vec<&PolygonSym> = polygons_of(rule).collect();
-                        if !syms.is_empty() {
-                            for rings in polys {
-                                if let Some(proj_rings) =
-                                    project_and_cull(&proj, rings, w, h, margin)
-                                {
+                // Additive rule selection within this FTS (OGC SLD 1.0 §11.4); no priority/scale declutter
+                // here — that shim is a point/label-only concept (Text symbolizer priority).
+                let rules = select_rules(&fts.rules, &f.props, scale);
+                for &rule in &rules {
+                    match &f.geom {
+                        // T7: every Polygon symbolizer of the rule fills, in document order (project
+                        // once, then composite each). `syms` empty → geometry pass stays vacuous, so a
+                        // point-only style keeps `geom_layer` None (golden byte-identity).
+                        Geometry::Polygon(_) => {
+                            let syms: Vec<&PolygonSym> = polygons_of(rule).collect();
+                            if !syms.is_empty() {
+                                if let ProjGeom::Single(Some(proj_rings)) = pg {
                                     let layer = geom_layer
                                         .get_or_insert_with(|| GeomLayer::new(width, height));
-                                    for &sym in &syms {
-                                        layer.fill_polygon(&proj_rings, sym);
+                                    for sym in syms {
+                                        layer.fill_polygon(proj_rings, sym);
                                     }
                                 }
                             }
                         }
-                    }
-                    // T7: every Line symbolizer strokes, in document order (road casing = a wide
-                    // dark stroke then a narrow light one on top).
-                    Geometry::LineString(pts) => {
-                        let syms: Vec<&LineSym> = lines_of(rule).collect();
-                        if !syms.is_empty() {
-                            if let Some(proj_lines) =
-                                project_and_cull(&proj, std::slice::from_ref(pts), w, h, margin)
-                            {
-                                let layer =
-                                    geom_layer.get_or_insert_with(|| GeomLayer::new(width, height));
-                                for sym in syms {
-                                    layer.stroke_lines(&proj_lines, sym.stroke, sym.stroke_width);
+                        Geometry::MultiPolygon(_) => {
+                            let syms: Vec<&PolygonSym> = polygons_of(rule).collect();
+                            if !syms.is_empty() {
+                                if let ProjGeom::Multi(parts) = pg {
+                                    for proj_rings in parts.iter().flatten() {
+                                        let layer = geom_layer
+                                            .get_or_insert_with(|| GeomLayer::new(width, height));
+                                        for &sym in &syms {
+                                            layer.fill_polygon(proj_rings, sym);
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                    Geometry::MultiLineString(lines) => {
-                        let syms: Vec<&LineSym> = lines_of(rule).collect();
-                        if !syms.is_empty() {
-                            if let Some(proj_lines) = project_and_cull(&proj, lines, w, h, margin) {
-                                let layer =
-                                    geom_layer.get_or_insert_with(|| GeomLayer::new(width, height));
-                                for sym in syms {
-                                    layer.stroke_lines(&proj_lines, sym.stroke, sym.stroke_width);
+                        // T7: every Line symbolizer strokes, in document order (road casing = a wide
+                        // dark stroke then a narrow light one on top).
+                        Geometry::LineString(_) => {
+                            let syms: Vec<&LineSym> = lines_of(rule).collect();
+                            if !syms.is_empty() {
+                                if let ProjGeom::Single(Some(proj_lines)) = pg {
+                                    let layer = geom_layer
+                                        .get_or_insert_with(|| GeomLayer::new(width, height));
+                                    for sym in syms {
+                                        layer.stroke_lines(
+                                            proj_lines,
+                                            sym.stroke,
+                                            sym.stroke_width,
+                                        );
+                                    }
                                 }
                             }
                         }
+                        Geometry::MultiLineString(_) => {
+                            let syms: Vec<&LineSym> = lines_of(rule).collect();
+                            if !syms.is_empty() {
+                                if let ProjGeom::Single(Some(proj_lines)) = pg {
+                                    let layer = geom_layer
+                                        .get_or_insert_with(|| GeomLayer::new(width, height));
+                                    for sym in syms {
+                                        layer.stroke_lines(
+                                            proj_lines,
+                                            sym.stroke,
+                                            sym.stroke_width,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Geometry::Point(_) => unreachable!("Skip'd above"),
                     }
-                    Geometry::Point(_) => unreachable!("filtered out above"),
                 }
             }
         }
@@ -467,6 +655,9 @@ fn render_vector_impl(
                 if !bbox_overlaps(f.bbox, fb) {
                     continue; // out of the request footprint — skip before projecting
                 }
+            }
+            if skip_below_min_area(f, min_area_src) {
+                continue; // below the min-feature-size threshold — no geometry, so no marker/label
             }
             // Anchor: a Point is itself; a Polygon/Line gets a representative interior/mid point so
             // its label/marker renders (was point-only before). Features with no vertices are skipped.
@@ -522,7 +713,13 @@ fn render_vector_impl(
                 for sym in &rule.symbolizers {
                     match sym {
                         Symbolizer::Point(p) => markers.push(([px, py], p.clone())),
-                        Symbolizer::Text(t) => {
+                        // The ONE place the tile path diverges from GetMap: with `labels = false`
+                        // no `LabelItem` is collected, so the placement + halo/body passes below
+                        // are vacuous and the tile carries geometry + markers only. Everything
+                        // above this line — rule selection, the declutter gate, the cull margin
+                        // (which is still sized off the largest text) — runs identically, so a
+                        // tile's non-label pixels match the equivalent GetMap.
+                        Symbolizer::Text(t) if labels => {
                             // `eval_label` (get_display under the hood): a numeric label field (e.g.
                             // `pop_max`, `scalerank`) must still render text, not go blank.
                             let text = super::style::eval_label(&t.label, &f.props);
@@ -537,7 +734,7 @@ fn render_vector_impl(
                             });
                             label_styles.push(t.clone());
                         }
-                        Symbolizer::Polygon(_) | Symbolizer::Line(_) => {}
+                        Symbolizer::Text(_) | Symbolizer::Polygon(_) | Symbolizer::Line(_) => {}
                     }
                 }
             }

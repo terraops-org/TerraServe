@@ -31,7 +31,7 @@ jobs:
             runner: ubuntu-24.04-arm      # free arm64 runner on public repos
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build wheel (manylinux_2_28, PROJ vendored)
         uses: PyO3/maturin-action@v1
@@ -51,7 +51,7 @@ jobs:
           LIBCLANG_PATH: /usr/lib64
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.arch }}
           path: bindings/python/dist/*.whl
@@ -64,12 +64,12 @@ jobs:
     permissions:
       contents: write     # create the release and upload assets
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
       - name: Attach wheels to the GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*.whl
           generate_release_notes: true

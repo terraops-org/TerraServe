@@ -50,6 +50,51 @@ cd terraserve
 docker build -t terraserve:latest .
 ```
 
+## Published image (GHCR)
+
+```sh
+docker pull ghcr.io/terraops-org/terraserve:latest
+docker run --rm -p 8080:8080 ghcr.io/terraops-org/terraserve:latest   # then open /xray
+```
+
+Built by `.github/workflows/publish-image.yml` **in the public repo** on a `v*` tag or a
+manual run. Multi-arch (`linux/amd64` + `linux/arm64`), built **natively per architecture**
+— never under QEMU, which would emulate a full Rust + bindgen + proj-sys + vendored-SQLite
+compile. Every publish emits a moving `:latest` **and** an immutable tag (`:YYYY-MM-DD`
+from a manual run, `:<version>` from a tag) so there is always something to pin and roll
+back to.
+
+Four things that cost time on 2026-07-21 and will again if forgotten:
+
+- **GHCR packages are PRIVATE by default**, even for a public repo, and there is no REST
+  endpoint for visibility. It is a UI change — and it is greyed out until the ORG setting
+  (`/organizations/<org>/settings/packages`) allows public packages.
+- **A repository ruleset with the `update` rule and no bypass actors blocks every merge**,
+  including your own, while classic branch-protection APIs report "not protected".
+- **`org.opencontainers.image.source`** is what links the package to its repo; without it
+  the package is an orphan with no README or licence.
+- The image's default `CMD` must point at the **baked-in** `/app/fixtures`, never `/data`
+  — `/data` is a mount point and is empty without `-v`, so a bare `docker run` dies.
+
+## Image variants
+
+The default `Dockerfile` (146 MB, Debian) is the recommended general-purpose image — it has a shell
+(easy to debug in production) and the full PROJ transformation grids (correct for every datum). Two
+smaller opt-in variants (both verified to serve WMS and reproject correctly):
+
+| variant | size | trade-off |
+|---|---|---|
+| `Dockerfile` (default) | 146 MB | Debian; shell; **all PROJ grids** — any datum transform is correct. |
+| `Dockerfile.slim` | 132 MB | Debian; shell; **PROJ grids pruned** (keeps `proj.db`, drops the `.gsb`/`.gtx` datum-shift grids). Fine for Web Mercator / UTM / ETRS89 / WGS84; a grid-dependent datum (NAD27, OSGB36…) would be silently ~100 m off. |
+| `Dockerfile.distroless` | 106 MB | Distroless (glibc) base — **no shell, no package manager** (smallest + smallest attack surface). Grids kept. No `HEALTHCHECK` (distroless has no `curl`; use a TCP/HTTP probe at the orchestrator). |
+
+```bash
+docker build -f Dockerfile.slim       -t terraserve:slim .
+docker build -f Dockerfile.distroless -t terraserve:distroless .
+```
+
+(Prune grids **and** go distroless → ~91 MB, if you know your CRSs need no grids.)
+
 ## Run (plain `docker run`, no compose)
 
 Mount read-only data at `/data` and bind the port; `--host 0.0.0.0` is required for the
@@ -96,6 +141,22 @@ TERRASERVE_VECTOR=parcels.gpkg TERRASERVE_STYLE=parcels.vec.json \
 ```
 
 or override `command:` entirely with `docker compose run --rm terraserve serve --config /data/layers.yaml --host 0.0.0.0 --port 8080`.
+
+## Env vars: FlatGeoBuf R-tree index caching
+
+A `.fgb` layer's packed R-tree index is small relative to the file (typically ~10–15%), so by
+default the whole index is read once at open and held resident in RAM — this saves the many
+small 40-byte-node round-trips a windowed query would otherwise make against every request,
+which matters most over S3.
+
+- `TERRASERVE_INDEX_LAZY_BYTES` — shared Resident/Lazy threshold for both the COG tile index and
+  the FGB R-tree index; an index above this size is read windowed (Lazy) instead of resident.
+  Default 4 MiB.
+- `TERRASERVE_FGB_INDEX_RESIDENT=0` (or `false`/`no`) — force every `.fgb` index to Lazy
+  (windowed, bounded-RAM chunk reads) regardless of size — trades more S3 round-trips for a
+  hard RAM ceiling.
+- `TERRASERVE_FGB_INDEX_CACHE_MB` — memory ceiling for the Lazy index's chunk cache. Default
+  16 MiB.
 
 ## Caveats
 

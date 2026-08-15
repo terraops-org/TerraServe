@@ -30,6 +30,13 @@ impl Style {
         parse_style(&text)
     }
 
+    /// Build a Style from already-fetched text. `path` is used only for error messages, so a
+    /// style loaded from an `s3://` URL still gets a useful error (there is no extension-based
+    /// dispatch here — raster `style.json` is always the plain RGB/pseudocolor JSON schema).
+    pub fn parse(path: &str, text: &str) -> Result<Style, String> {
+        parse_style(text).map_err(|e| format!("{path}: {e}"))
+    }
+
     /// Colorize a plane of derived values (e.g. NDVI in [-1, 1]) **directly** through the
     /// pseudocolor stops, keyed on the real value domain — no 0..255 LUT indirection. This
     /// is the band-math styling path: the same `[value, r,g,b,a]` stops as `style.json`, just

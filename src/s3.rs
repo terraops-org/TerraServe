@@ -176,21 +176,23 @@ impl S3RangeSource {
     }
 }
 
-impl RangeSource for S3RangeSource {
-    fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        if len == 0 {
-            return Ok(Vec::new());
-        }
-        let range = format!("bytes={}-{}", offset, offset + len as u64 - 1);
+impl S3RangeSource {
+    /// Sign (SigV4) and issue a GET, optionally ranged; return the raw body bytes. The header
+    /// list is built WITH the `range` header only when `Some`, then sorted lexicographically —
+    /// so the `Some(range)` case produces the exact same canonical request as before this was
+    /// extracted (`host < range < x-amz-content-sha256 < x-amz-date < x-amz-security-token`).
+    fn signed_get(&self, range: Option<&str>, cap: usize) -> Result<Vec<u8>> {
         let (amzdate, datestamp) = timestamps();
 
-        // Canonical headers — sorted by lowercase name; add the session token when present.
+        // Canonical headers — sorted by lowercase name; add range/session-token when present.
         let mut headers: Vec<(String, String)> = vec![
             ("host".into(), self.host.clone()),
-            ("range".into(), range.clone()),
             ("x-amz-content-sha256".into(), EMPTY_SHA256.into()),
             ("x-amz-date".into(), amzdate.clone()),
         ];
+        if let Some(r) = range {
+            headers.push(("range".into(), r.to_string()));
+        }
         if let Some(tok) = &self.session_token {
             headers.push(("x-amz-security-token".into(), tok.clone()));
         }
@@ -224,14 +226,16 @@ impl RangeSource for S3RangeSource {
             self.access_key
         );
 
-        // Issue the signed range GET on the pooled agent (reuses the TLS connection).
+        // Issue the signed GET on the pooled agent (reuses the TLS connection).
         let mut req = self
             .agent
             .get(&self.url())
-            .set("Range", &range)
             .set("x-amz-content-sha256", EMPTY_SHA256)
             .set("x-amz-date", &amzdate)
             .set("Authorization", &authorization);
+        if let Some(r) = range {
+            req = req.set("Range", r);
+        }
         if let Some(tok) = &self.session_token {
             req = req.set("x-amz-security-token", tok);
         }
@@ -248,10 +252,28 @@ impl RangeSource for S3RangeSource {
             ureq::Error::Transport(t) => err(format!("s3 transport: {t}")),
         })?;
 
-        let mut buf = Vec::with_capacity(len);
+        let mut buf = Vec::with_capacity(cap);
         resp.into_reader()
             .read_to_end(&mut buf)
             .map_err(|e| err(format!("s3 read body: {e}")))?;
+        Ok(buf)
+    }
+
+    /// Fetch the entire object (a no-Range signed GET). For small startup config assets
+    /// (style/font/mvt-style) — NOT a windowed read. No length check: the whole body is what
+    /// we want.
+    pub fn read_whole(&self) -> Result<Vec<u8>> {
+        self.signed_get(None, 0)
+    }
+}
+
+impl RangeSource for S3RangeSource {
+    fn read_range(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let range = format!("bytes={}-{}", offset, offset + len as u64 - 1);
+        let buf = self.signed_get(Some(&range), len)?;
         // S3 legitimately returns a SHORT body when a range GET extends past the object end;
         // callers (`cog::index_chunk_entry`, `read_ifd`, `read_uints`) assume exact length, so
         // honor the same exact-length-or-Err contract `LocalFileRangeSource` (read_exact_at)
@@ -422,5 +444,66 @@ mod tests {
     fn is_s3_url_detects() {
         assert!(is_s3_url("s3://bucket/key.tif"));
         assert!(!is_s3_url("/local/path.tif"));
+    }
+
+    // --- S3RangeSource::open validation — all fail before any network call -------------
+
+    #[test]
+    fn open_missing_endpoint_errors() {
+        // S3RangeSource has no Debug impl, so use .err().expect(...) rather than
+        // .unwrap_err() (which needs T: Debug to print the Ok case on panic).
+        let cfg = S3Config::default();
+        let err = S3RangeSource::open("s3://bucket/key.tif", &cfg)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("missing S3 endpoint"), "got: {err}");
+    }
+
+    #[test]
+    fn open_bucket_without_key_errors() {
+        let cfg = S3Config::default();
+        let err = S3RangeSource::open("s3://bucket", &cfg)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("needs a key"), "got: {err}");
+    }
+
+    #[test]
+    fn open_empty_bucket_and_key_errors() {
+        let cfg = S3Config::default();
+        let err = S3RangeSource::open("s3:///", &cfg)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("needs bucket and key"), "got: {err}");
+    }
+
+    #[test]
+    fn open_missing_access_key_errors_when_endpoint_present() {
+        let cfg = S3Config {
+            endpoint: Some("https://s3.example.com".to_string()),
+            ..S3Config::default()
+        };
+        let err = S3RangeSource::open("s3://bucket/key.tif", &cfg)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("missing AWS_ACCESS_KEY_ID"), "got: {err}");
+    }
+
+    #[test]
+    fn open_missing_secret_key_errors_when_access_key_present() {
+        let cfg = S3Config {
+            endpoint: Some("https://s3.example.com".to_string()),
+            access_key: Some("AKIA_TEST".to_string()),
+            ..S3Config::default()
+        };
+        let err = S3RangeSource::open("s3://bucket/key.tif", &cfg)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("missing AWS_SECRET_ACCESS_KEY"), "got: {err}");
     }
 }

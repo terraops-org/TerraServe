@@ -42,9 +42,20 @@ pub struct LayerConfig {
     /// Vector style (point/text/polygon/line Style IR JSON) for a `vector` layer. Required with `vector`.
     #[serde(default)]
     pub vec_style: Option<String>,
-    /// The COG's own CRS. Defaults to the cascais grid.
-    #[serde(default = "default_src_crs")]
-    pub src_crs: String,
+    /// The layer's source CRS, as the operator declared it. `None` = NOT declared.
+    ///
+    /// Deliberately an `Option` with no serde default. It used to be a `String` defaulting to
+    /// `EPSG:3763`, which made "the operator wrote `src_crs: EPSG:3763`" and "the operator wrote
+    /// nothing" the same value. `build_vector_layer` needs to tell those apart -- an unset CRS
+    /// means "adopt the file header's", an explicit one must win over it -- so with no way to
+    /// ask this field, it consulted the GLOBAL `--src-crs` flag instead. Under `--config` that
+    /// flag is normally unset, so EVERY per-layer `src_crs:` was silently discarded in favour of
+    /// the file header. The live Swiss demo (7 vector layers, all `src_crs: EPSG:2056`) was
+    /// masked only because its FlatGeoBuf headers happened to agree.
+    ///
+    /// The COG path applies `default_src_crs()` itself, so its behaviour is unchanged.
+    #[serde(default)]
+    pub src_crs: Option<String>,
     /// On-the-fly band-math expression, e.g. `(B08 - B04) / (B08 + B04)`. When set, the layer
     /// is served as band math + value-domain pseudocolor instead of RGB passthrough.
     #[serde(default)]
@@ -69,6 +80,41 @@ pub struct LayerConfig {
     /// Tile pixel size for the preset / `from_cog` grids this layer names (128/256/512). Default 512.
     #[serde(default = "default_tile_px")]
     pub tile_px: u32,
+    /// Pre-built PMTiles archive path(s) for this layer (read-through; a tile not in the matching-grid
+    /// archive is live-encoded). Each archive self-describes its grid via `grid_id` metadata, so this
+    /// is just a plain path list — one entry per grid, never mixed (design commitment 1). Default empty.
+    #[serde(default)]
+    pub pmtiles: Vec<String>,
+    /// Pre-baked **PNG** archive path(s) for this layer's WMTS/TMS raster path (read-through; a tile
+    /// not in the matching-grid archive is rendered live). The raster twin of `pmtiles:` above, kept
+    /// separate because the two feed different front-ends with different payload formats — an
+    /// archive listed under the wrong key is refused at startup, naming both formats, rather than
+    /// serving image bytes to an MVT client (or the reverse). Bake with
+    /// `build-pmtiles --tile-format png`. Default empty.
+    #[serde(default)]
+    pub raster_pmtiles: Vec<String>,
+    /// Layer bounds in the source CRS, `[minx, miny, maxx, maxy]`.
+    ///
+    /// REQUIRED for a `postgis://` layer and authoritative there: TerraServe never issues
+    /// `ST_EstimatedExtent` (NULL on a never-ANALYZEd table) or `ST_Extent` (a full-table scan
+    /// that reproduced the 101-second cos2023 startup). Making the config the source of truth
+    /// buys a deterministic startup. A wrong value gives wrong ADVERTISED bounds; queries are
+    /// unaffected.
+    #[serde(default)]
+    pub extent: Option<[f64; 4]>,
+    /// Extra attribute columns to fetch for a `postgis://` layer, on top of the ones the layer's
+    /// `vec_style` references.
+    ///
+    /// A file source (`.gpkg`/`.fgb`) reads whatever the feature carries, but a database query has
+    /// to name its columns up front, and TerraServe derives that list from the SERVER-side style
+    /// (`Style::referenced_fields`). Anything the server-side style cannot see needs naming here —
+    /// above all `--mvt-style`, which is client-side JSON served verbatim and never parsed into a
+    /// `Style`, so its `["get", FIELD]` expressions are invisible to the engine. Without this, such
+    /// a layer ships tiles with no class attribute and the client draws the whole map in its
+    /// fallback colour. Ignored (with no effect) for every non-PostGIS source. Every name is
+    /// checked against the table at startup, so a typo fails loudly instead of blanking the map.
+    #[serde(default)]
+    pub columns: Vec<String>,
 }
 
 /// A config-defined custom TileMatrixSet: explicit CRS + top-left origin + full extent + tile size
@@ -118,7 +164,7 @@ impl GridConfig {
     }
 }
 
-fn default_src_crs() -> String {
+pub(crate) fn default_src_crs() -> String {
     "EPSG:3763".to_string()
 }
 
@@ -133,12 +179,42 @@ pub fn default_tile_px() -> u32 {
 /// Resolve ONE grid id → a validated `TileMatrixSet`. `cog` supplies the COG+CRS for `from_cog`
 /// (None ⇒ `from_cog` errors — used by COG-less unit tests). Fails loudly if the id is unknown or the
 /// resolved grid is not TMS-indexable (matrix·tile·resolution not level-invariant — the blocker class).
+///
+/// An id ENDING IN `.json` is a path to an OGC TileMatrixSet 2.0 document (read relative to the
+/// process CWD — the same convention `--cog`/`--vector`/`--mvt-style` already use for a local path,
+/// no `s3://` support here), loaded via `tms::from_ogc_json`. That path is checked FIRST (before
+/// `from_cog`/preset/custom-map), and returns straight from the JSON without running the
+/// level-invariance gate below: unlike a `GridConfig`, whose `matrixWidth`/`matrixHeight` are
+/// DERIVED here from an extent + a resolution ladder (the gate exists to catch a bad derivation),
+/// an OGC-JSON document's `matrixWidth`/`matrixHeight` are already explicit, authoritative, per-level
+/// values straight from the file — there is no derivation step to protect. Real-world WMTS grids
+/// (e.g. swisstopo's own LV95 pyramid, `fixtures/grids/swissLV95.json`) are routinely NOT
+/// level-invariant (a non-dyadic resolution ladder over a fixed extent), which the single-`<Origin>`
+/// TMS 1.0.0 client-indexing concern the gate protects against doesn't apply to — WMTS/MVT tile
+/// lookups (`TileMatrixSet::tile_bounds`) read each level's own `matrix_w`/`matrix_h` and are correct
+/// regardless of invariance; only a TMS 1.0.0 client computing tile position from Y + resolution
+/// alone (without per-level dims) would care, and that front-end already only advertises `full_extent`
+/// (level 0) for such a grid, a pre-existing, documented limitation (not one this task changes).
+///
+/// CAVEAT scoping the "correct regardless of invariance" claim above: only tile GEOMETRY is
+/// invariance-agnostic. The OPT-IN, WebMercator-calibrated MVT feature-size heuristics —
+/// `--mvt-min-feature-px` and the per-zoom LOD tolerance, both routed through
+/// `vector::mvt::tile::merc_m_per_px` (a hardcoded `2^z` ladder) — ASSUME dyadic level doubling, so
+/// on a non-dyadic `.json` grid they over/under-thin features by the ratio between the real
+/// `cellSize` and the Mercator `2^z` resolution (an ~84x error at some `swissLV95` levels). This
+/// knob is OFF by default (`min_feature_px = 0.0`) and never affects tile geometry or the default
+/// path; the design spec declares these heuristics out-of-scope for v1. Fast-follow fix: make
+/// `min_area_src_for_zoom`/the LOD tolerance read `level(z).resolution` instead of `2^z`.
 fn resolve_one(
     id: &str,
     tile_px: u32,
     cog: Option<(&Cog, &str)>,
     custom: &BTreeMap<String, GridConfig>,
 ) -> Result<TileMatrixSet, String> {
+    if id.ends_with(".json") {
+        let json = std::fs::read_to_string(id).map_err(|e| format!("grid '{id}': {e}"))?;
+        return crate::tms::from_ogc_json(&json).map_err(|e| format!("grid '{id}': {e}"));
+    }
     let tms = if id == "from_cog" {
         let (cog, crs) = cog.ok_or("grid 'from_cog' requires a COG")?;
         TileMatrixSet::from_cog(cog, crs, tile_px)
@@ -268,7 +344,7 @@ layers:
         assert_eq!(cfg.layers.len(), 2);
         let ndvi = &cfg.layers[0];
         assert_eq!(ndvi.name, "ndvi");
-        assert_eq!(ndvi.src_crs, "EPSG:32629");
+        assert_eq!(ndvi.src_crs.as_deref(), Some("EPSG:32629"));
         assert_eq!(ndvi.nodata, Some(-32768.0));
         assert_eq!(
             ndvi.expression.as_deref(),
@@ -279,7 +355,7 @@ layers:
         // second layer defaults: no expression, src_crs from file
         let cas = &cfg.layers[1];
         assert!(cas.expression.is_none());
-        assert_eq!(cas.src_crs, "EPSG:3763");
+        assert_eq!(cas.src_crs.as_deref(), Some("EPSG:3763"));
     }
 
     #[test]
@@ -287,7 +363,9 @@ layers:
         let cfg: Config =
             serde_yaml::from_str("layers:\n  - name: a\n    cog: a.tif\n    style: s.json\n")
                 .unwrap();
-        assert_eq!(cfg.layers[0].src_crs, "EPSG:3763");
+        // An omitted `src_crs:` is now None, NOT the cascais default. The COG path applies
+        // that default itself; the vector path needs the None to mean "use the header".
+        assert_eq!(cfg.layers[0].src_crs, None);
     }
 
     #[test]
@@ -307,5 +385,30 @@ layers:
         let neither = "layers:\n  - name: y\n";
         let c2: Config = serde_yaml::from_str(neither).unwrap();
         assert!(c2.layers[0].validate().is_err());
+    }
+
+    // NOTE: the plan's brief called for `Config::parse_str(...)`, which does not exist on this
+    // struct — every neighbouring test above parses via `serde_yaml::from_str::<Config>(...)`
+    // directly, so these two follow that existing pattern instead of inventing a new helper.
+    #[test]
+    fn extent_parses_as_four_floats() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: p\n    vector: postgis://ts:${P}@db/gis/parcels\n    \
+             vec_style: s.json\n    extent: [2485000.0, 1075000.0, 2834000.0, 1296000.0]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.layers[0].extent,
+            Some([2485000.0, 1075000.0, 2834000.0, 1296000.0])
+        );
+    }
+
+    #[test]
+    fn extent_is_none_when_omitted() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: p\n    vector: a.fgb\n    vec_style: s.json\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.layers[0].extent, None);
     }
 }

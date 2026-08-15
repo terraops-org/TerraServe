@@ -569,3 +569,169 @@ fn blue_pixels_in_rect(rgba: &[u8], w: usize, x0: usize, x1: usize, y0: usize, y
     }
     n
 }
+
+// ---------------------------------------------------------------------------------------------
+// Min-feature-size gate on the RASTER path
+//
+// The gate used to be MVT-only: no raster path applied it, so a low-zoom WMS GetMap / WMTS tile of
+// a dense polygon layer drew (and, from PostGIS, FETCHED) every sub-pixel feature. These pin the
+// raster half: the same keep/drop test the MVT encoder makes, applied to what gets drawn.
+// ---------------------------------------------------------------------------------------------
+
+/// Two squares side by side in EPSG:4326: a big one (1 deg x 1 deg = 1.0 units squared) and a small
+/// one 100x smaller in area (0.1 x 0.1). Both filled solid blue by the style below.
+fn two_squares() -> GeoJsonSource {
+    GeoJsonSource::from_str(
+        r#"{"type":"FeatureCollection","features":[
+          {"type":"Feature","properties":{"n":"big"},"geometry":{"type":"Polygon","coordinates":
+            [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]]}},
+          {"type":"Feature","properties":{"n":"small"},"geometry":{"type":"Polygon","coordinates":
+            [[[2.0,0.0],[2.1,0.0],[2.1,0.1],[2.0,0.1],[2.0,0.0]]]}}
+        ]}"#,
+    )
+    .unwrap()
+}
+
+fn solid_blue_fill() -> Style {
+    Style {
+        feature_type_styles: vec![FeatureTypeStyle {
+            rules: vec![Rule {
+                filter: None,
+                else_filter: false,
+                min_scale: None,
+                max_scale: None,
+                symbolizers: vec![Symbolizer::Polygon(PolygonSym {
+                    fill: [0, 0, 255, 255],
+                    stroke: None,
+                    stroke_width: 0.0,
+                })],
+                title: None,
+            }],
+        }],
+    }
+}
+
+/// The gate's threshold is in SOURCE-CRS units squared, so with the fixture above anything in
+/// (0.01, 1.0) drops the small square and keeps the big one.
+fn render_two_squares(min_area_src: f64) -> Vec<u8> {
+    let vs = terraserve::vector::source::VectorSource::LoadAll(std::sync::Arc::new(two_squares()));
+    terraserve::vector::render::render_vector_from(
+        &vs,
+        &solid_blue_fill(),
+        "EPSG:4326",
+        "EPSG:4326",
+        [-0.5, -0.5, 2.6, 1.5],
+        512,
+        330,
+        &shaper(),
+        false,
+        min_area_src,
+    )
+    .unwrap()
+}
+
+#[test]
+fn raster_min_area_gate_drops_only_the_sub_threshold_polygon() {
+    // Gate OFF (0.0) is the pre-change behaviour: both squares drawn.
+    let off = render_two_squares(0.0);
+    let big_off = blue_pixels_in_rect(&off, 512, 0, 260, 0, 330);
+    let small_off = blue_pixels_in_rect(&off, 512, 300, 512, 0, 330);
+    assert!(
+        big_off > 1000,
+        "big square drawn with the gate off: {big_off}"
+    );
+    assert!(
+        small_off > 10,
+        "small square drawn with the gate off: {small_off}"
+    );
+
+    // Gate ON at a threshold between the two areas: the small one vanishes, the big one does not.
+    let on = render_two_squares(0.1);
+    let big_on = blue_pixels_in_rect(&on, 512, 0, 260, 0, 330);
+    let small_on = blue_pixels_in_rect(&on, 512, 300, 512, 0, 330);
+    assert_eq!(
+        big_on, big_off,
+        "the above-threshold polygon is untouched by the gate"
+    );
+    assert_eq!(small_on, 0, "the sub-threshold polygon is not drawn");
+}
+
+#[test]
+fn raster_min_area_gate_is_off_by_default_and_at_zero() {
+    // The whole change is opt-in: 0.0 must be byte-identical to no gate at all, which is what keeps
+    // every golden in this suite unchanged.
+    assert_eq!(render_two_squares(0.0), render_two_squares(-1.0));
+}
+
+/// A windowed source that HONOURS `query_gated` — the pushdown a `postgis://` layer performs in
+/// SQL, standing in for a live database so this runs in CI. It drops exactly what
+/// `WindowedSource::query_gated`'s contract allows and no more: sub-threshold polygons only.
+struct GatingSource {
+    feats: Vec<terraserve::vector::feature::Feature>,
+    extent: [f64; 4],
+}
+
+impl terraserve::vector::source::WindowedSource for GatingSource {
+    fn query(&self, _bbox: [f64; 4]) -> Result<Vec<terraserve::vector::feature::Feature>, String> {
+        Ok(self.feats.clone())
+    }
+    fn query_gated(
+        &self,
+        bbox: [f64; 4],
+        min_area_src: f64,
+    ) -> Result<Vec<terraserve::vector::feature::Feature>, String> {
+        Ok(self
+            .query(bbox)?
+            .into_iter()
+            .filter(|f| !(min_area_src > 0.0 && f.area > 0.0 && f.area < min_area_src))
+            .collect())
+    }
+    fn full_extent(&self) -> [f64; 4] {
+        self.extent
+    }
+    fn crs(&self) -> Option<&str> {
+        Some("EPSG:4326")
+    }
+}
+
+/// The `query_gated` contract: "a gated read and an ungated one must produce the same tile". A
+/// source that pushes the threshold down to where the data lives (PostGIS puts it in the SQL
+/// `WHERE`) must render byte-identically to one that ignores it and lets the Rust gate do the work
+/// — otherwise the same layer would draw differently depending on which backend served it, which is
+/// the failure the raster gate has to avoid now that it thins as well as speeds things up.
+#[test]
+fn pushdown_and_rust_gate_render_the_same_image() {
+    use terraserve::vector::source::{FeatureSource, VectorSource};
+    let loaded = two_squares();
+    let gating = VectorSource::Windowed(std::sync::Arc::new(GatingSource {
+        feats: loaded.features().to_vec(),
+        extent: loaded.full_extent(),
+    }));
+    let ignoring = VectorSource::LoadAll(std::sync::Arc::new(two_squares()));
+
+    let render = |vs: &VectorSource, min_area_src: f64| {
+        terraserve::vector::render::render_vector_from(
+            vs,
+            &solid_blue_fill(),
+            "EPSG:4326",
+            "EPSG:4326",
+            [-0.5, -0.5, 2.6, 1.5],
+            512,
+            330,
+            &shaper(),
+            false,
+            min_area_src,
+        )
+        .unwrap()
+    };
+
+    for threshold in [0.0, 0.1] {
+        assert_eq!(
+            render(&gating, threshold),
+            render(&ignoring, threshold),
+            "pushdown and Rust-side gate disagree at min_area_src={threshold}"
+        );
+    }
+    // ...and the gate is doing something at 0.1, so the equality above is not vacuous.
+    assert_ne!(render(&gating, 0.1), render(&gating, 0.0));
+}

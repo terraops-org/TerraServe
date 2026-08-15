@@ -92,6 +92,104 @@ pub fn min_area_src_for_zoom(z: u32, area_scale: f64, min_feature_px: f64) -> f6
     min_feature_px * px_area_merc / area_scale // → source-CRS units²
 }
 
+/// The min-feature-size threshold (source-CRS units²) for one tile of a SPECIFIC GRID.
+///
+/// ⚠ This replaces `min_area_src_for_zoom` on every serving path because that function bakes in
+/// **WebMercatorQuad with 256-px tiles** — it derives the pixel size from `merc_m_per_px(z)`, which
+/// knows nothing about the grid actually being used. Two ways that is wrong, both live:
+///
+/// * **A non-mercator grid.** On the OGC `EuropeanETRS89_LAEAQuad` (EPSG:3035) level 10 is
+///   17.2 m/px, but `merc_m_per_px(10)` says 152.9 — a constant 8.906x across every level, and the
+///   threshold goes as the SQUARE, so it comes out **79x too aggressive**. `--mvt-min-feature-px 2`
+///   would behave like 158 and empty the map.
+/// * **A 512-px tile.** Our own demos publish `WebMercatorQuad_512`, where a level's real
+///   resolution is HALF what `merc_m_per_px` reports, so the threshold was 4x too aggressive there
+///   too — on the grid this project has been shipping all along.
+///
+/// The fix is to ask the grid: `TmLevel::resolution` is CRS units per pixel for THAT level of THAT
+/// grid, which accounts for tile size and CRS together.
+///
+/// Two cases, and the first is both simpler and more accurate:
+/// * **Grid CRS == source CRS** (EU5 on the LAEA grid: both EPSG:3035). A grid unit IS a source
+///   unit, so the pixel's footprint is `resolution²` directly — no calibration, and none of the
+///   layer-mean error that `area_scale` carries.
+/// * **Otherwise** fall back to `area_scale` (mercator m² per source unit², a per-layer constant),
+///   which is what the old code always did. Still per-zoom-constant, so still seam-free.
+pub fn min_area_src_for_grid(
+    tms: &TileMatrixSet,
+    z: u32,
+    src_crs: &str,
+    area_scale: f64,
+    min_feature_px: f64,
+) -> f64 {
+    if min_feature_px <= 0.0 {
+        return 0.0;
+    }
+    let Some(lvl) = tms.level(z) else {
+        return 0.0; // out of the grid: gate off rather than guess
+    };
+    if !(lvl.resolution > 0.0) || !lvl.resolution.is_finite() {
+        return 0.0;
+    }
+    if tms.crs.eq_ignore_ascii_case(src_crs) {
+        // Same CRS — the pixel footprint is already in source units.
+        return min_feature_px * lvl.resolution * lvl.resolution;
+    }
+    if !(area_scale > 0.0) {
+        return 0.0; // fail OPEN, as `min_area_src_for_zoom` always has
+    }
+    let px_m = lvl.resolution * crate::tms::meters_per_unit(&tms.crs);
+    min_feature_px * px_m * px_m / area_scale
+}
+
+/// The WebMercatorQuad zoom whose display resolution matches an OGC scale denominator — the
+/// inverse of [`merc_m_per_px`]. `scale · 0.00028` is ground metres per pixel (the OGC 0.28 mm/px
+/// rule that `render::request_scale_denominator` encodes), so this inverts
+/// `res = WORLD_MERC_M / (2^z · 256)`.
+///
+/// The one home for that inversion, shared by the per-zoom LOD pool pick
+/// (`topology::lod::LodSet::for_scale_denominator`) and the raster paths' min-feature-size gate, so
+/// a request cannot pick its LOD pool from one effective zoom and its size threshold from another.
+///
+/// Why the raster paths go through a *resolution*, not the tile's own `z`: a 512-px grid packs
+/// twice the detail of a 256-px grid at the same `z`, and a WMS GetMap has no `z` at all. Deriving
+/// from the resolution makes a tile and the GetMap covering the same ground at the same pixel size
+/// apply the identical threshold. (`/mvt` correctly uses the raw `z` — its encoder has a fixed
+/// 4096-unit extent, so zoom IS its only resolution.)
+///
+/// `None` for a non-finite or non-positive scale (a degenerate request). Callers must treat that as
+/// **gate off**, never as "zoom u32::MAX": `min_area_src_for_zoom` does `2f64.powi(z as i32)`, and
+/// `u32::MAX as i32` is `-1`, which would yield an enormous threshold, drop every polygon, and fail
+/// CLOSED on a blank tile. The clamp to 32 is the same reasoning — far past any real tile matrix,
+/// and safely inside `i32`.
+pub fn zoom_for_scale_denominator(scale: f64) -> Option<u32> {
+    let res_m = scale * 0.00028; // ground metres per pixel
+    if !(res_m > 0.0) || !res_m.is_finite() {
+        return None;
+    }
+    let z = (WORLD_MERC_M / (DISPLAY_TILE_PX * res_m)).log2().round();
+    if !z.is_finite() {
+        return None;
+    }
+    Some(z.clamp(0.0, 32.0) as u32)
+}
+
+/// The min-feature-size threshold (source-CRS units²) for a RASTER render of resolution `scale`
+/// (an OGC scale denominator). [`zoom_for_scale_denominator`] → [`min_area_src_for_zoom`], with the
+/// degenerate-scale case failing OPEN (`0.0` = gate off) as everything else on this path does.
+///
+/// This is the raster twin of the derivation `encode_tile_opt` does for itself from the tile `z`.
+/// Both raster tile front-ends (WMTS/TMS, via `server::VectorLayer::render_tile`), WMS GetMap of a
+/// vector layer, and the `build-pmtiles --tile-format png` bake (which goes through `render_tile`)
+/// come through here — the gate used to be MVT-only, which let one z1 raster tile of the 107.9M-row
+/// EU5 buildings layer pull every row into memory.
+pub fn min_area_src_for_scale(scale: f64, area_scale: f64, min_feature_px: f64) -> f64 {
+    match zoom_for_scale_denominator(scale) {
+        Some(z) => min_area_src_for_zoom(z, area_scale, min_feature_px),
+        None => 0.0,
+    }
+}
+
 /// Encode one MVT tile with the default feature budget. Thin wrapper over `encode_tile_opt`
 /// (the entry the tests and any default caller use). Kept taking a bare `&dyn FeatureSource` —
 /// several test fixtures build one directly and this is the one place that still needs the whole
@@ -127,6 +225,14 @@ pub fn encode_tile(
 /// own fallback) degrades to an empty batch / the source's full extent respectively — `encode_tile_opt`
 /// re-derives `tms.tile_bounds` itself and returns empty on the same out-of-grid case, so an empty
 /// batch here is never wrong, just occasionally a redundant zero-feature call.
+///
+/// `opts` is the same `MvtOptimizations` the caller is about to hand `encode_tile_opt`, and it is
+/// taken purely to derive the per-zoom min-feature-size threshold — the SAME `min_area_src_for_zoom`
+/// value the encoder derives for itself — and offer it to the source. A source that can apply it
+/// where the data lives (PostGIS, in the SQL `WHERE`) then never sends or decodes the sub-pixel
+/// rows the encoder would discard a moment later; every other source ignores it and behaves
+/// exactly as before. Deriving it from `z` here rather than taking a bare number keeps the two
+/// derivations impossible to drift apart.
 pub fn features_for_tile<'a>(
     src: &'a crate::vector::source::VectorSource,
     tms: &TileMatrixSet,
@@ -134,13 +240,25 @@ pub fn features_for_tile<'a>(
     x: u32,
     y: u32,
     src_crs: &str,
-) -> crate::vector::source::FeatureBatch<'a> {
+    opts: &MvtOptimizations,
+) -> Result<crate::vector::source::FeatureBatch<'a>, String> {
     let Some(bbox) = tms.tile_bounds(z, x, y) else {
-        return crate::vector::source::FeatureBatch::Borrowed(&[]);
+        // Out of the grid: genuinely no features, not a failure. `Ok` of an empty batch.
+        return Ok(crate::vector::source::FeatureBatch::Borrowed(&[]));
     };
     let query_bbox =
         source_filter_bbox(tms.crs.as_str(), src_crs, bbox).unwrap_or_else(|| src.full_extent());
-    src.features_in(query_bbox)
+    // The mosaic and dissolve passes vote on the RAW candidate set, so `encode_tile_opt` skips its
+    // own size gate when either is active (dropping small polygons would leave the very holes the
+    // mosaic exists to fill). The pushdown must skip for the same reason and by the same test, or
+    // the rows would be gone before the vote ever sees them.
+    let gated = !(is_mosaic_active(opts, z) || is_dissolve_active(opts, z));
+    let min_area_src = if gated {
+        min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px)
+    } else {
+        0.0
+    };
+    src.features_in_gated(query_bbox, min_area_src)
 }
 
 /// One encoded MVT feature (geometry + interned attribute tag indices).
@@ -262,7 +380,7 @@ pub fn encode_tile_opt(
     // routes produce identical bytes from a single derivation site. `max_features`/`dedup` come
     // straight off the opts. (Cell-mosaic wiring lands in Task B6.)
     let max_features = opts.max_features;
-    let min_area_src = min_area_src_for_zoom(z, opts.area_scale, opts.min_feature_px);
+    let min_area_src = min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px);
     let Some(bbox) = tms.tile_bounds(z, x, y) else {
         return Vec::new();
     };
@@ -676,8 +794,54 @@ fn sampled_positions(n: usize, budget: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{layer_area_scale, min_area_src_for_zoom, sampled_positions};
+    use super::{
+        layer_area_scale, merc_m_per_px, min_area_src_for_scale, min_area_src_for_zoom,
+        sampled_positions, zoom_for_scale_denominator,
+    };
     use crate::vector::source::FeatureSource;
+
+    /// The OGC scale denominator a WebMercatorQuad zoom's resolution corresponds to — the forward
+    /// direction of what `zoom_for_scale_denominator` inverts.
+    fn scale_of_zoom(z: u32) -> f64 {
+        merc_m_per_px(z) / 0.00028
+    }
+
+    #[test]
+    fn scale_to_zoom_round_trips_over_every_real_zoom() {
+        // The inversion is shared by the LOD pool pick and the raster size gate; if it drifts, a
+        // request thins at one effective zoom while its geometry came from another.
+        for z in 0..=22u32 {
+            assert_eq!(
+                zoom_for_scale_denominator(scale_of_zoom(z)),
+                Some(z),
+                "round trip failed at z{z}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_to_zoom_fails_open_on_a_degenerate_scale() {
+        // NOT `Some(u32::MAX)`: `min_area_src_for_zoom` does `2f64.powi(z as i32)` and
+        // `u32::MAX as i32` is -1, which would make the threshold enormous, drop every polygon and
+        // fail CLOSED on a blank tile. `None` -> gate off is the fail-OPEN answer.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(zoom_for_scale_denominator(bad), None, "scale {bad}");
+            assert_eq!(min_area_src_for_scale(bad, 1.0, 4.0), 0.0, "scale {bad}");
+        }
+    }
+
+    #[test]
+    fn min_area_for_scale_matches_the_equivalent_zoom() {
+        // The raster paths derive from a scale, the MVT encoder from a zoom. Same number, or a
+        // raster tile and the MVT tile of the same ground would disagree on what is visible.
+        for z in 0..=18u32 {
+            assert_eq!(
+                min_area_src_for_scale(scale_of_zoom(z), 2.5, 4.0),
+                min_area_src_for_zoom(z, 2.5, 4.0),
+                "z{z}"
+            );
+        }
+    }
 
     #[test]
     fn min_area_off_when_feature_px_not_positive() {
@@ -790,15 +954,23 @@ mod tests {
             extent: [-100_000.0, 4.6e6, 100_000.0, 4.8e6],
         };
         let grid = crate::tms::preset("WebMercatorQuad", 4096).unwrap();
-        // With `area_scale` set to the z6 display-px² area, `min_area_src_for_zoom` returns
-        // `min_feature_px` verbatim — so `min_area` below IS the source-area threshold, keeping this
-        // test identical to the pre-refactor `encode_tile_budgeted(..., 0, min_area)` form.
-        let px_area = super::min_area_src_for_zoom(6, 1.0, 1.0);
+        // This test wants `min_area` to BE the source-area threshold, so it has to convert that
+        // into the px² the knob actually takes. `unit` is source-units² per display-px² for THIS
+        // grid and zoom — one call to the same function the encoder uses, so the conversion cannot
+        // drift from it.
+        //
+        // (It used to do this by setting `area_scale` to the z6 display-px² area so the old
+        // zoom-only formula returned `min_feature_px` verbatim. That trick relied on the threshold
+        // being divided by `area_scale`, which the grid-aware same-CRS path correctly does not do —
+        // the grid here is EPSG:3857 and so is the source, so a pixel's footprint is already in
+        // source units. The trick broke; the seam-free property being tested did not.)
+        let unit = super::min_area_src_for_grid(&grid, 6, "EPSG:3857", 1.0, 1.0);
+        assert!(unit > 0.0, "grid resolution must be computable");
         let enc = |x: u32, min_area: f64| {
             let opts = MvtOptimizations {
                 max_features: 0,
-                min_feature_px: min_area,
-                area_scale: px_area,
+                min_feature_px: min_area / unit,
+                area_scale: 1.0, // unused on the same-CRS path; pinned so it cannot mislead
                 ..MvtOptimizations::defaults()
             };
             encode_tile_opt(src.features(), &grid, 6, x, 24, "EPSG:3857", "t", &opts)
@@ -1033,5 +1205,127 @@ mod tests {
     #[test]
     fn budget_zero_is_empty() {
         assert!(sampled_positions(100, 0).is_empty());
+    }
+
+    // ---- Task 4: NaN-safe encode for interrupted projections ----
+
+    #[test]
+    fn nan_safe_encode_drops_feature_with_non_finite_vertex() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        use crate::vector::feature::{Feature, Geometry, Props};
+        // A rectangle like `rect_feature`, but its 4th corner is corrupted to NaN — simulating what
+        // an interrupted projection (`+proj=igh`) can hand back for a vertex that falls in a lobe
+        // gap. The OTHER 4 vertices still give the ring a normal, in-tile bbox, so the cheap
+        // source-CRS bbox pre-filter does NOT trivially reject the whole feature before projection is
+        // ever reached (a whole-NaN Point feature would be — Geometry::compute_bbox ignores a NaN
+        // vertex entirely, so that path never even exercises the guard under test). This one
+        // survives the pre-filter and reaches real per-vertex projection, where the corrupted vertex
+        // must be caught.
+        let ring = vec![
+            [-100_000.0, 4.6e6],
+            [100_000.0, 4.6e6],
+            [100_000.0, 4.8e6],
+            [f64::NAN, 4.8e6],
+            [-100_000.0, 4.6e6],
+        ];
+        let feat = Feature::new(Geometry::Polygon(vec![ring]), Props::new(), 1);
+        let src = VecSource {
+            feats: vec![feat],
+            extent: [-100_000.0, 4.6e6, 100_000.0, 4.8e6],
+        };
+        let grid = crate::tms::preset("WebMercatorQuad", 4096).unwrap();
+        let bytes = encode_tile_opt(
+            src.features(),
+            &grid,
+            6,
+            32,
+            24,
+            "EPSG:3857",
+            "t",
+            &MvtOptimizations::defaults(),
+        );
+        assert!(
+            bytes.is_empty(),
+            "a feature with one non-finite vertex must be dropped whole (the existing skip/None \
+             contract `project_ring`/`project_rings` already implement via `Option::collect`), never \
+             partially encoded with a garbage/rounded-to-zero coordinate"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grid_aware_gate_tests {
+    use super::*;
+    use crate::tms;
+
+    fn laea() -> tms::TileMatrixSet {
+        tms::from_ogc_json(
+            &std::fs::read_to_string("fixtures/grids/EuropeanETRS89_LAEAQuad.json").unwrap(),
+        )
+        .expect("LAEA grid")
+    }
+
+    /// ⚠ THE BUG. On the LAEA grid, level 10 is 17.578125 m/px; `merc_m_per_px(10)` claims 152.87.
+    /// The threshold squares that, so the old zoom-only derivation was ~79x too aggressive — on the
+    /// grid an EU customer would actually use.
+    #[test]
+    fn laea_threshold_uses_the_grids_own_resolution_not_mercators() {
+        let g = laea();
+        // Same CRS as the source, so the pixel footprint IS the threshold basis: 17.578125² × 2.
+        let got = min_area_src_for_grid(&g, 10, "EPSG:3035", 2.116, 2.0);
+        let res = 17_578.125 / 2f64.powi(10);
+        assert!((got - 2.0 * res * res).abs() < 1e-6, "got {got}");
+
+        // How much too aggressive the old derivation was. NOTE the factor is NOT simply the
+        // resolution ratio squared (8.906² = 79.3): the old formula also divides by `area_scale`,
+        // which for this layer is 2.116, so the net is 79.3 / 2.116 ≈ 37.5. Stated structurally
+        // rather than as a magic number, because `area_scale` is per-LAYER — quoting a single
+        // figure without naming the layer is meaningless.
+        let area_scale = 2.116;
+        let old = min_area_src_for_zoom(10, area_scale, 2.0);
+        let res_ratio = merc_m_per_px(10) / res;
+        let expected = res_ratio * res_ratio / area_scale;
+        assert!(
+            (old / got - expected).abs() < 0.01,
+            "expected the old gate to be {expected:.1}x too big, measured {:.1}x",
+            old / got
+        );
+        assert!(old / got > 30.0, "and that is a LOT: {:.1}x", old / got);
+    }
+
+    /// The 512-px grid this project actually ships was wrong too — a level's real resolution is
+    /// half what `merc_m_per_px` reports, so the threshold was 4x too aggressive.
+    #[test]
+    fn a_512px_mercator_grid_was_four_times_too_aggressive() {
+        let g512 = tms::preset("WebMercatorQuad", 512).expect("preset");
+        let got = min_area_src_for_grid(&g512, 11, "EPSG:3035", 2.116, 2.0);
+        let old = min_area_src_for_zoom(11, 2.116, 2.0);
+        assert!(
+            (old / got - 4.0).abs() < 0.01,
+            "expected 4x, got {}",
+            old / got
+        );
+    }
+
+    /// The canonical 256-px WebMercatorQuad — the one case the old code was right about — must be
+    /// UNCHANGED, or every existing archive silently disagrees with the live path.
+    #[test]
+    fn canonical_256px_mercator_is_unchanged() {
+        let g = tms::preset("WebMercatorQuad", 256).expect("preset");
+        for z in 0..=18 {
+            let new = min_area_src_for_grid(&g, z, "EPSG:3035", 2.116, 2.0);
+            let old = min_area_src_for_zoom(z, 2.116, 2.0);
+            assert!((new - old).abs() < old * 1e-9, "z{z}: {new} vs {old}");
+        }
+    }
+
+    /// Fail OPEN, as the gate always has: off knob, out-of-grid zoom, uncomputable calibration.
+    #[test]
+    fn degenerate_inputs_disable_the_gate() {
+        let g = laea();
+        assert_eq!(min_area_src_for_grid(&g, 10, "EPSG:3035", 2.116, 0.0), 0.0);
+        assert_eq!(min_area_src_for_grid(&g, 99, "EPSG:3035", 2.116, 2.0), 0.0);
+        // different CRS + no calibration -> off, not a wild guess
+        assert_eq!(min_area_src_for_grid(&g, 10, "EPSG:4326", 0.0, 2.0), 0.0);
     }
 }

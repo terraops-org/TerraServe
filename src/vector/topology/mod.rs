@@ -262,6 +262,51 @@ pub(crate) fn normalize_ring_rotation(ring: &mut GridRing) {
     }
 }
 
+// ---- CLI-facing helpers ----------------------------------------------------------------------
+//
+// Shared by the `build-topology` subcommand and by layer construction (`serve
+// --topology-simplify` / `--topology-dissolve` build topology at load time). They live next to
+// `BuildReport` rather than inside either caller so that neither has to depend on the other.
+
+/// Reject a non-positive or non-finite `--snap-tolerance` before touching the filesystem. Pure
+/// (no file I/O) so it's unit-testable without a gpkg fixture. `!(tol > 0.0 && tol.is_finite())`
+/// rejects zero, negative, NaN (every comparison with NaN is false), AND +inf (which passes `> 0.0`
+/// but snaps all coordinates to 0 → the coverage collapses to the origin with no error).
+pub(crate) fn validate_tolerance(tol: f64) -> Result<(), String> {
+    if !(tol > 0.0 && tol.is_finite()) {
+        return Err(format!(
+            "--snap-tolerance must be a positive finite number, got {tol}"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn format_report(rep: &BuildReport) -> String {
+    format!(
+        "arc-topology build report\n\
+         \x20 features in : {}\n\
+         \x20 rings in    : {}\n\
+         \x20 arcs        : {}  (shared {} · boundary {})\n\
+         \x20 junctions   : {}\n\
+         \x20 vertices    : {} → {} (after snap)\n\
+         \x20 dropped     : {} degenerate rings · {} non-finite verts\n\
+         \x20 area delta  : {:.3} (world units²)\n\
+         \x20 warnings    : {}",
+        rep.features_in,
+        rep.rings_in,
+        rep.arcs,
+        rep.shared_arcs,
+        rep.boundary_arcs,
+        rep.junctions,
+        rep.vertices_in,
+        rep.vertices_after_snap,
+        rep.degenerate_rings_dropped,
+        rep.nonfinite_dropped,
+        rep.total_abs_area_delta,
+        rep.warnings.len(),
+    )
+}
+
 #[cfg(test)]
 mod normalize_tests {
     use super::*;

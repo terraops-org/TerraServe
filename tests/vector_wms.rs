@@ -1,7 +1,8 @@
 //! Integration: the WMS surface serving a vector (label) layer.
 
 use std::sync::Arc;
-use terraserve::server::{Layer, VectorLayer};
+use terraserve::server::{Layer, PublishedGrid, VectorLayer};
+use terraserve::tms::TileMatrixSet;
 use terraserve::vector::geojson::GeoJsonSource;
 use terraserve::vector::shape::Shaper;
 use terraserve::vector::source::{FeatureSource, VectorSource};
@@ -28,15 +29,29 @@ fn vector_layer() -> Layer {
         grids: Vec::new(),
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
-            area_scale: 0.0, // MVT-only knob, unused by this test
+            area_scale: 0.0,     // size-gate calibration, unused by this test
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
+}
+
+/// Like `vector_layer()`, but with a non-empty `grids` — the shape a vector layer has when its
+/// config publishes grids. Since vector layers raster on the tile paths, this is the shape that
+/// MUST be advertised: the grid it publishes is a grid it can serve.
+fn vector_layer_with_grid() -> Layer {
+    let mut l = vector_layer();
+    l.grids = vec![PublishedGrid {
+        tms: TileMatrixSet::web_mercator_quad(256),
+        data_bounds: None,
+    }];
+    l
 }
 
 const EUROPE_3857: &str =
@@ -83,12 +98,67 @@ fn getcapabilities_advertises_vector_layer() {
 
 #[test]
 fn wmts_capabilities_omits_grid_less_vector_layer() {
-    // A vector layer has no tile grids; advertising it as a WMTS <Layer> would be schema-invalid
-    // (0 TileMatrixSetLink) and every GetTile would 400. It must be omitted (regression guard).
+    // `grids:` unset (the vector default: `from_cog` is dropped for a layer with no COG). There is
+    // no grid to raster on, and a <Layer> with 0 TileMatrixSetLink is schema-invalid, so it must be
+    // omitted — the other half of "advertised == servable" from the test above.
     let state = terraserve::server::ServeState::new(vec![vector_layer()], "http://h".into(), 4);
     let xml = terraserve::wmts::capabilities_xml(&state, "http://h/wmts", "http://h/wmts/1.0.0");
     assert!(
         !xml.contains("<Layer>"),
         "vector layer must not appear as a WMTS <Layer>"
+    );
+}
+
+#[test]
+fn wmts_capabilities_advertises_a_vector_layer_with_grids() {
+    // INVERTED with tiled raster vector layers: `get_tile` rasters a vector layer, so the `.png`
+    // <ResourceURL> is real. While it 400'd, listing it advertised an always-400 endpoint; now
+    // omitting it would hide a working endpoint from QGIS, which builds its layer list from here.
+    let state =
+        terraserve::server::ServeState::new(vec![vector_layer_with_grid()], "http://h".into(), 4);
+    let xml = terraserve::wmts::capabilities_xml(&state, "http://h/wmts", "http://h/wmts/1.0.0");
+    assert!(
+        xml.contains("<Layer>") && xml.contains("<ows:Identifier>airports</ows:Identifier>"),
+        "vector layer with grids must be advertised as a WMTS <Layer>: {xml}"
+    );
+    assert!(
+        xml.contains("<TileMatrixSet>WebMercatorQuad</TileMatrixSet>"),
+        "…linked to the grid it publishes: {xml}"
+    );
+    // …but NOT offering GetFeatureInfo: that stayed raster-only, so advertising the InfoFormats
+    // would offer an operation that 400s on this layer (<InfoFormat> is 0..* in WMTS 1.0.0).
+    assert!(
+        !xml.contains("<InfoFormat>"),
+        "a vector layer must not advertise GetFeatureInfo formats: {xml}"
+    );
+}
+
+#[test]
+fn tms_root_advertises_a_vector_layer_with_grids() {
+    // INVERTED with tiled raster vector layers: `render_tms_tile` now rasters a vector layer
+    // (`VectorLayer::render_tile`), so a `<TileMap>` href for a grid it publishes resolves to a
+    // real PNG. While vector tiles 400'd, listing one here was advertising an always-400 endpoint;
+    // omitting it now would be the opposite bug — a working endpoint no client can discover.
+    let state =
+        terraserve::server::ServeState::new(vec![vector_layer_with_grid()], "http://h".into(), 4);
+    let root = terraserve::tms_http::tms_root(&state.base_url);
+    let xml = terraserve::tms_http::tilemapservice_xml(&state, &root);
+    assert!(
+        xml.contains("<TileMap ") && xml.contains("airports@WebMercatorQuad"),
+        "vector layer with grids must be advertised as a TMS <TileMap>: {xml}"
+    );
+}
+
+#[test]
+fn tms_root_omits_a_vector_layer_that_publishes_no_grids() {
+    // The other half: `grids:` unset (the default `from_cog` is dropped for a vector layer) means
+    // there is no grid to raster on, so there is nothing honest to advertise. Advertised == servable
+    // in BOTH directions.
+    let state = terraserve::server::ServeState::new(vec![vector_layer()], "http://h".into(), 4);
+    let root = terraserve::tms_http::tms_root(&state.base_url);
+    let xml = terraserve::tms_http::tilemapservice_xml(&state, &root);
+    assert!(
+        !xml.contains("<TileMap "),
+        "a grid-less vector layer has no servable tile endpoint to advertise"
     );
 }

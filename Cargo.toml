@@ -28,21 +28,44 @@ default = ["jemalloc"]
 # jemalloc global allocator. glibc's malloc keeps freed memory in-process (RSS stays at the
 # high-water mark, inflating the k8s pod footprint after a big whole-extent request); jemalloc
 # returns dirty pages to the OS and is fast under the engine's multithreaded decode/render.
-# Opt-in so the default build (and score.sh/CI) stay on glibc: `cargo build --release --features jemalloc`.
+# ON BY DEFAULT (this comment used to claim the opposite). Turn it off with `--no-default-features`.
+# Absent entirely on MSVC — see the target table below, and terraops-org/TerraServe#9.
 jemalloc = ["dep:tikv-jemallocator"]
 # Build PROJ from source (vendored) instead of linking system libproj. OFF by default so the
 # server build and score.sh stay on fast system libproj; the Python wheel turns it ON so the
 # distributed artifact is self-contained (imports on a host with no libproj installed).
 bundled-proj = ["proj/bundled_proj"]
 
+# jemalloc allocator, declared per-TARGET so it is absent on MSVC.
+#
+# ⚠ NOT a style choice — `tikv-jemalloc-sys` does not build for `x86_64-pc-windows-msvc` ("jemalloc
+# support ... is untested", then the build script fails). Because `default = ["jemalloc"]`, a plain
+# `cargo build --release` on Windows therefore could not succeed AT ALL. Reported from the wild in
+# terraops-org/TerraServe#9 by someone simply trying to build the project.
+#
+# Under this target table the crate is not in the dependency graph on MSVC, the `jemalloc` feature
+# resolves to nothing there, and `main.rs`'s `#[cfg(feature = "jemalloc")]` global allocator is
+# compiled out — so Windows silently gets the system allocator and builds. Every other platform is
+# unchanged and keeps jemalloc on by default (it is worth ~23x lower idle RSS; see
+# `project-serving-architecture-pmtiles`).
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+# Unprefixed so it provides the standard malloc/free symbols + reads MALLOC_CONF. A memory
+# allocator, not a COG/GeoTIFF reader — allowed by the banned-crate gate.
+tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-# jemalloc allocator (opt-in via the `jemalloc` feature). Unprefixed so it provides the standard
-# malloc/free symbols + reads MALLOC_CONF. A memory allocator, not a COG/GeoTIFF reader — allowed.
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"], optional = true }
 flate2 = "1"
 png = "0.17"
 proj = "0.27"
+# Direct FFI to a handful of libproj C functions (proj_create/proj_as_proj_string) not
+# exposed by the `proj` crate's safe wrapper — needed to export an arbitrary CRS as a
+# PROJ.4 string for the viewer's proj4js registration (see reproj::crs_to_proj4). Pinned to
+# the exact version `proj = "0.27"` already pulls transitively (see Cargo.lock) so Cargo
+# unifies it into the same build — no second libproj, no second `links = "proj"` conflict.
+# Its own `bundled_proj` feature is NOT enabled here; `proj/bundled_proj` (below) remains
+# the sole switch, so the Python wheel's vendored-PROJ build is untouched.
+proj-sys = "=0.23.2"
 weezl = "0.1"   # LZW codec (TIFF variant) — a codec crate like flate2/zune-jpeg, not a TIFF reader
 zune-jpeg = "0.4"
 zstd = "0.13"   # ZSTD codec (libzstd binding) — a codec crate like flate2/zune-jpeg, not a TIFF reader
@@ -94,9 +117,44 @@ tiny-skia = "0.11"
 # R-tree/Feature decode (src/vector/fgb/) is hand-written on top of this low-level Table API.
 flatbuffers = "25"
 
+# Postgres wire client + connection pool for the PostGIS vector source (src/vector/postgis.rs).
+# A database CLIENT, exactly analogous to `rusqlite` for GeoPackage — not a geo-format reader:
+# the geometry arrives as plain ISO WKB from `ST_AsBinary` and is decoded by our own
+# `vector/wkb.rs`. Pure Rust (no libpq), so the static binary and the image size survive, and
+# the binary wire protocol puts `bytea` straight into the decoder with no hex round trip.
+# `deadpool` over `bb8` for its per-connection prepared-statement cache.
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+# `TryStreamExt` for consuming tokio-postgres's `RowStream` (query_raw) without buffering the
+# result set. Present transitively already, but a transitive dependency is not importable.
+futures-util = { version = "0.3", default-features = false }
+
 [dev-dependencies]
 # SIMD micro-benchmark only (examples/simd_bench.rs) — not used by the engine yet.
 wide = "0.7"
 
 [profile.release]
 opt-level = 3
+# MEASURED 2026-08-05 (bench/fgb_decode_bench.py, median of 3 runs per config), not assumed.
+#
+# The per-feature decode loop is dominated by tiny accessor calls into the `flatbuffers` CRATE
+# (`Vector::get` per ordinate, `Table::get` per field). Without LTO the optimizer cannot see
+# across that crate boundary, so each one stays an opaque call. `lto = "fat"` merges every
+# crate's IR at link time, letting those accessors inline into our decode loops:
+#
+#   case                          none    lto=fat
+#   z9 decode-only               2885ms   2664ms  -7.6 %
+#   z8 decode-only               5770ms   5548ms  -3.8 %
+#   z7 decode-only              11283ms  10310ms  -8.6 %
+#   (all six cases improved; run-to-run spread is ~4-5 %, so the per-case delta is near the
+#    noise floor, but 12/12 measurements across two configs favoured LTO.)
+#
+# `codegen-units = 1` was TRIED AND REJECTED: it measured within noise of lto=fat alone (and
+# slightly worse on 5 of 6 cases) while pushing the build 1m04s -> 1m49s. Fat LTO already merges
+# everything into one module at link time, which subsumes what CGU=1 buys. Do not re-add it
+# without a measurement showing otherwise.
+#
+# NOT `panic = "abort"`: several decode paths carry a documented "never panics, always a clean
+# Err" contract that the suite asserts by catching panics, and aborting turns those into a
+# killed test process.
+lto = "fat"

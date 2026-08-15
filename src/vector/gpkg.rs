@@ -591,38 +591,42 @@ impl GpkgWindowedSource {
     /// the cap bounds work done, not just a post-hoc truncation. The GeoPackage R-tree stores
     /// PER-FEATURE bboxes (unlike FGB's packed-node tree, which only proves node-level overlap),
     /// so the SQL `WHERE` already is the exact per-feature overlap set — no post-decode
-    /// re-filter needed. Fail-open: any `rusqlite`/open/prepare/query error, or a column-lookup
-    /// miss, returns `Vec::new()` rather than propagating — a request-time read failure must not
-    /// panic the server (matches `FgbSource::query_capped`). A single malformed row is skipped,
-    /// not fatal to the rest of the batch, same spirit.
-    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Vec<Feature> {
+    /// re-filter needed.
+    ///
+    /// ⚠ Every open/prepare/query failure is REPORTED, not swallowed. This used to answer all six
+    /// of them with `Vec::new()` under the name "fail-open", which is the wrong shape for a read
+    /// error: a missing file, a corrupt page or a lock timeout arrived at the client as an empty
+    /// map behind a **200 OK**, indistinguishable from ground with no features on it. Propagating
+    /// does not panic the server either — every caller above already turns the error into a 500 /
+    /// OWS exception. A single malformed ROW is still skipped rather than failing the batch: that
+    /// one genuinely is a fail-open, because the other rows are good data.
+    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Result<Vec<Feature>, String> {
         let [w, s, e, n] = bbox;
-        let conn = match Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+        let ctx = |what: &str, e: rusqlite::Error| {
+            format!(
+                "gpkg: {what} failed on `{}` in {}: {e}",
+                self.table, self.path
+            )
         };
+        let conn = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| ctx("open", e))?;
         let sql = format!(
             "SELECT t.* FROM \"{}\" t JOIN \"{}\" r ON t.\"{}\" = r.id \
              WHERE r.maxx >= ?1 AND r.minx <= ?2 AND r.maxy >= ?3 AND r.miny <= ?4 LIMIT ?5",
             self.table, self.rtree_table, self.pk_col
         );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt = conn.prepare(&sql).map_err(|e| ctx("prepare", e))?;
         let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
-        let geom_idx = match col_names.iter().position(|c| c == &self.geom_col) {
-            Some(i) => i,
-            None => return Vec::new(),
+        let col = |name: &str, what: &str| {
+            col_names.iter().position(|c| c == name).ok_or_else(|| {
+                format!("gpkg: {what} column `{name}` not in table `{}`", self.table)
+            })
         };
-        let pk_idx = match col_names.iter().position(|c| c == &self.pk_col) {
-            Some(i) => i,
-            None => return Vec::new(),
-        };
-        let mut rows = match stmt.query(rusqlite::params![w, e, s, n, cap as i64]) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
+        let geom_idx = col(&self.geom_col, "geometry")?;
+        let pk_idx = col(&self.pk_col, "primary key")?;
+        let mut rows = stmt
+            .query(rusqlite::params![w, e, s, n, cap as i64])
+            .map_err(|e| ctx("query", e))?;
 
         let mut out = Vec::new();
         loop {
@@ -632,10 +636,13 @@ impl GpkgWindowedSource {
                         out.push(f);
                     }
                     // A `Ok(None)` (empty/unmodeled geometry) or `Err` (malformed row) both just
-                    // skip this row — fail-open per row, matching `FgbSource::query_capped`.
+                    // skip this row — a per-row fail-open, because the rest of the batch is good.
                 }
                 Ok(None) => break,
-                Err(_) => break, // fail-open: a mid-iteration read error returns what we have
+                // NOT a per-row skip: the iteration itself broke, so what we have is a TRUNCATED
+                // window, not a complete one. Returning it would be the silent-blank bug in
+                // miniature -- a partial map that looks whole.
+                Err(e) => return Err(ctx("row iteration", e)),
             }
         }
         if out.len() >= cap {
@@ -645,14 +652,14 @@ impl GpkgWindowedSource {
                 self.table
             );
         }
-        out
+        Ok(out)
     }
 }
 
 impl WindowedSource for GpkgWindowedSource {
     /// Delegates to `query_capped` with `max_query_features()` — the real serving path's entry
     /// point (every WMS/MVT/WMTS request against a windowed `.gpkg` layer reads through this).
-    fn query(&self, bbox: [f64; 4]) -> Vec<Feature> {
+    fn query(&self, bbox: [f64; 4]) -> Result<Vec<Feature>, String> {
         self.query_capped(bbox, max_query_features())
     }
     fn full_extent(&self) -> [f64; 4] {
@@ -961,6 +968,7 @@ mod windowed_tests {
         };
         let windowed = |bbox: [f64; 4]| -> BTreeSet<u64> {
             WindowedSource::query(&src, bbox)
+                .expect("read the fixture")
                 .into_iter()
                 .map(|f| f.fid)
                 .collect()
@@ -990,14 +998,14 @@ mod windowed_tests {
         let src = GpkgWindowedSource::open(g.path(), None).unwrap();
         let bbox = [-1.0, -1.0, 71.0, 31.0]; // covers all 8 fixture features
 
-        let capped = src.query_capped(bbox, 3);
+        let capped = src.query_capped(bbox, 3).expect("read the fixture");
         assert!(
             capped.len() <= 3,
             "cap=3 must bound the result to at most 3, got {}",
             capped.len()
         );
 
-        let uncapped = src.query_capped(bbox, 1000);
+        let uncapped = src.query_capped(bbox, 1000).expect("read the fixture");
         assert_eq!(
             uncapped.len(),
             8,

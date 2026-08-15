@@ -78,7 +78,7 @@ fn format_num(n: f64) -> String {
 
 /// Geometry in the source CRS. A `Polygon`'s ring 0 is the exterior; any further rings are
 /// holes (GeoJSON winding order is not enforced here — the renderer decides how to fill).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Geometry {
     Point([f64; 2]),
     LineString(Vec<[f64; 2]>),

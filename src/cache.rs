@@ -77,6 +77,30 @@ pub fn index_cache_bytes() -> u64 {
         .unwrap_or(64 * 1024 * 1024)
 }
 
+/// Bounded chunk cache for a lazily-read FlatGeoBuf R-tree index (`fgb::FgbIndex::Lazy`).
+/// `chunk_index -> raw index bytes of that chunk`. Per-`FgbSource` (each owns one), so the key is
+/// just the chunk number — no cross-source discriminator is needed. Weight = byte length, so total
+/// resident chunk bytes stay hard-bounded like every other cache here. Cheap when unused: a
+/// `Resident` index never inserts.
+pub type FgbIndexCache = moka::sync::Cache<u64, Arc<Vec<u8>>>;
+
+/// Build an FGB index-chunk cache with a hard `cap_bytes` memory ceiling.
+pub fn new_fgb_index_cache(cap_bytes: u64) -> FgbIndexCache {
+    moka::sync::Cache::builder()
+        .max_capacity(cap_bytes)
+        .weigher(|_k: &u64, v: &Arc<Vec<u8>>| v.len().min(u32::MAX as usize) as u32)
+        .build()
+}
+
+/// Default `FgbIndexCache` cap: env `TERRASERVE_FGB_INDEX_CACHE_MB`, default 16 MiB.
+pub fn fgb_index_cache_bytes() -> u64 {
+    std::env::var("TERRASERVE_FGB_INDEX_CACHE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(16 * 1024 * 1024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +158,17 @@ mod tests {
             "configured 1 MiB cap not honoured: {}",
             c.weighted_size()
         );
+    }
+
+    #[test]
+    fn fgb_index_cache_stays_bounded() {
+        let cap = 1024 * 1024; // 1 MiB
+        let cache = new_fgb_index_cache(cap);
+        for i in 0..64u64 {
+            cache.insert(i, Arc::new(vec![0u8; 256 * 1024])); // 256 KiB chunks
+        }
+        cache.run_pending_tasks();
+        assert!(cache.weighted_size() <= cap, "fgb index cache exceeded cap");
+        assert!(cache.entry_count() < 64, "nothing was evicted");
     }
 }

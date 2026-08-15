@@ -58,19 +58,28 @@ fn countries_layer(name: &str) -> Layer {
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
             area_scale: terraserve::vector::mvt::layer_area_scale(ext, ext),
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 
 #[test]
 fn read_through_hits_archive_and_falls_back_live() {
-    let grid = terraserve::tms::preset("WebMercatorQuad", 4096).unwrap();
+    // `tms::preset` suffixes `.id` with the tile_px it built at (4096 here, the MVT-baking
+    // resolution) whenever that isn't 256, e.g. "WebMercatorQuad_4096" — but a live MVT request for
+    // this grid always asks for the bare preset name (see `resolve_grid`'s preset fallback in
+    // mvt_http.rs). `run_build_pmtiles` (the real `build-pmtiles` CLI path) corrects this by
+    // stamping the id the operator actually asked for via `--grid`; mirror that fix here since this
+    // test drives `generate::build_pmtiles` directly, bypassing the CLI layer.
+    let mut grid = terraserve::tms::preset("WebMercatorQuad", 4096).unwrap();
+    grid.id = "WebMercatorQuad".to_string();
 
     // Generation layer: same geometry/style/font as the served layer, but named "ARCHIVED" — the
     // archive's tiles carry THIS name in their embedded MVT `Layer.name`, not "countries".
@@ -97,7 +106,12 @@ fn read_through_hits_archive_and_falls_back_live() {
     // attached — this is the mismatch that makes archive-served bytes distinguishable from a live
     // "countries" encode.
     let mut served_layer = countries_layer(LAYER);
-    served_layer.pmtiles = Some(Arc::new(PmtilesReader::open(&out).unwrap()));
+    let reader_owned = PmtilesReader::open(&out).unwrap();
+    // Task 3: file the archive under the grid it self-describes (metadata `grid_id`) — the same
+    // auto-mapping `build_vector_layer` does for `serve --pmtiles`.
+    served_layer
+        .pmtiles
+        .insert(reader_owned.grid_id(), Arc::new(reader_owned));
     let st = ServeState::new(vec![served_layer], "http://h/wms".into(), 16);
 
     // A second, identical "countries" layer with NO archive at all — what a live encode of
@@ -108,7 +122,7 @@ fn read_through_hits_archive_and_falls_back_live() {
     // serving it via render_mvt_tile returns exactly the archive's bytes, AND that those bytes are
     // NOT what a live "countries" encode of the same tile would produce (see module doc for why the
     // name mismatch makes this a genuine regression guard rather than a tautology).
-    let reader = st.layers[0].pmtiles.as_ref().unwrap().clone();
+    let reader = st.layers[0].pmtiles.get("WebMercatorQuad").unwrap().clone();
     let bbox3857 = terraserve::reproj::crs_bounds(
         "EPSG:4326",
         "EPSG:3857",

@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use terraserve::config::GridConfig;
 use terraserve::mvt_http;
-use terraserve::server::{self, Layer, ServeState, VectorLayer};
+use terraserve::server::{self, Layer, PublishedGrid, ServeState, VectorLayer};
 use terraserve::vector::geojson::GeoJsonSource;
 use terraserve::vector::shape::Shaper;
 use terraserve::vector::source::{FeatureSource, VectorSource};
@@ -43,18 +44,40 @@ fn vector_layer() -> Layer {
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
             area_scale: terraserve::vector::mvt::layer_area_scale(ext, ext),
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 
 fn state() -> ServeState {
     ServeState::new(vec![vector_layer()], "http://h/wms".into(), 16)
+}
+
+/// Task 3: `vector_layer()` plus a CUSTOM grid `testgrid` (Task 2's `layer.grids`, built the same
+/// way `src/lib.rs`'s `vector_layer_custom_grid_grids_non_empty` test builds one) — covers the fixture's
+/// own extent ([-30,-30,30,30], see `fixtures/vector/mini_mvt.geojson`) at z0, so z0/0/0 returns the
+/// whole layer.
+fn vector_layer_with_custom_grid() -> Layer {
+    let mut l = vector_layer();
+    let grid_cfg = GridConfig {
+        crs: "EPSG:4326".to_string(),
+        origin: [-30.0, 30.0],
+        extent: [-30.0, -30.0, 30.0, 30.0],
+        tile_px: 256,
+        resolutions: vec![60.0 / 256.0, 30.0 / 256.0],
+    };
+    l.grids = vec![PublishedGrid {
+        tms: grid_cfg.to_tms("testgrid"),
+        data_bounds: None,
+    }];
+    l
 }
 
 #[test]
@@ -93,6 +116,20 @@ fn xyz_tile_unknown_tms_is_4xx_not_panic() {
 }
 
 #[test]
+fn xyz_tile_custom_grid_is_200_and_nonempty() {
+    // Task 3: `/mvt/{layer}/testgrid/...` must resolve the layer's OWN published grid, not just the
+    // 4 built-in presets — before this task this 404'd with "no TileMatrixSet 'testgrid'".
+    let st = ServeState::new(
+        vec![vector_layer_with_custom_grid()],
+        "http://h/wms".into(),
+        16,
+    );
+    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0)
+        .expect("custom grid 'testgrid' should resolve, not 404");
+    assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
+}
+
+#[test]
 fn xyz_tile_unknown_layer_is_404() {
     let st = state();
     let err = mvt_http::render_mvt_tile(&st, "nope", "WebMercatorQuad", 0, 0, 0).unwrap_err();
@@ -112,7 +149,7 @@ fn xyz_tile_raster_layer_is_4xx_not_panic() {
 #[test]
 fn tilejson_document_has_the_expected_shape() {
     let st = state();
-    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", None).unwrap();
+    let doc = mvt_http::tilejson_doc(&st, LAYER, "WebMercatorQuad", None, None).unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["tilejson"], "3.0.0");
     let tiles = v["tiles"].as_array().expect("tiles array");
@@ -138,14 +175,72 @@ fn tilejson_document_has_the_expected_shape() {
 #[test]
 fn tilejson_unknown_tms_is_4xx_not_panic() {
     let st = state();
-    let err = mvt_http::tilejson_doc(&st, LAYER, "NoSuchGrid", None).unwrap_err();
+    let err = mvt_http::tilejson_doc(&st, LAYER, "NoSuchGrid", None, None).unwrap_err();
     assert!((400..500).contains(&err.0));
+}
+
+/// Regression for the bug that was LIVE on terraserve.io until 2026-08-03:
+///
+///   GET https://terraserve.io/demo/vida/mvt/vida/style.json
+///     -> "url": "http://terraserve.io/mvt/vida/WebMercatorQuad.json"   (404, mixed-content)
+///
+/// `advertised_origin` preferred the Host header unconditionally, so it hardcoded `http://`
+/// and rebuilt the origin from the host alone, discarding the `/demo/vida` path prefix. Since
+/// HTTP/1.1 ALWAYS sends Host, the configured-`--public-url` branch was dead code.
+///
+/// This asserts at the DOCUMENT level, not on the private helper: the unit tests in
+/// `src/mvt_http.rs` pin `advertised_origin` itself, but only a test that reads the emitted
+/// JSON proves the value actually reaches `sources.terraserve.url`. Both are needed - the
+/// unit tests would still pass if `style_json` stopped calling the helper.
+#[test]
+fn style_json_prefers_configured_public_url_over_the_request_host() {
+    let mut st = state();
+    st.public_url = Some("https://terraserve.io/demo/vida/wms".to_string());
+    // Host says something else entirely, and there is no X-Forwarded-Proto: the configured
+    // public URL must still win, keeping BOTH the https scheme and the /demo/vida prefix.
+    let doc =
+        mvt_http::style_json(&st, LAYER, "WebMercatorQuad", Some("terraserve.io"), None).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    assert_eq!(
+        v["sources"]["terraserve"]["url"],
+        format!("https://terraserve.io/demo/vida/mvt/{LAYER}/WebMercatorQuad.json"),
+        "configured --public-url must win over the Host header, scheme and path prefix intact"
+    );
+}
+
+/// The other half: with no `--public-url`, the scheme comes from `X-Forwarded-Proto` rather
+/// than being assumed. Traefik terminates TLS, so the connection the server sees is always
+/// plain HTTP and an assumed scheme is always wrong behind a proxy.
+#[test]
+fn tilejson_takes_the_scheme_from_forwarded_proto() {
+    let st = state();
+    let doc = mvt_http::tilejson_doc(
+        &st,
+        LAYER,
+        "WebMercatorQuad",
+        Some("example.org"),
+        Some("https"),
+    )
+    .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    let tpl = v["tiles"][0].as_str().expect("tiles[0]");
+    assert!(
+        tpl.starts_with("https://example.org/"),
+        "expected an https origin from X-Forwarded-Proto, got {tpl}"
+    );
 }
 
 #[test]
 fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
     let st = state();
-    let doc = mvt_http::style_json(&st, LAYER, Some("192.168.1.121:8081")).unwrap();
+    let doc = mvt_http::style_json(
+        &st,
+        LAYER,
+        "WebMercatorQuad",
+        Some("192.168.1.121:8081"),
+        None,
+    )
+    .unwrap();
     let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
     assert_eq!(v["version"], 8, "MapLibre GL style spec version");
     // The source references the layer's TileJSON on the REQUEST host (not 0.0.0.0 / base_url).
@@ -186,8 +281,23 @@ fn style_json_is_a_maplibre_gl_style_referencing_the_source() {
 #[test]
 fn style_json_unknown_layer_is_404() {
     let st = state();
-    let err = mvt_http::style_json(&st, "nope", None).unwrap_err();
+    let err = mvt_http::style_json(&st, "nope", "WebMercatorQuad", None, None).unwrap_err();
     assert_eq!(err.0, 404);
+}
+
+#[test]
+fn style_json_source_url_is_parametrized_by_grid_id() {
+    // Task 4: the embedded vector source's TileJSON must reference the REQUESTED grid, not always
+    // WebMercatorQuad — a style asked for a different TileMatrixSet must point at that grid's
+    // TileJSON (even though MapLibre itself can only ever render Web Mercator — a client concern,
+    // not this server's).
+    let st = state();
+    let doc = mvt_http::style_json(&st, LAYER, "WorldCRS84Quad", Some("host:8081"), None).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&doc).expect("valid JSON");
+    assert_eq!(
+        v["sources"]["terraserve"]["url"],
+        "http://host:8081/mvt/mini/WorldCRS84Quad.json"
+    );
 }
 
 #[test]
@@ -215,6 +325,25 @@ fn wmts_gettile_mvt_format_matches_the_xyz_route() {
     assert_eq!(
         wmts_bytes, xyz_bytes,
         "WMTS-MVT must match the XYZ route byte-for-byte"
+    );
+}
+
+#[test]
+fn wmts_gettile_mvt_custom_grid_matches_the_xyz_route() {
+    // Task 3: `wmts::get_tile_mvt` must resolve the layer's OWN published grid too (same
+    // lookup-then-preset order as `mvt_http::resolve_grid`), and produce byte-identical output to
+    // the `/mvt` XYZ route on the same `layer/tms/z/x/y` key.
+    let st = ServeState::new(
+        vec![vector_layer_with_custom_grid()],
+        "http://h/wms".into(),
+        16,
+    );
+    let wmts_bytes = wmts::get_tile_mvt(&st, LAYER, "default", "testgrid", 0, 0, 0)
+        .expect("custom grid 'testgrid' should resolve, not 404");
+    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0).unwrap();
+    assert_eq!(
+        wmts_bytes, xyz_bytes,
+        "WMTS-MVT must match the XYZ route byte-for-byte on a custom grid too"
     );
 }
 

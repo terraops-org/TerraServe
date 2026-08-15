@@ -43,6 +43,186 @@ impl Transformer {
     }
 }
 
+/// Export the PROJ.4 string for any CRS libproj can resolve — an EPSG code, WKT, or a
+/// `+proj=` string. `None` if PROJ can't build the object or can't render it as PROJ.4
+/// (never panics). Used by the built-in viewer to register a CRS with proj4js on the fly:
+/// the 4-entry hardcoded polar table in `tms_http.rs::proj4_def` only covers the CRSs the
+/// polar `/viewer` ships with, and can't produce e.g. LV95 (EPSG:2056) or Homolosine.
+///
+/// `proj` (the safe wrapper crate) doesn't expose `proj_create`/`proj_as_proj_string`, so
+/// this drops to the raw `proj-sys` FFI directly — pinned to the exact version `proj`
+/// already pulls transitively (see Cargo.toml), so it's the same libproj build, not a
+/// Does this CRS declare its NORTHING (or latitude) axis FIRST?
+///
+/// WMS 1.3.0 orders a BBOX by the CRS's own declared axis order, not by an easting-first
+/// convention. `EPSG:4326` being lat,lon is the famous case but it is one member of a class, not
+/// the class: `EPSG:3301` (Estonia), `EPSG:2180` (Poland) and `EPSG:3035` (ETRS89-LAEA) are all
+/// PROJECTED and all northing-first. A hardcoded 4326 check misses them, and the symptom is
+/// nasty — QGIS sends a correctly-ordered BBOX, the server reads it transposed, the envelope
+/// lands nowhere near the data, and every request returns a BLANK 200.
+///
+/// ⚠ **Decide on the axis NAME, not its direction.** Direction is a trap: `EPSG:3413` (NSIDC
+/// polar stereographic) declares `AXIS["easting (X)",south]` — an EASTING whose direction is
+/// `south`, because both axes of a polar projection point away from the pole. A direction-only
+/// test calls 3413 northing-first and transposes the Arctic. Found by the GetFeatureInfo tests,
+/// which serve exactly that CRS.
+///
+/// The abbreviation is the fallback for CRSs whose name is bare (`EPSG:2056` is just `"(E)"`),
+/// and direction is the last resort.
+///
+/// `None` when the CRS cannot be resolved or has fewer than two axes; the caller then keeps the
+/// bytes in the order they arrived, which is right for the easting-first majority.
+pub fn crs_is_northing_first(crs: &str) -> Option<bool> {
+    use proj_sys::{
+        proj_context_create, proj_context_destroy, proj_create, proj_crs_get_coordinate_system,
+        proj_cs_get_axis_count, proj_cs_get_axis_info, proj_destroy,
+    };
+    use std::ffi::{CStr, CString};
+
+    let c_crs = CString::new(crs).ok()?;
+
+    // SAFETY: every pointer is null-checked before use, and `ctx`, `pj` and `cs` are destroyed on
+    // EVERY exit path including the early returns. The strings PROJ writes belong to `cs` and are
+    // only valid until it is destroyed, so they are copied out strictly before that. Out-params
+    // we do not need are null, which `proj_cs_get_axis_info` documents as permitted.
+    unsafe {
+        let ctx = proj_context_create();
+        if ctx.is_null() {
+            return None;
+        }
+        let pj = proj_create(ctx, c_crs.as_ptr());
+        if pj.is_null() {
+            proj_context_destroy(ctx);
+            return None;
+        }
+        let cs = proj_crs_get_coordinate_system(ctx, pj);
+        if cs.is_null() {
+            proj_destroy(pj);
+            proj_context_destroy(ctx);
+            return None;
+        }
+
+        let mut out = None;
+        if proj_cs_get_axis_count(ctx, cs) >= 2 {
+            let mut name: *const std::os::raw::c_char = std::ptr::null();
+            let mut abbrev: *const std::os::raw::c_char = std::ptr::null();
+            let mut direction: *const std::os::raw::c_char = std::ptr::null();
+            let ok = proj_cs_get_axis_info(
+                ctx,
+                cs,
+                0, // the FIRST axis is the one that decides BBOX order
+                &mut name,
+                &mut abbrev,
+                &mut direction,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                let s = |p: *const std::os::raw::c_char| -> String {
+                    if p.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(p)
+                            .to_str()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                    }
+                };
+                out = classify_first_axis(&s(name), &s(abbrev), &s(direction));
+            }
+        }
+
+        proj_destroy(cs);
+        proj_destroy(pj);
+        proj_context_destroy(ctx);
+        out
+    }
+}
+
+/// The decision, split out so it is testable without a PROJ handle.
+///
+/// Order matters: NAME, then ABBREVIATION, then direction. See `crs_is_northing_first` for why
+/// direction cannot come first.
+fn classify_first_axis(name: &str, abbrev: &str, direction: &str) -> Option<bool> {
+    if name.contains("northing") || name.contains("latitude") {
+        return Some(true);
+    }
+    if name.contains("easting") || name.contains("longitude") {
+        return Some(false);
+    }
+    // A bare name like "(E)" (EPSG:2056, EPSG:3031) carries nothing; the abbreviation does.
+    match abbrev {
+        "n" | "y" | "lat" => return Some(true),
+        "e" | "x" | "lon" | "long" => return Some(false),
+        _ => {}
+    }
+    // Last resort. Only reached when both name and abbreviation are unhelpful.
+    match direction {
+        "north" | "south" => Some(true),
+        "east" | "west" => Some(false),
+        _ => None,
+    }
+}
+
+/// second one.
+pub fn crs_to_proj4(crs: &str) -> Option<String> {
+    use proj_sys::{
+        proj_as_proj_string, proj_context_create, proj_context_destroy, proj_create,
+        proj_crs_create_bound_crs_to_WGS84, proj_destroy, PJ_PROJ_STRING_TYPE_PJ_PROJ_4,
+    };
+    use std::ffi::{CStr, CString};
+
+    // The CString must outlive the `proj_create` call — it's built and held here, not
+    // dropped before use.
+    let c_crs = CString::new(crs).ok()?;
+
+    // SAFETY: every FFI pointer is null-checked before use. `ctx` and `pj` are freed on
+    // EVERY exit path (success, a null `pj`, or a null/unreadable proj-string result) — no
+    // early return skips their destroy call, so a garbage CRS can never leak either. The
+    // string PROJ returns from `proj_as_proj_string` is owned by `pj` and only valid until
+    // `pj` is destroyed (or the context is reused), so it is copied into an owned `String`
+    // strictly before `proj_destroy` runs.
+    unsafe {
+        let ctx = proj_context_create();
+        if ctx.is_null() {
+            return None;
+        }
+        let pj = proj_create(ctx, c_crs.as_ptr());
+        if pj.is_null() {
+            proj_context_destroy(ctx);
+            return None;
+        }
+        // PROJ 6+ models the datum relationship as a SEPARATE coordinate operation, and the
+        // legacy PROJ.4 string of a *CRS* has nowhere to put it, so exporting the CRS directly
+        // silently DROPS `+towgs84`. For EPSG:2056 (Swiss LV95, Bessel ellipsoid) that is a
+        // **164 m** error in the definition handed to proj4js by `/viewer` and published as the
+        // `"proj4"` field of `GET /tileMatrixSets/{id}` (measured 2026-07-27).
+        //
+        // A **BoundCRS** is PROJ's own answer to this: it pairs the CRS with its hub
+        // transformation, and its legacy export therefore carries the Helmert parameters. This
+        // is the same mechanism GDAL's `exportToProj4` relies on. Fall back to the bare CRS when
+        // no bound form exists (already WGS84-based, or a grid-shift datum that genuinely cannot
+        // be written as `+towgs84`).
+        let bound = proj_crs_create_bound_crs_to_WGS84(ctx, pj, std::ptr::null());
+        let export = if bound.is_null() { pj } else { bound };
+
+        let raw = proj_as_proj_string(ctx, export, PJ_PROJ_STRING_TYPE_PJ_PROJ_4, std::ptr::null());
+        let result = if raw.is_null() {
+            None
+        } else {
+            CStr::from_ptr(raw).to_str().ok().map(|s| s.to_owned())
+        };
+        if !bound.is_null() {
+            proj_destroy(bound);
+        }
+        proj_destroy(pj);
+        proj_context_destroy(ctx);
+        result
+    }
+}
+
 fn crs_eq(a: &str, b: &str) -> bool {
     a.trim().eq_ignore_ascii_case(b.trim())
 }
@@ -163,5 +343,149 @@ mod tests {
         let (x, y) = t.to_source(-9.0, 37.945).expect("transform failed");
         assert!((x - 500000.0).abs() < 1.0, "easting off: {x}");
         assert!((y - 4_199_712.7).abs() < 100.0, "northing off: {y}");
+    }
+
+    #[test]
+    fn crs_to_proj4_lv95_is_swiss_oblique_mercator() {
+        // EPSG:2056 (CH1903+ / LV95) is a Swiss oblique Mercator — PROJ's `somerc`. This is
+        // the CRS the hardcoded 4-entry polar table in tms_http.rs::proj4_def can't produce,
+        // which is why the LV95 viewer can't register it with proj4js today.
+        let s = crs_to_proj4("EPSG:2056").expect("PROJ must resolve EPSG:2056");
+        assert!(s.contains("+proj=somerc"), "unexpected proj4 string: {s}");
+    }
+
+    #[test]
+    fn crs_to_proj4_wgs84_is_longlat() {
+        let s = crs_to_proj4("EPSG:4326").expect("PROJ must resolve EPSG:4326");
+        assert!(s.contains("+proj=longlat"), "unexpected proj4 string: {s}");
+    }
+
+    #[test]
+    fn crs_to_proj4_garbage_crs_is_none() {
+        assert_eq!(crs_to_proj4("EPSG:not-a-real-crs-99999999"), None);
+        assert_eq!(crs_to_proj4(""), None);
+    }
+
+    #[test]
+    fn crs_to_proj4_keeps_the_datum_shift() {
+        // PROJ's legacy proj4 export of a CRS DROPS `+towgs84`, because PROJ 6+ holds the datum
+        // relationship as a separate operation. For EPSG:2056 (Bessel ellipsoid) that silently
+        // costs 164 m in the definition handed to proj4js by `/viewer` and published as the
+        // `"proj4"` field of `GET /tileMatrixSets/{id}`. Measured 2026-07-27.
+        let s = crs_to_proj4("EPSG:2056").expect("PROJ must resolve EPSG:2056");
+        assert!(s.contains("+proj=somerc"), "unexpected projection: {s}");
+        assert!(
+            s.contains("towgs84"),
+            "EPSG:2056 lost its datum shift, this is the 164 m bug: {s}"
+        );
+        // The Swiss shift is ~674 m in X; assert the real value, not merely that a key exists,
+        // so a zeroed or truncated clause still fails.
+        assert!(
+            s.contains("+towgs84=674.374"),
+            "wrong CH1903+ -> WGS84 parameters: {s}"
+        );
+    }
+
+    #[test]
+    fn crs_to_proj4_introduces_no_shift_for_wgs84_based_crs() {
+        // The BoundCRS export must not invent a shift where none exists. These are WGS84-based,
+        // so any datum clause must be ALL ZEROS (PROJ states it explicitly for EPSG:3763, and
+        // omits it entirely for the `+datum=WGS84` ones) — both mean "no shift". Asserting the
+        // semantic property rather than string equality, because making a zero shift explicit is
+        // a correctness improvement, not a regression.
+        for crs in ["EPSG:4326", "EPSG:32629", "EPSG:3763", "EPSG:5041"] {
+            let s = crs_to_proj4(crs).unwrap_or_else(|| panic!("PROJ must resolve {crs}"));
+            if let Some(rest) = s.split("+towgs84=").nth(1) {
+                let params = rest.split_whitespace().next().unwrap_or("");
+                assert!(
+                    params
+                        .split(',')
+                        .all(|v| v.trim().parse::<f64>() == Ok(0.0)),
+                    "{crs} must not gain a non-zero datum shift: {s}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod axis_order_tests {
+    use super::crs_is_northing_first;
+
+    /// The bug this exists to prevent: EPSG:3301 (Estonia) is a PROJECTED CRS that declares
+    /// `AXIS["northing (X)",north]` FIRST. A hardcoded `crs == "EPSG:4326"` axis check misses it,
+    /// so QGIS sends a correctly-ordered northing-first BBOX, the server reads it transposed, and
+    /// every request renders blank behind a 200 OK.
+    #[test]
+    fn estonia_3301_is_northing_first() {
+        assert_eq!(crs_is_northing_first("EPSG:3301"), Some(true));
+    }
+
+    /// Geographic lat,lon — the case that WAS handled, kept so the general rule still covers it.
+    #[test]
+    fn wgs84_4326_is_latitude_first() {
+        assert_eq!(crs_is_northing_first("EPSG:4326"), Some(true));
+    }
+
+    /// The mutation guard. Without an easting-first case, an implementation that always returned
+    /// `Some(true)` would pass every other test here and transpose the whole world.
+    #[test]
+    fn web_mercator_and_swiss_lv95_are_easting_first() {
+        assert_eq!(crs_is_northing_first("EPSG:3857"), Some(false));
+        // Swiss LV95 is projected AND easting-first, so it proves "projected" alone does not
+        // decide this — the axis declaration does. It is also the CRS a live demo serves.
+        assert_eq!(crs_is_northing_first("EPSG:2056"), Some(false));
+        assert_eq!(crs_is_northing_first("EPSG:3763"), Some(false));
+    }
+
+    /// ⚠ THE REGRESSION GUARD. EPSG:3413 (NSIDC polar stereographic) declares
+    /// `AXIS["easting (X)",south]` — an EASTING whose DIRECTION is `south`, because both axes of
+    /// a polar projection point away from the pole. The first version of this function tested
+    /// direction only, called 3413 northing-first, and transposed the Arctic. The existing
+    /// GetFeatureInfo tests, which serve exactly this CRS, caught it.
+    #[test]
+    fn polar_crss_are_easting_first_despite_a_south_pointing_axis() {
+        assert_eq!(crs_is_northing_first("EPSG:3413"), Some(false));
+        assert_eq!(crs_is_northing_first("EPSG:3031"), Some(false)); // Antarctic, name is "(E)"
+    }
+
+    /// The decision table, without needing PROJ. Pins the PRECEDENCE: name beats abbreviation
+    /// beats direction. Reverse any two and a real CRS above breaks.
+    #[test]
+    fn classification_precedence_name_then_abbrev_then_direction() {
+        use super::classify_first_axis;
+        // Name wins even when the direction disagrees — the 3413 shape.
+        assert_eq!(
+            classify_first_axis("easting (x)", "x", "south"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_first_axis("northing (x)", "x", "north"),
+            Some(true)
+        );
+        // Bare name falls through to the abbreviation — the 2056 shape.
+        assert_eq!(classify_first_axis("(e)", "e", "east"), Some(false));
+        assert_eq!(classify_first_axis("(n)", "n", "north"), Some(true));
+        // Both unhelpful: direction is the last resort.
+        assert_eq!(classify_first_axis("", "", "north"), Some(true));
+        assert_eq!(classify_first_axis("", "", "east"), Some(false));
+        // Nothing usable at all.
+        assert_eq!(classify_first_axis("", "", ""), None);
+    }
+
+    /// Two more northing-first PROJECTED CRSs, so the fix is not quietly Estonia-specific.
+    #[test]
+    fn other_northing_first_projected_crss() {
+        assert_eq!(crs_is_northing_first("EPSG:2180"), Some(true)); // Poland CS92
+        assert_eq!(crs_is_northing_first("EPSG:3035"), Some(true)); // ETRS89-LAEA Europe
+    }
+
+    /// An unresolvable CRS must not panic and must not guess. `None` makes the caller keep the
+    /// bytes as they arrived, which is right for the easting-first majority.
+    #[test]
+    fn an_unknown_crs_is_none_not_a_panic() {
+        assert_eq!(crs_is_northing_first("EPSG:99999999"), None);
+        assert_eq!(crs_is_northing_first("not-a-crs"), None);
+        assert_eq!(crs_is_northing_first(""), None);
     }
 }

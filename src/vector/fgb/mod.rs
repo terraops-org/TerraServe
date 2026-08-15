@@ -58,6 +58,117 @@ fn max_query_features() -> usize {
         .unwrap_or(500_000)
 }
 
+/// Lazy R-tree index read granularity (bytes per cached chunk).
+const FGB_INDEX_CHUNK: u64 = 64 * 1024;
+
+/// How the R-tree index bytes are served to `rtree::query`: wholly resident in RAM (small indexes)
+/// or read in bounded, cached chunks (big indexes). Mirrors `cog::TileIndex::{Resident, Lazy}`.
+pub(crate) enum FgbIndex {
+    Resident(std::sync::Arc<Vec<u8>>),
+    Lazy(crate::cache::FgbIndexCache),
+}
+
+impl FgbIndex {
+    /// Pure, env-free decision (testable): Resident (reads the whole index now) when
+    /// `index_size <= threshold` and not `force_lazy`; else Lazy (reads nothing now).
+    fn decide_with<R: RangeSource>(
+        src: &R,
+        index_start: u64,
+        index_size: u64,
+        threshold: u64,
+        force_lazy: bool,
+    ) -> io::Result<FgbIndex> {
+        if index_size == 0 || force_lazy || index_size > threshold {
+            Ok(FgbIndex::Lazy(crate::cache::new_fgb_index_cache(
+                crate::cache::fgb_index_cache_bytes(),
+            )))
+        } else {
+            let bytes = src.read_range(index_start, index_size as usize)?;
+            if bytes.len() != index_size as usize {
+                return Err(invalid("fgb: short read on the R-tree index section"));
+            }
+            Ok(FgbIndex::Resident(std::sync::Arc::new(bytes)))
+        }
+    }
+
+    /// Env-driven decision. Threshold = `TERRASERVE_INDEX_LAZY_BYTES` (default 4 MiB, shared with
+    /// the COG index). `force_lazy` when `TERRASERVE_FGB_INDEX_RESIDENT` is `0`/`false`/`no`.
+    fn decide<R: RangeSource>(src: &R, index_start: u64, index_size: u64) -> io::Result<FgbIndex> {
+        let threshold = std::env::var("TERRASERVE_INDEX_LAZY_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(4 * 1024 * 1024);
+        let force_lazy = matches!(
+            std::env::var("TERRASERVE_FGB_INDEX_RESIDENT")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false") | Some("no")
+        );
+        Self::decide_with(src, index_start, index_size, threshold, force_lazy)
+    }
+
+    fn is_resident(&self) -> bool {
+        matches!(self, FgbIndex::Resident(_))
+    }
+}
+
+/// A `RangeSource` over just the index region, so `rtree::query` stays byte-range-generic and
+/// unmodified: node reads are served from the resident bytes or the Lazy chunk cache. A read
+/// outside `[index_start, index_start+index_size)` (never issued by `query`) falls through to
+/// `src` for safety.
+struct IndexView<'a, R: RangeSource> {
+    src: &'a R,
+    index: &'a FgbIndex,
+    index_start: u64,
+    index_size: u64,
+    /// Lazy chunk read granularity. Production always sets this to `FGB_INDEX_CHUNK`; tests may
+    /// override it to a tiny value to force multi-chunk reassembly on a small fixture index.
+    chunk: u64,
+}
+
+impl<'a, R: RangeSource> RangeSource for IndexView<'a, R> {
+    fn read_range(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let end_abs = offset.saturating_add(len as u64);
+        if offset < self.index_start || end_abs > self.index_start + self.index_size {
+            return self.src.read_range(offset, len);
+        }
+        match self.index {
+            FgbIndex::Resident(bytes) => {
+                let rel = (offset - self.index_start) as usize;
+                Ok(bytes[rel..rel + len].to_vec())
+            }
+            FgbIndex::Lazy(cache) => {
+                let start = offset - self.index_start; // within-index byte offset
+                let end = start + len as u64; // exclusive
+                let mut out = Vec::with_capacity(len);
+                let mut pos = start;
+                while pos < end {
+                    let chunk = pos / self.chunk;
+                    let chunk_start = chunk * self.chunk;
+                    let bytes = match cache.get(&chunk) {
+                        Some(b) => b,
+                        None => {
+                            let clen = self.chunk.min(self.index_size - chunk_start) as usize;
+                            let b = self.src.read_range(self.index_start + chunk_start, clen)?;
+                            if b.len() != clen {
+                                return Err(invalid("fgb: short read on an R-tree index chunk"));
+                            }
+                            let b = std::sync::Arc::new(b);
+                            cache.insert(chunk, b.clone());
+                            b
+                        }
+                    };
+                    let in_chunk = (pos - chunk_start) as usize;
+                    let take = (end.min(chunk_start + self.chunk) - pos) as usize;
+                    out.extend_from_slice(&bytes[in_chunk..in_chunk + take]);
+                    pos += take as u64;
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
 /// An opened `.fgb` file: the parsed `Header` plus the computed container layout. Reads
 /// through `R: RangeSource` — a local file or S3, whichever `R` is (the same seam COG uses).
 pub struct FgbSource<R: RangeSource> {
@@ -67,6 +178,7 @@ pub struct FgbSource<R: RangeSource> {
     index_size: u64,
     features_start: u64,
     crs: Option<String>,
+    index: FgbIndex,
 }
 
 impl<R: RangeSource> FgbSource<R> {
@@ -119,6 +231,8 @@ impl<R: RangeSource> FgbSource<R> {
 
         let crs = header.crs_code().map(|code| format!("EPSG:{code}"));
 
+        let index = FgbIndex::decide(&src, index_start, idx_size)?;
+
         Ok(FgbSource {
             src,
             header,
@@ -126,6 +240,7 @@ impl<R: RangeSource> FgbSource<R> {
             index_size: idx_size,
             features_start,
             crs,
+            index,
         })
     }
 
@@ -168,17 +283,30 @@ impl<R: RangeSource> FgbSource<R> {
         self.features_start
     }
 
+    /// True when the whole R-tree index is held in RAM (`FgbIndex::Resident`).
+    pub fn index_is_resident(&self) -> bool {
+        self.index.is_resident()
+    }
+
     /// Decode at most `cap` features overlapping `bbox` (see `WindowedSource::query`, which
     /// delegates here with `cap = max_query_features()`) — the cap bounds per-request memory:
     /// `rtree_query` returning a big `Vec<u64>` of offsets is cheap (8 bytes each), but
     /// `decode_at`-ing every hit into a full `Feature` is the expensive part, so the cap bounds
-    /// the decode loop, not the candidate list. Fail-open: warns once and returns the first
-    /// `cap` (R-tree/spatial order) if more than `cap` match, rather than allocating unbounded.
-    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Vec<Feature> {
-        let hits = match self.rtree_query(bbox) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
+    /// the decode loop, not the candidate list. The CAP is still fail-open: it warns once and
+    /// returns the first `cap` (R-tree/spatial order) rather than allocating unbounded.
+    ///
+    /// ⚠ READ errors are not fail-open, and used to be — silently, with no log at all. An index
+    /// traversal or feature fetch that failed returned an empty `Vec`, so a dropped connection or
+    /// a truncated HTTP range read against an `s3://…fgb` layer arrived as a blank map behind a
+    /// **200 OK**. That is the most dangerous shape this bug takes, because the remote reader is
+    /// exactly the one whose reads fail transiently.
+    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Result<Vec<Feature>, String>
+    where
+        R: Send + Sync,
+    {
+        let hits = self
+            .rtree_query(bbox)
+            .map_err(|e| format!("fgb: index query failed: {e}"))?;
         if hits.len() > cap {
             eprintln!(
                 "fgb: query matched {} features; capping decode at {} (raise TERRASERVE_FGB_MAX_QUERY_FEATURES)",
@@ -186,15 +314,30 @@ impl<R: RangeSource> FgbSource<R> {
                 cap
             );
         }
-        let mut out = Vec::with_capacity(hits.len().min(cap));
-        for rel_offset in hits.into_iter().take(cap) {
-            if let Ok(Some(feature)) = self.decode_at(rel_offset) {
-                if bbox_intersects(feature.bbox, bbox) {
-                    out.push(feature);
-                }
-            }
-        }
-        out
+        let capped: Vec<u64> = hits.into_iter().take(cap).collect();
+        // Fetch + decode in parallel on the dedicated I/O pool. rayon's ordered `collect` preserves
+        // the R-tree/Hilbert order of `capped`, so the kept features are in the same order the
+        // serial loop produced — render output is byte-identical.
+        //
+        // `Ok(None)` (an unmodeled geometry — MultiPoint / GeometryCollection) and a feature whose
+        // own bbox misses the window are both legitimate skips. An `Err` is not: it means a range
+        // read failed, and dropping that feature would quietly hand back a window with a hole in
+        // it. Collected as `Result` so rayon short-circuits and the first real read error wins.
+        let decoded: Result<Vec<Option<Feature>>, String> =
+            crate::render::io_pool().install(|| {
+                use rayon::prelude::*;
+                capped
+                    .par_iter()
+                    .map(|&rel_offset| match self.decode_at(rel_offset) {
+                        Ok(Some(f)) if bbox_intersects(f.bbox, bbox) => Ok(Some(f)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(format!(
+                            "fgb: feature read failed at offset {rel_offset}: {e}"
+                        )),
+                    })
+                    .collect()
+            });
+        Ok(decoded?.into_iter().flatten().collect())
     }
 
     /// Windowed bbox query (`[minx, miny, maxx, maxy]`): top-down packed-R-tree traversal via
@@ -207,8 +350,15 @@ impl<R: RangeSource> FgbSource<R> {
         if self.header.index_node_size() < 2 || self.header.features_count() == 0 {
             return self.bruteforce_query(bbox);
         }
+        let view = IndexView {
+            src: &self.src,
+            index: &self.index,
+            index_start: self.index_start,
+            index_size: self.index_size,
+            chunk: FGB_INDEX_CHUNK,
+        };
         rtree::query(
-            &self.src,
+            &view,
             self.index_start,
             self.header.features_count(),
             self.header.index_node_size(),
@@ -260,12 +410,16 @@ impl<R: RangeSource> FgbSource<R> {
         Ok(feature)
     }
 
-    /// Read one size-prefixed Feature FlatBuffer at `rel_offset` (relative to `features_start`):
-    /// the `u32 feat_size` prefix (consumed, not returned) plus the `feat_size`-byte body.
-    /// Returns `(body, 4 + feat_size)` — the second value is how far a sequential-scan cursor
-    /// (`decode_all`) should advance to reach the next record. Same read shape as
-    /// `bruteforce_query`'s loop (kept separate: that one also decodes+tests a bbox inline,
-    /// this one just fetches raw bytes for `feat::decode_feature`).
+    /// Read one size-prefixed Feature FlatBuffer at `rel_offset` (relative to `features_start`),
+    /// returning the WHOLE record — `u32 feat_size` prefix INCLUDED — plus `4 + feat_size`, how
+    /// far a sequential-scan cursor (`decode_all`) advances to reach the next record.
+    ///
+    /// The prefix is returned rather than consumed because `feat::verify_feature_buf` needs the
+    /// size-prefixed frame to check field alignment (see its doc). It used to be dropped here
+    /// and then RE-SYNTHESIZED per feature by allocating a new buffer and copying the whole body
+    /// into it behind 4 placeholder bytes. The second read below therefore starts at the record,
+    /// not the body: re-reading 4 bytes is far cheaper than an allocation plus a full copy of
+    /// every feature.
     fn read_feature_record(&self, rel_offset: u64) -> io::Result<(Vec<u8>, u64)> {
         let size_bytes = self.src.read_range(self.features_start + rel_offset, 4)?;
         if size_bytes.len() != 4 {
@@ -277,13 +431,14 @@ impl<R: RangeSource> FgbSource<R> {
         if size > MAX_FEATURE_BYTES {
             return Err(invalid("fgb: feature size prefix implausibly large"));
         }
-        let body = self
+        let record_len = 4 + size as usize;
+        let record = self
             .src
-            .read_range(self.features_start + rel_offset + 4, size as usize)?;
-        if body.len() != size as usize {
+            .read_range(self.features_start + rel_offset, record_len)?;
+        if record.len() != record_len {
             return Err(invalid("fgb: short read on a Feature FlatBuffer"));
         }
-        Ok((body, 4 + size))
+        Ok((record, 4 + size))
     }
 
     /// Sequential scan of every feature (decoding just enough of each Feature FlatBuffer to
@@ -305,13 +460,14 @@ impl<R: RangeSource> FgbSource<R> {
             if size > MAX_FEATURE_BYTES {
                 return Err(invalid("fgb: feature size prefix implausibly large"));
             }
-            let body = self
+            let record_len = 4 + size as usize;
+            let record = self
                 .src
-                .read_range(self.features_start + rel_offset + 4, size as usize)?;
-            if body.len() != size as usize {
+                .read_range(self.features_start + rel_offset, record_len)?;
+            if record.len() != record_len {
                 return Err(invalid("fgb: short read on a Feature FlatBuffer"));
             }
-            if let Some(fb) = feature_bbox(&body) {
+            if let Some(fb) = feature_bbox(&record) {
                 if bbox_intersects(fb, bbox) {
                     hits.push(rel_offset);
                 }
@@ -339,12 +495,12 @@ impl<R: RangeSource + Send + Sync> crate::vector::source::WindowedSource for Fgb
     /// `bbox` — the R-tree only proves the *node* bbox overlaps, not the feature's actual
     /// geometry (a node packs several features under one conservative bbox). A `decode_at`
     /// that returns `Ok(None)` (unmodeled geometry — MultiPoint/GeometryCollection) is skipped,
-    /// not an error. On an I/O error from `rtree_query` itself, fails open (empty result) —
-    /// `WindowedSource::query` has no error channel; a request-time read failure should not
-    /// panic the server. Delegates to `query_capped` with `max_query_features()` — a wide/
-    /// low-zoom query against a dense `.fgb` decodes at most that many features, bounding
-    /// per-request memory (see `query_capped`'s doc comment).
-    fn query(&self, bbox: [f64; 4]) -> Vec<Feature> {
+    /// not an error. An I/O error IS one and is propagated — it used to fail open with an empty
+    /// result because `WindowedSource::query` had no error channel; it has one now, and no caller
+    /// panics on it (they answer 500 / an OWS exception). Delegates to `query_capped` with
+    /// `max_query_features()` — a wide/low-zoom query against a dense `.fgb` decodes at most that
+    /// many features, bounding per-request memory (see `query_capped`'s doc comment).
+    fn query(&self, bbox: [f64; 4]) -> Result<Vec<Feature>, String> {
         self.query_capped(bbox, max_query_features())
     }
 
@@ -428,16 +584,20 @@ fn validate_root_table(buf: &[u8]) -> Option<usize> {
 /// 18) is transcribed from the schema's field order (`ends, xy, z, m, t, tm, type, parts`) but
 /// **not** exercised by any fixture here — `tiny.fgb` has no Multi*/GeometryCollection
 /// features. Flagged for Task 6 (the PRT.fgb / real-world MultiPolygon run) to confirm.
-fn feature_bbox(body: &[u8]) -> Option<[f64; 4]> {
-    let root_loc = validate_root_table(body)?;
+/// `record` is the WHOLE on-disk record, `u32 feat_size` prefix INCLUDED — the same convention
+/// `feat::decode_feature` takes, because `verify_feature_buf` needs that frame to check field
+/// alignment.
+fn feature_bbox(record: &[u8]) -> Option<[f64; 4]> {
     // Task 7: `accumulate_geometry_bbox` below recurses into `Geometry.parts` unboundedly and,
     // like every other accessor here, reads through unchecked `flatbuffers::Table::get` calls
     // -- so it needs the exact same full structural verification (bounds AND the verifier's
     // `max_depth` recursion cap) `feat::decode_feature` gates on, or a crafted deeply-nested
     // `parts` chain / out-of-bounds field offset could stack-overflow or OOB-read here instead.
-    if !feat::verify_feature_buf(body) {
+    if record.len() < 4 || !feat::verify_feature_buf(record) {
         return None;
     }
+    let body = &record[4..];
+    let root_loc = validate_root_table(body)?;
     let feature = unsafe { Table::new(body, root_loc) };
     let geometry = unsafe { feature.get::<ForwardsUOffset<Table<'_>>>(4, None) }?;
     let mut acc: Option<[f64; 4]> = None;
@@ -518,6 +678,122 @@ mod tests {
         // and that offset lands exactly on 3 size-prefixed Feature FlatBuffers ending at EOF.
         assert_eq!(fgb.index_size(), 160);
         assert_eq!(fgb.features_start(), 808);
+    }
+
+    #[test]
+    fn lazy_index_reads_match_resident() {
+        // The R-tree query over a Lazy index must return exactly the hits a Resident index does.
+        let bbox = [0.0, 0.0, 5.0, 6.0];
+        let path = "fixtures/fgb/tiny.fgb";
+
+        let resident =
+            FgbSource::open(crate::cog::LocalFileRangeSource::open(path).unwrap()).unwrap();
+        assert!(
+            resident.index_is_resident(),
+            "tiny.fgb index must be Resident by default"
+        );
+
+        // Force Lazy without touching the process env: reopen and overwrite the index mode.
+        let mut lazy =
+            FgbSource::open(crate::cog::LocalFileRangeSource::open(path).unwrap()).unwrap();
+        lazy.index = FgbIndex::Lazy(crate::cache::new_fgb_index_cache(
+            crate::cache::fgb_index_cache_bytes(),
+        ));
+        assert!(!lazy.index_is_resident());
+
+        assert_eq!(
+            resident.rtree_query(bbox).unwrap(),
+            lazy.rtree_query(bbox).unwrap(),
+            "Lazy and Resident R-tree queries must return identical hits"
+        );
+    }
+
+    #[test]
+    fn lazy_index_reads_reassemble_across_chunk_boundaries() {
+        // `tiny.fgb`'s whole 160-byte index fits inside ONE production 64 KiB `FGB_INDEX_CHUNK`,
+        // so no committed test previously drove `IndexView::read_range`'s Lazy multi-chunk loop
+        // (cache miss -> fetch -> insert -> slice -> advance `pos`, repeated) at all. `IndexView`
+        // now takes an overridable `chunk` field so a test can force that path on this small
+        // fixture without touching the production constant.
+        //
+        // Chunk size 48 is deliberately NOT a divisor of 160: chunks are [0,48) [48,96) [96,144)
+        // [144,160) -- three full 48-byte chunks plus a genuinely partial 16-byte last chunk, so
+        // the cases below can exercise a straddle onto that partial chunk, not just full/full.
+        let path = "fixtures/fgb/tiny.fgb";
+        let s = FgbSource::open(crate::cog::LocalFileRangeSource::open(path).unwrap()).unwrap();
+        let (index_start, index_size) = (s.index_start, s.index_size);
+        assert_eq!(
+            index_size, 160,
+            "the hand-picked chunk boundaries below assume tiny.fgb's known 160-byte index"
+        );
+
+        let view = IndexView {
+            src: &s.src,
+            index: &FgbIndex::Lazy(crate::cache::new_fgb_index_cache(
+                crate::cache::fgb_index_cache_bytes(),
+            )),
+            index_start,
+            index_size,
+            chunk: 48,
+        };
+
+        // (offset relative to index_start, len): a read fully inside chunk0; two 40-byte node
+        // reads that straddle the chunk0/chunk1 and chunk1/chunk2 boundaries; a read straddling
+        // the last full chunk and the partial last chunk; a read fully inside the partial last
+        // chunk; and the whole index in one call, crossing all four chunks.
+        let cases: &[(u64, usize)] = &[(5, 10), (30, 40), (70, 40), (130, 30), (150, 10), (0, 160)];
+        for &(rel_off, len) in cases {
+            let off = index_start + rel_off;
+            let via_view = view.read_range(off, len).unwrap();
+            let via_raw = s.src.read_range(off, len).unwrap();
+            assert_eq!(
+                via_view, via_raw,
+                "Lazy multi-chunk reassembly mismatch at relative offset {rel_off}, len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_with_picks_resident_below_threshold_and_lazy_above_or_forced() {
+        let src = crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap();
+        let s = FgbSource::open(
+            crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap(),
+        )
+        .unwrap();
+        let (start, size) = (s.index_start, s.index_size);
+        // Below threshold, not forced -> Resident.
+        assert!(FgbIndex::decide_with(&src, start, size, size + 1, false)
+            .unwrap()
+            .is_resident());
+        // Above threshold -> Lazy.
+        assert!(!FgbIndex::decide_with(&src, start, size, size - 1, false)
+            .unwrap()
+            .is_resident());
+        // Forced -> Lazy even below threshold.
+        assert!(!FgbIndex::decide_with(&src, start, size, size + 1, true)
+            .unwrap()
+            .is_resident());
+    }
+
+    #[test]
+    fn opens_local_fgb_through_anysource_identically() {
+        // Change 1: the .fgb serve path opens via s3::AnySource (local-or-s3). A LOCAL path through
+        // AnySource must behave exactly like LocalFileRangeSource — same hits for the same bbox.
+        let bbox = [0.0, 0.0, 5.0, 6.0];
+        let via_local = FgbSource::open(
+            crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap(),
+        )
+        .unwrap();
+        let via_any = FgbSource::open(
+            crate::s3::AnySource::open("fixtures/fgb/tiny.fgb", &crate::s3::S3Config::from_env())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            via_local.rtree_query(bbox).unwrap(),
+            via_any.rtree_query(bbox).unwrap(),
+            "AnySource(local) must return the same R-tree hits as LocalFileRangeSource"
+        );
     }
 
     #[test]
@@ -716,18 +992,59 @@ mod tests {
         let fgb = FgbSource::open(src).unwrap();
         let bbox = [-1.0, -1.0, 6.0, 7.0]; // covers all 3 tiny.fgb features
 
-        let capped = fgb.query_capped(bbox, 2);
+        let capped = fgb.query_capped(bbox, 2).expect("read the fixture");
         assert!(
             capped.len() <= 2,
             "cap=2 must bound the decode to at most 2 features, got {}",
             capped.len()
         );
 
-        let uncapped = fgb.query_capped(bbox, 1000);
+        let uncapped = fgb.query_capped(bbox, 1000).expect("read the fixture");
         assert_eq!(
             uncapped.len(),
             3,
             "a generous cap must not truncate below the true match count"
+        );
+    }
+
+    /// Task 3: `query_capped` now fetches+decodes the capped R-tree hits in parallel on
+    /// `render::io_pool()` instead of a serial `for` loop. Rayon's ordered `collect` must
+    /// preserve the R-tree/Hilbert order of the capped candidate list, so the kept features
+    /// come back in exactly the order the old serial loop produced — this is the regression
+    /// guard the parallel rewrite must keep green (render output, incl. MVT goldens, depends
+    /// on that order being byte-identical).
+    #[test]
+    fn query_capped_parallel_matches_serial_order() {
+        let bbox = [0.0, 0.0, 5.0, 6.0];
+        let s = FgbSource::open(
+            crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap(),
+        )
+        .unwrap();
+
+        // Serial reference: same predicate the loop used before parallelization.
+        let hits = s.rtree_query(bbox).unwrap();
+        let mut expected: Vec<u64> = Vec::new();
+        for rel in hits.into_iter().take(1000) {
+            if let Ok(Some(f)) = s.decode_at(rel) {
+                if bbox_intersects(f.bbox, bbox) {
+                    expected.push(f.fid);
+                }
+            }
+        }
+
+        let got: Vec<u64> = s
+            .query_capped(bbox, 1000)
+            .expect("read the fixture")
+            .into_iter()
+            .map(|f| f.fid)
+            .collect();
+        assert_eq!(
+            got, expected,
+            "parallel query_capped must match serial fids in the same order"
+        );
+        assert!(
+            !got.is_empty(),
+            "tiny.fgb must yield features for this bbox"
         );
     }
 
@@ -736,7 +1053,8 @@ mod tests {
         let src = crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap();
         let fgb = FgbSource::open(src).unwrap();
         // a bbox around point b (5,6) returns exactly 1 feature with name="b"
-        let got = crate::vector::source::WindowedSource::query(&fgb, [4.5, 5.5, 5.5, 6.5]);
+        let got = crate::vector::source::WindowedSource::query(&fgb, [4.5, 5.5, 5.5, 6.5])
+            .expect("read the fixture");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].props.get_str("name"), Some("b"));
     }
@@ -822,7 +1140,8 @@ mod tests {
         let fgb = FgbSource::open(counting).unwrap();
         assert_eq!(fgb.features_count(), 6_097_126);
 
-        let feats = crate::vector::source::WindowedSource::query(&fgb, bbox);
+        let feats =
+            crate::vector::source::WindowedSource::query(&fgb, bbox).expect("read the fixture");
         assert!(!feats.is_empty());
 
         // Every returned feature's own decoded bbox must actually overlap the query bbox (the
@@ -900,7 +1219,8 @@ mod tests {
         assert_eq!(fgb.crs(), Some("EPSG:3763"));
 
         let bbox = [88839.18, -179394.11, 96883.47, -173740.15];
-        let feats = crate::vector::source::WindowedSource::query(&fgb, bbox);
+        let feats =
+            crate::vector::source::WindowedSource::query(&fgb, bbox).expect("read the fixture");
         assert!(
             !feats.is_empty(),
             "no features in feature 699772's own bbox"

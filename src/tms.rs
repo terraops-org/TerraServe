@@ -214,6 +214,240 @@ impl TileMatrixSet {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct OgcTms {
+    id: String,
+    crs: String,
+    /// OGC TMS 2.0 `orderedAxes`: the axis order the document's OWN coordinates are written in.
+    /// Optional; absent means "the CRS's declared order applies" (see `origin_is_northing_first`).
+    #[serde(rename = "orderedAxes")]
+    ordered_axes: Option<Vec<String>>,
+    #[serde(rename = "tileMatrices")]
+    tile_matrices: Vec<OgcTileMatrix>,
+}
+
+#[derive(serde::Deserialize)]
+struct OgcTileMatrix {
+    #[serde(rename = "cellSize")]
+    cell_size: Option<f64>,
+    #[serde(rename = "scaleDenominator")]
+    scale_denominator: Option<f64>,
+    #[serde(rename = "pointOfOrigin")]
+    point_of_origin: [f64; 2],
+    #[serde(rename = "tileWidth")]
+    tile_width: u32,
+    #[serde(rename = "tileHeight")]
+    tile_height: u32,
+    #[serde(rename = "matrixWidth")]
+    matrix_width: u32,
+    #[serde(rename = "matrixHeight")]
+    matrix_height: u32,
+}
+
+/// Normalize an OGC CRS identifier (URI/URN/shortcode) to what libproj + the rest of the
+/// engine use. A bare proj string / WKT passes through untouched.
+fn normalize_crs(crs: &str) -> String {
+    // http://www.opengis.net/def/crs/EPSG/0/2056  ->  EPSG:2056
+    if let Some(rest) = crs.rsplit("/def/crs/").next().filter(|r| *r != crs) {
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() == 3 {
+            let (auth, code) = (parts[0].to_uppercase(), parts[2]);
+            if auth == "OGC" && code.eq_ignore_ascii_case("CRS84") {
+                return "CRS:84".to_string();
+            }
+            return format!("{auth}:{code}");
+        }
+    }
+    crs.to_string()
+}
+
+/// Is this document's `pointOfOrigin` written NORTHING-FIRST?
+///
+/// ⚠ This is the difference between a working grid and 3.5 MILLION METRES of error, which renders
+/// as empty tiles behind a 200 — the same failure the WMS 1.3.0 axis flip (`deb77cb`) and the Swiss
+/// `+towgs84` drop produced. It went unnoticed here because `swissLV95` (EPSG:2056) is
+/// easting-first, so the only custom grid ever shipped happened to be the case where the naive
+/// `[0]`=x, `[1]`=y reading is correct.
+///
+/// Precedence, and it matters:
+///  1. **The document's own `orderedAxes`**, when present. A TMS document declares the order its
+///     numbers are in, and that declaration is authoritative for reading them — even if it
+///     disagrees with the CRS registry, because the numbers are what they are.
+///  2. Otherwise **the CRS's declared order**, via `reproj::crs_is_northing_first` (the same PROJ
+///     query the WMS 1.3.0 path uses — one definition, so the two can never drift).
+///  3. Otherwise easting-first, matching that helper's own documented fallback: it is right for the
+///     easting-first majority, and it is what every grid parsed before this fix assumed.
+///
+/// The real case: OGC's registered `EuropeanETRS89_LAEAQuad` (EPSG:3035) declares
+/// `orderedAxes: ["Y","X"]` and writes `pointOfOrigin: [5500000, 2000000]` — northing 5 500 000,
+/// easting 2 000 000. Read naively that becomes x=5 500 000, y=2 000 000: off the grid entirely.
+fn origin_is_northing_first(ordered_axes: Option<&Vec<String>>, crs: &str) -> bool {
+    let from_crs = crate::reproj::crs_is_northing_first(crs);
+    if let Some(axes) = ordered_axes {
+        if let Some(first) = axes.first() {
+            let a = first.trim().to_ascii_lowercase();
+            // OGC documents spell it "Y" / "N" / "Lat" depending on the CRS kind.
+            let declared = matches!(
+                a.as_str(),
+                "y" | "n" | "lat" | "north" | "northing" | "latitude"
+            );
+            // ⚠ WARN when the document contradicts the CRS registry, because one spelling really is
+            // ambiguous and silently guessing wrong costs millions of metres. On EPSG:3301
+            // (Estonia), 2180 (Poland) and the German Gauss-Krüger zones the axis literally NAMED
+            // "X" is the NORTHING — so a hand-written `["X","Y"]` there means northing-first, the
+            // opposite of what it means on EPSG:3035 where X genuinely is the easting.
+            //
+            // We still honour the declaration (the document owns its own numbers, and the
+            // registered LAEA document's `["X","Y"]` override case is legitimate), but a mismatch
+            // is far more often a typo than an intention, and it renders as an empty tile behind a
+            // 200 rather than an error. Say so once, at load, where an operator will see it.
+            if from_crs == Some(!declared) {
+                eprintln!(
+                    "WARNING: tile grid for {crs}: document declares orderedAxes[0]={first:?} \
+                     ({}), but {crs} declares {} first. Honouring the document. If tiles come back \
+                     blank behind a 200, this is the first thing to check — on some CRSs the axis \
+                     named \"X\" IS the northing.",
+                    if declared {
+                        "northing-first"
+                    } else {
+                        "easting-first"
+                    },
+                    if from_crs == Some(true) {
+                        "northing"
+                    } else {
+                        "easting"
+                    },
+                );
+            }
+            return declared;
+        }
+    }
+    from_crs.unwrap_or(false)
+}
+
+/// Parse an OGC TileMatrixSet 2.0 JSON document into a `TileMatrixSet`.
+pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
+    let doc: OgcTms = serde_json::from_str(json).map_err(|e| format!("OGC TMS JSON: {e}"))?;
+    if doc.tile_matrices.is_empty() {
+        return Err("OGC TMS JSON: tileMatrices is empty".into());
+    }
+    let crs = normalize_crs(&doc.crs);
+    let mpu = meters_per_unit(&crs);
+    // OGC origin is shared across levels (single pointOfOrigin per matrix; take level 0's).
+    // The pair is (x, y) ONLY for an easting-first CRS — see `origin_is_northing_first`.
+    let raw = doc.tile_matrices[0].point_of_origin;
+    let origin = if origin_is_northing_first(doc.ordered_axes.as_ref(), &crs) {
+        [raw[1], raw[0]]
+    } else {
+        raw
+    };
+    let tile_w = doc.tile_matrices[0].tile_width;
+    let tile_h = doc.tile_matrices[0].tile_height;
+    let levels = doc
+        .tile_matrices
+        .iter()
+        .enumerate()
+        .map(|(z, m)| {
+            // resolution (CRS units / px): cellSize if present, else scaleDenominator * 0.28mm / mpu.
+            let resolution = m
+                .cell_size
+                .or_else(|| m.scale_denominator.map(|sd| sd * 0.00028 / mpu))
+                .ok_or("OGC TMS JSON: tileMatrix needs cellSize or scaleDenominator")?;
+            Ok(TmLevel {
+                z: z as u32,
+                resolution,
+                matrix_w: m.matrix_width.max(1),
+                matrix_h: m.matrix_height.max(1),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(TileMatrixSet {
+        id: doc.id,
+        crs,
+        origin_x: origin[0],
+        origin_y: origin[1],
+        tile_w,
+        tile_h,
+        levels,
+    })
+}
+
+/// Inverse of `normalize_crs`'s URI shortcut: `EPSG:<n>` → the OGC CRS URI form. Everything else
+/// (a `CRS:84` shortcode, a proj string, WKT) passes through untouched — `from_ogc_json`'s
+/// `normalize_crs` only rewrites the `/def/crs/` URI shape, so a non-EPSG string already round-trips.
+fn to_ogc_crs_uri(crs: &str) -> String {
+    let trimmed = crs.trim();
+    if let Some(code) = trimmed
+        .strip_prefix("EPSG:")
+        .or_else(|| trimmed.strip_prefix("epsg:"))
+    {
+        if !code.is_empty() && code.chars().all(|c| c.is_ascii_digit()) {
+            return format!("http://www.opengis.net/def/crs/EPSG/0/{code}");
+        }
+    }
+    trimmed.to_string()
+}
+
+/// `to_ogc_json`'s body, as a `serde_json::Value` — `pub(crate)` so `tms_http`'s `/tileMatrixSets/{id}`
+/// handler can inject the non-standard `"proj4"` convenience field without a stringify/reparse
+/// round-trip. Mirrors `from_ogc_json`'s field mapping in reverse: `id`=z (as a string, per the OGC
+/// schema), `cellSize`=resolution, `pointOfOrigin`=`[origin_x, origin_y]` (the ORIGIN IS SHARED across
+/// levels in this model — `from_ogc_json` takes it from level 0 only, so emitting it on every level
+/// is what makes the round-trip exact), `tileWidth`/`tileHeight`/`matrixWidth`/`matrixHeight` verbatim.
+///
+/// ⚠ ALWAYS EMITS `[x, y]`, and DECLARES `orderedAxes: ["X","Y"]` to say so. This is deliberate and
+/// it is not the same choice as the parse side above.
+///
+/// A TMS 2.0 document declares the order of its own coordinates, so `["X","Y"]` + `[x, y]` is fully
+/// spec-legal for ANY CRS — including a northing-first one — and it round-trips exactly through
+/// `from_ogc_json`, which honours the declaration. What it also does is keep every NAIVE client
+/// working: a reader that assumes `[x, y]` and ignores `orderedAxes` still gets the right grid.
+///
+/// That is not hypothetical. Mirroring the official northing-first byte order here (the first cut
+/// of this change) broke two live things at once: `src/xray.html` reads `pointOfOrigin[0]` as x and
+/// never looks at `orderedAxes`, and `/tileMatrixSets/WorldCRS84Quad` flipped from `[-180, 90]` to
+/// `[90, -180]` because EPSG:4326 is latitude-first — a regression on already-shipping demos, for a
+/// fidelity nobody had asked for. Byte-identity with the OGC registry document is a nice property;
+/// not breaking every client that reads us is a requirement.
+///
+/// (`xray.html` was ALSO taught to honour `orderedAxes`, so it can consume a third-party document
+/// that makes the other choice. Belt and braces: this side stays maximally compatible regardless.)
+pub(crate) fn to_ogc_value(tms: &TileMatrixSet) -> serde_json::Value {
+    let origin = [tms.origin_x, tms.origin_y];
+    let tile_matrices: Vec<serde_json::Value> = tms
+        .levels
+        .iter()
+        .map(|l| {
+            serde_json::json!({
+                "id": l.z.to_string(),
+                "cellSize": l.resolution,
+                "pointOfOrigin": origin,
+                "tileWidth": tms.tile_w,
+                "tileHeight": tms.tile_h,
+                "matrixWidth": l.matrix_w,
+                "matrixHeight": l.matrix_h,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": tms.id,
+        "crs": to_ogc_crs_uri(&tms.crs),
+        // See the doc comment: we always write x,y and say so, rather than mirroring the CRS's
+        // declared order. A reader that honours this gets it right; a reader that ignores it and
+        // assumes x,y ALSO gets it right, which is the whole point.
+        "orderedAxes": ["X", "Y"],
+        "tileMatrices": tile_matrices,
+    })
+}
+
+/// Serialize a `TileMatrixSet` to OGC TileMatrixSet 2.0 JSON — the inverse of `from_ogc_json`
+/// (round-trips id/crs/origin/tile-size/levels; see the `tms.rs` test module). Served at
+/// `GET /tileMatrixSets/{id}` (`tms_http::tile_matrix_set_doc`) so a client (the X-ray viewer, Task 3)
+/// can read any published grid's CRS + tile geometry without hardcoding it.
+pub fn to_ogc_json(tms: &TileMatrixSet) -> String {
+    serde_json::to_string(&to_ogc_value(tms)).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Resolve a well-known preset id → a `TileMatrixSet`. An id may carry an explicit `_{tile_px}`
 /// size suffix (`WebMercatorQuad_256`) which overrides the `tile_px` argument (R3: lets one config
 /// entry pin its size, and lets a URL request the un-suffixed base name). Returns `None` for an
@@ -366,5 +600,230 @@ fn build_quad(
         tile_w: tile_px,
         tile_h: tile_px,
         levels,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn from_ogc_json_cellsize_and_scaledenominator() {
+        // Minimal OGC TMS 2.0: two levels, one via cellSize, one via scaleDenominator.
+        let json = r#"{
+          "id": "TestQuad",
+          "crs": "http://www.opengis.net/def/crs/EPSG/0/2056",
+          "tileMatrices": [
+            { "id": "0", "cellSize": 4000.0, "pointOfOrigin": [2420000.0, 1350000.0],
+              "tileWidth": 256, "tileHeight": 256, "matrixWidth": 1, "matrixHeight": 1 },
+            { "id": "1", "scaleDenominator": 7142857.142857143, "pointOfOrigin": [2420000.0, 1350000.0],
+              "tileWidth": 256, "tileHeight": 256, "matrixWidth": 2, "matrixHeight": 1 }
+          ]
+        }"#;
+        let tms = super::from_ogc_json(json).expect("parse");
+        assert_eq!(tms.id, "TestQuad");
+        assert_eq!(tms.crs, "EPSG:2056"); // OGC CRS URI normalized to shortcode
+        assert_eq!(tms.tile_w, 256);
+        assert_eq!(tms.levels.len(), 2);
+        assert_eq!(tms.levels[0].z, 0);
+        assert!((tms.levels[0].resolution - 4000.0).abs() < 1e-6); // cellSize path
+                                                                   // scaleDenominator 7142857.14 * 0.00028 / meters_per_unit(EPSG:2056=1.0) = 2000.0
+        assert!((tms.levels[1].resolution - 2000.0).abs() < 1e-3);
+        assert_eq!(tms.origin_x, 2420000.0);
+        assert_eq!(tms.origin_y, 1350000.0);
+    }
+
+    #[test]
+    fn from_ogc_json_rejects_missing_tilematrices() {
+        let json = r#"{ "id": "X", "crs": "EPSG:2056", "tileMatrices": [] }"#;
+        assert!(super::from_ogc_json(json).is_err());
+    }
+
+    /// Task 2, Step 1: `to_ogc_json` is the INVERSE of `from_ogc_json` — the `WorldCRS84Quad` preset
+    /// serialized then parsed back yields an identical `TileMatrixSet` (id/crs/origin/tile/levels).
+    #[test]
+    fn to_ogc_json_round_trips_world_crs84_quad() {
+        let original = super::TileMatrixSet::world_crs84_quad(256);
+        let json = super::to_ogc_json(&original);
+        let round = super::from_ogc_json(&json).expect("to_ogc_json output must parse");
+
+        assert_eq!(round.id, original.id);
+        assert_eq!(round.crs, original.crs); // "EPSG:4326" -> OGC URI -> normalized back to "EPSG:4326"
+        assert_eq!(round.origin_x, original.origin_x);
+        assert_eq!(round.origin_y, original.origin_y);
+        assert_eq!(round.tile_w, original.tile_w);
+        assert_eq!(round.tile_h, original.tile_h);
+        assert_eq!(round.levels.len(), original.levels.len());
+        for (a, b) in original.levels.iter().zip(round.levels.iter()) {
+            assert_eq!(a.z, b.z);
+            assert!(
+                (a.resolution - b.resolution).abs() < 1e-9,
+                "resolution drift at z={}: {} vs {}",
+                a.z,
+                a.resolution,
+                b.resolution
+            );
+            assert_eq!(a.matrix_w, b.matrix_w);
+            assert_eq!(a.matrix_h, b.matrix_h);
+        }
+    }
+
+    /// The OGC `crs` field is the EPSG URI form when the id is `EPSG:<n>` (mirrors
+    /// `normalize_crs`'s inverse mapping) — verified directly on the JSON text, not just via the
+    /// round-trip (which would also pass if both sides silently agreed on a non-standard form).
+    #[test]
+    fn to_ogc_json_emits_the_epsg_uri_form_of_crs() {
+        let tms = super::TileMatrixSet::web_mercator_quad(256);
+        let json = super::to_ogc_json(&tms);
+        assert!(
+            json.contains("http://www.opengis.net/def/crs/EPSG/0/3857"),
+            "expected the OGC CRS URI in: {json}"
+        );
+    }
+
+    /// Task 5, Step 1: the Swiss LV95 fixture (`fixtures/grids/swissLV95.json`, the swisstopo
+    /// 27-level resolution ladder over the official CH extent) round-trips through `from_ogc_json`.
+    #[test]
+    fn from_ogc_json_round_trips_the_swiss_lv95_fixture() {
+        let json = std::fs::read_to_string("fixtures/grids/swissLV95.json")
+            .expect("fixture file readable");
+        let tms = super::from_ogc_json(&json).expect("swissLV95.json parses");
+        assert_eq!(tms.id, "swissLV95");
+        assert_eq!(tms.crs, "EPSG:2056"); // OGC CRS URI normalized to shortcode
+        assert_eq!(tms.origin_x, 2420000.0);
+        assert_eq!(tms.origin_y, 1350000.0);
+        assert_eq!(tms.tile_w, 256);
+        assert_eq!(tms.tile_h, 256);
+        assert_eq!(tms.levels.len(), 27);
+        assert!((tms.levels[0].resolution - 4000.0).abs() < 1e-9);
+        assert_eq!(tms.levels[0].matrix_w, 1);
+        assert_eq!(tms.levels[0].matrix_h, 1);
+        assert!((tms.levels[26].resolution - 0.5).abs() < 1e-9);
+        assert_eq!(tms.levels[26].matrix_w, 3750);
+        assert_eq!(tms.levels[26].matrix_h, 2500);
+    }
+}
+
+#[cfg(test)]
+mod axis_order_tests {
+    use super::*;
+
+    /// The real OGC-registered document, trimmed to two levels. Note `orderedAxes: ["Y","X"]` and
+    /// `pointOfOrigin: [5500000, 2000000]` — northing FIRST, which is what EPSG:3035 declares.
+    const LAEA_OFFICIAL: &str = r#"{
+      "id": "EuropeanETRS89_LAEAQuad",
+      "crs": "http://www.opengis.net/def/crs/EPSG/0/3035",
+      "orderedAxes": ["Y", "X"],
+      "tileMatrices": [
+        { "id": "0", "scaleDenominator": 62779017.857142866, "cellSize": 17578.125,
+          "pointOfOrigin": [5500000.0, 2000000.0], "tileWidth": 256, "tileHeight": 256,
+          "matrixWidth": 1, "matrixHeight": 1 },
+        { "id": "1", "scaleDenominator": 31389508.928571433, "cellSize": 8789.0625,
+          "pointOfOrigin": [5500000.0, 2000000.0], "tileWidth": 256, "tileHeight": 256,
+          "matrixWidth": 2, "matrixHeight": 2 }
+      ]
+    }"#;
+
+    /// ⚠ THE BUG THIS FIXES. Read naively as `[x, y]` the origin becomes x=5 500 000,
+    /// y=2 000 000 — 3.5 MILLION METRES off, which serves empty tiles behind a 200 rather than
+    /// failing loudly. `swissLV95` never caught it because EPSG:2056 is easting-first.
+    #[test]
+    fn official_laea_grid_reads_its_northing_first_origin_correctly() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse the OGC document");
+        assert_eq!(g.crs, "EPSG:3035");
+        assert_eq!(g.origin_x, 2_000_000.0, "easting is the SECOND number here");
+        assert_eq!(g.origin_y, 5_500_000.0, "northing is the FIRST number here");
+    }
+
+    /// The origin is the top-left, so the grid must cover a 4 500 km square reaching DOWN and
+    /// RIGHT from it — and Europe (and our EU5 extent) must land inside. This is the assertion
+    /// that would fail on a swapped origin even if someone "fixed" the field order by accident.
+    #[test]
+    fn official_laea_grid_covers_europe() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse");
+        let b = g.tile_bounds(0, 0, 0).expect("z0 tile exists");
+        assert_eq!(b, [2_000_000.0, 1_000_000.0, 6_500_000.0, 5_500_000.0]);
+        // EU5's own extent in EPSG:3035, from ST_Extent at import time.
+        for (x, y) in [(3_155_046.0, 2_026_265.0), (4_673_364.0, 3_550_864.0)] {
+            assert!(
+                x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3],
+                "EU5 corner ({x}, {y}) must fall inside the grid"
+            );
+        }
+    }
+
+    /// An easting-first CRS must be untouched: this is the swissLV95 shape, and every grid parsed
+    /// before this fix assumed it.
+    #[test]
+    fn an_easting_first_grid_is_unchanged() {
+        let doc = r#"{
+          "id": "swissLV95", "crs": "http://www.opengis.net/def/crs/EPSG/0/2056",
+          "tileMatrices": [{ "id": "0", "cellSize": 4000.0,
+            "pointOfOrigin": [2420000.0, 1350000.0], "tileWidth": 256, "tileHeight": 256,
+            "matrixWidth": 1, "matrixHeight": 1 }]
+        }"#;
+        let g = from_ogc_json(doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (2_420_000.0, 1_350_000.0));
+    }
+
+    /// `orderedAxes` absent → fall back to the CRS's declared order, which is what the OGC spec
+    /// says and what `reproj::crs_is_northing_first` answers. Same document as above minus the
+    /// declaration; EPSG:3035 is northing-first, so the result must be identical.
+    #[test]
+    fn a_missing_ordered_axes_falls_back_to_the_crs_declaration() {
+        let doc = LAEA_OFFICIAL.replace("\"orderedAxes\": [\"Y\", \"X\"],", "");
+        // Without this, a reformat of the fixture makes the replace a no-op and this test quietly
+        // degenerates into a copy of `official_laea_grid_reads_...` — still green, testing nothing.
+        assert!(
+            !doc.contains("orderedAxes"),
+            "the fixture changed shape; this test is no longer removing the declaration"
+        );
+        let g = from_ogc_json(&doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (2_000_000.0, 5_500_000.0));
+    }
+
+    /// The document's own declaration WINS over the CRS registry: the numbers are what they are.
+    #[test]
+    fn an_explicit_ordered_axes_overrides_the_crs_declaration() {
+        let doc = LAEA_OFFICIAL.replace("[\"Y\", \"X\"]", "[\"X\", \"Y\"]");
+        let g = from_ogc_json(&doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (5_500_000.0, 2_000_000.0));
+    }
+
+    /// The published document must stay readable by a NAIVE client — one that takes
+    /// `pointOfOrigin` as `[x, y]` and never looks at `orderedAxes`. That is what `xray.html` did,
+    /// and mirroring the registry's northing-first byte order broke it. `WorldCRS84Quad` is the
+    /// sharpest case: EPSG:4326 is latitude-first, so a CRS-derived emit order would have flipped
+    /// its long-published origin from `[-180, 90]` to `[90, -180]`.
+    #[test]
+    fn published_grids_keep_an_x_y_origin_for_naive_clients() {
+        for id in ["WorldCRS84Quad", "WebMercatorQuad"] {
+            let g = preset(id, 256).expect("preset exists");
+            let v = to_ogc_value(&g);
+            assert_eq!(v["orderedAxes"], serde_json::json!(["X", "Y"]), "{id}");
+            assert_eq!(
+                v["tileMatrices"][0]["pointOfOrigin"],
+                serde_json::json!([g.origin_x, g.origin_y]),
+                "{id}: origin must be published x,y"
+            );
+        }
+    }
+
+    /// ⚠ A round-trip alone CANNOT catch a swapped origin — swapping on both read and write is
+    /// self-consistent. So this asserts the round trip AND the absolute value, plus that we
+    /// publish `orderedAxes` so a client never has to guess.
+    #[test]
+    fn emitted_json_declares_its_axis_order_and_round_trips() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse");
+        let v = to_ogc_value(&g);
+        // We publish x,y ALWAYS and declare it, even for a northing-first CRS. Spec-legal, and it
+        // is what keeps a naive reader correct — mirroring the registry's byte order instead broke
+        // xray.html and flipped WorldCRS84Quad's published origin. See `to_ogc_value`.
+        assert_eq!(v["orderedAxes"], serde_json::json!(["X", "Y"]));
+        assert_eq!(
+            v["tileMatrices"][0]["pointOfOrigin"],
+            serde_json::json!([2_000_000.0, 5_500_000.0]),
+            "easting first, matching the declaration we just made"
+        );
+        let back = from_ogc_json(&serde_json::to_string(&v).unwrap()).expect("reparse");
+        assert_eq!((back.origin_x, back.origin_y), (2_000_000.0, 5_500_000.0));
     }
 }

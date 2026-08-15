@@ -50,9 +50,9 @@ fn multi_layer_config_resolves_two_fgb_layers_each_own_features() {
     // A bbox covering tiny.fgb's whole extent ([0,0]-[5,6]) must return all 3 tiny features
     // and NONE of lines.fgb's (disjoint extent [10,6.5]-[12,11] -- see fixtures/fgb/lines.geojson).
     let tiny_bbox = [-1.0, -1.0, 6.0, 7.0];
-    let tiny_batch = tiny.features_in(tiny_bbox);
+    let tiny_batch = tiny.features_in(tiny_bbox).expect("read the fixture");
     assert_eq!(tiny_batch.len(), 3, "tiny layer's own window");
-    let lines_over_tiny_bbox = lines.features_in(tiny_bbox);
+    let lines_over_tiny_bbox = lines.features_in(tiny_bbox).expect("read the fixture");
     assert!(
         lines_over_tiny_bbox.is_empty(),
         "lines layer must not answer tiny's bbox with its own (disjoint-extent) features"
@@ -61,7 +61,7 @@ fn multi_layer_config_resolves_two_fgb_layers_each_own_features() {
     // Symmetric check: lines.fgb's whole extent returns both LineStrings, and tiny.fgb answers
     // empty over that same window.
     let lines_bbox = [9.5, 6.0, 12.5, 11.5];
-    let lines_batch = lines.features_in(lines_bbox);
+    let lines_batch = lines.features_in(lines_bbox).expect("read the fixture");
     assert_eq!(lines_batch.len(), 2, "lines layer's own window");
     for f in lines_batch.as_slice() {
         assert_eq!(
@@ -71,7 +71,7 @@ fn multi_layer_config_resolves_two_fgb_layers_each_own_features() {
             f.props
         );
     }
-    let tiny_over_lines_bbox = tiny.features_in(lines_bbox);
+    let tiny_over_lines_bbox = tiny.features_in(lines_bbox).expect("read the fixture");
     assert!(
         tiny_over_lines_bbox.is_empty(),
         "tiny layer must not answer lines' bbox with its own (disjoint-extent) features"

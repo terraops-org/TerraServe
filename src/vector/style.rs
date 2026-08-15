@@ -290,11 +290,17 @@ impl Style {
     /// emit without an XML prolog, and an XML document saved under a non-`.sld` extension.
     pub fn load(path: &str) -> Result<Style, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        if path.ends_with(".sld") || looks_like_sld(&text) {
-            let doc = crate::sld::parse(&text).map_err(|e| format!("{path}: {}", e.0))?;
+        Self::parse(path, &text)
+    }
+
+    /// Build a Style from already-fetched text. `path` is used ONLY for the `.sld` extension hint
+    /// and error messages (so an s3:// URL ending in `.sld` still routes to the SLD parser).
+    pub fn parse(path: &str, text: &str) -> Result<Style, String> {
+        if path.ends_with(".sld") || looks_like_sld(text) {
+            let doc = crate::sld::parse(text).map_err(|e| format!("{path}: {}", e.0))?;
             crate::vector::sld_lower::lower(doc).map_err(|e| format!("{path}: {e}"))
         } else {
-            Style::from_json_str(&text).map_err(|e| format!("{path}: {e}"))
+            Style::from_json_str(text).map_err(|e| format!("{path}: {e}"))
         }
     }
 
@@ -339,6 +345,60 @@ impl Style {
                 Symbolizer::Text(t) => Some(&t.label),
                 _ => None,
             })
+    }
+
+    /// Every property name this style actually reads: filter fields (recursively through
+    /// `And`/`Or`/`Not`) plus label text/priority fields on every `Text` symbolizer, across every
+    /// rule.
+    ///
+    /// This is the column set a source that gets to CHOOSE what it fetches (PostGIS: a `SELECT`
+    /// list, not a whole-row read) must ask for. Under-asking is silent and wrong in two different
+    /// directions: a `Cmp`/`Between`/`Like` against a property that was never fetched always
+    /// evaluates false (a rule that should fire never does), while `IsNull` against the same
+    /// vacuously evaluates true (a rule that should NOT fire matches every feature) — see
+    /// `Filter::eval`. A label field that was never fetched just renders blank. Nothing panics or
+    /// warns either way, which is exactly why this has to be right rather than "good enough": a
+    /// source that reads the whole row (`.gpkg`/`.fgb`) never needs this at all.
+    pub fn referenced_fields(&self) -> std::collections::BTreeSet<String> {
+        let mut fields = std::collections::BTreeSet::new();
+        for rule in self.all_rules() {
+            if let Some(f) = &rule.filter {
+                collect_filter_fields(f, &mut fields);
+            }
+            for sym in &rule.symbolizers {
+                if let Symbolizer::Text(t) = sym {
+                    for part in &t.label {
+                        if let LabelPart::Field(name) = part {
+                            fields.insert(name.clone());
+                        }
+                    }
+                    if let Some(Priority::Field(name)) = &t.priority {
+                        fields.insert(name.clone());
+                    }
+                }
+            }
+        }
+        fields
+    }
+}
+
+/// Walk a `Filter` tree collecting every property name it tests, recursively through the boolean
+/// combinators. Split out of `Style::referenced_fields` so the recursion is a plain function, not
+/// a closure capturing `&mut` across `And`/`Or`'s `Vec<Filter>`.
+fn collect_filter_fields(f: &Filter, out: &mut std::collections::BTreeSet<String>) {
+    match f {
+        Filter::Cmp(_, prop, _) | Filter::Between(prop, _, _) | Filter::Like(prop, _) => {
+            out.insert(prop.clone());
+        }
+        Filter::IsNull(prop) => {
+            out.insert(prop.clone());
+        }
+        Filter::And(fs) | Filter::Or(fs) => {
+            for g in fs {
+                collect_filter_fields(g, out);
+            }
+        }
+        Filter::Not(g) => collect_filter_fields(g, out),
     }
 }
 

@@ -81,7 +81,67 @@ impl PmtilesReader {
         &self.metadata
     }
 
-    /// Decompressed MVT bytes for (z,x,y), or None on a miss.
+    /// The `grid_id` this archive was baked on, read from its metadata JSON (design commitment 2).
+    /// Absent (a legacy archive baked before generic grids, e.g. the existing cos2023/vida ones) ⇒
+    /// `WebMercatorQuad` — the only grid `build-pmtiles` could produce then.
+    pub fn grid_id(&self) -> String {
+        serde_json::from_str::<serde_json::Value>(&self.metadata)
+            .ok()
+            .and_then(|v| {
+                v.get("grid_id")
+                    .and_then(|g| g.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "WebMercatorQuad".to_string())
+    }
+
+    /// The tile PIXEL size a RASTER archive was baked at (`tile_px`, stamped by
+    /// `raster::raster_metadata_json`). `None` for an MVT archive, which has no pixels, or for a
+    /// raster archive predating the field. Serve compares it against the published grid's `tile_w`,
+    /// because a 256-px archive on a 512-px grid draws a quarter-size map behind a 200 OK.
+    pub fn raster_tile_px(&self) -> Option<u32> {
+        serde_json::from_str::<serde_json::Value>(&self.metadata)
+            .ok()
+            .and_then(|v| v.get("tile_px").and_then(|t| t.as_u64()))
+            .map(|n| n as u32)
+    }
+
+    /// What this archive DECLARES it holds (PMTiles `tile_type`): `1` = MVT, `2` = PNG. The header
+    /// is the only honest answer to "what is in here" — the payload bytes are opaque — so every
+    /// path that can only draw one of the two asks this before registering the archive.
+    pub fn tile_type(&self) -> u8 {
+        self.header.tile_type
+    }
+
+    /// Refuse an archive whose declared `tile_type` is not what the caller can serve, naming the
+    /// file and BOTH formats. Registering an MVT archive on the raster path (or the reverse) would
+    /// otherwise hand a client bytes of the wrong format behind a 200 — the exact
+    /// reports-success-while-doing-nothing failure this project keeps hitting (most recently an
+    /// archive whose internal layer name did not match its TileJSON, which drew a blank map in QGIS
+    /// with no error anywhere). Called at STARTUP, so a mismatch is a config error, never a per-tile
+    /// surprise.
+    pub fn require_tile_type(&self, expected: u8, path: &str) -> PmResult<()> {
+        let found = self.header.tile_type;
+        if found == expected {
+            return Ok(());
+        }
+        Err(format!(
+            "pmtiles archive {path} declares tile_type {found} ({}) but this path serves \
+             tile_type {expected} ({}) — pass it to the matching flag \
+             (`--pmtiles` for MVT, `--raster-pmtiles` for PNG), or re-bake it with \
+             `build-pmtiles --tile-format {}`",
+            super::write::tile_type_name(found),
+            super::write::tile_type_name(expected),
+            if expected == super::write::TILE_TYPE_PNG {
+                "png"
+            } else {
+                "mvt"
+            },
+        ))
+    }
+
+    /// Decoded tile bytes for (z,x,y), or None on a miss. Decompression follows the header's
+    /// `tile_compression`: gzip (2) for MVT, none (1) for the raster archives whose PNG payloads are
+    /// already compressed. Any other value is an error rather than a silently mangled tile.
     pub fn get(&self, z: u32, x: u32, y: u32) -> PmResult<Option<Vec<u8>>> {
         if z > 26 {
             return Ok(None);
@@ -118,7 +178,13 @@ impl PmtilesReader {
                     .checked_add(e.offset)
                     .ok_or_else(|| "pmtiles: tile data offset overflow".to_string())?;
                 let blob = read_at(&self.file, self.file_len, tile_off, e.length)?;
-                return Ok(Some(gunzip(&blob)?));
+                return match self.header.tile_compression {
+                    super::write::COMPRESSION_GZIP => Ok(Some(gunzip(&blob)?)),
+                    super::write::COMPRESSION_NONE => Ok(Some(blob)),
+                    other => Err(format!(
+                        "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
+                    )),
+                };
             }
             return Ok(None); // in a gap within the run's id range
         }

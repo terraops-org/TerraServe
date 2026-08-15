@@ -36,8 +36,9 @@ fn layer() -> Option<Layer> {
         tile_cache: None,
         index_cache: terraserve::cache::new_index_cache(terraserve::cache::index_cache_bytes()),
         vector: None,
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
         grids: vec![],
     })
 }

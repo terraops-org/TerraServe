@@ -48,14 +48,16 @@ fn vector_layer(style: Style) -> Layer {
         grids: Vec::new(),
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
-            area_scale: 0.0, // MVT-only knob, unused by this test
+            area_scale: 0.0,     // size-gate calibration, unused by this test
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
-        pmtiles: None,
-        overlay: None,
+        pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
+        overlay: std::collections::BTreeMap::new(),
     }
 }
 

@@ -13,12 +13,12 @@
 use crate::server::{Layer, PublishedGrid, ServeState};
 use crate::tms::{strip_size_suffix, TileFactory, TileMatrixSet, TileRequest};
 
-/// The TMS root URL, derived from the advertised WMS base (`…/wms` → `…/tms/1.0.0`).
-pub fn tms_root(base_url: &str) -> String {
-    let origin = base_url
-        .strip_suffix("/wms")
-        .unwrap_or(base_url)
-        .trim_end_matches('/');
+/// The TMS service root, composed on an ALREADY-DERIVED origin.
+///
+/// This used to take `base_url` and derive the origin itself, which is why TMS could not
+/// honour `X-Forwarded-Proto`: it never saw the request. Derivation now lives in exactly one
+/// place, `ServeState::advertised_origin`, and this only appends the path.
+pub fn tms_root(origin: &str) -> String {
     format!("{origin}/tms/1.0.0")
 }
 
@@ -60,10 +60,31 @@ fn pick_grid<'a>(layer: &'a Layer, grid_id: &Option<String>) -> Option<&'a Publi
     }
 }
 
+/// The 404 body when a grid cannot be resolved. A layer publishing NO grids at all gets a message
+/// that says what to do about it: `grids:` defaults to `from_cog`, which `build_vector_layer` drops
+/// (a vector layer has no COG), so a vector layer whose config never set `grids:` explicitly serves
+/// MVT fine (the preset fallback) yet has no grid to raster on — and "no grid None on 'x'" does not
+/// hint at that at all.
+fn no_grid_msg(layer: &Layer, gid: &Option<String>) -> String {
+    if layer.grids.is_empty() {
+        format!(
+            "layer '{}' publishes no tile grids; add e.g. `grids: [WebMercatorQuad]` to it",
+            layer.name
+        )
+    } else {
+        format!("no grid {gid:?} on '{}'", layer.name)
+    }
+}
+
 /// `/tms/1.0.0/` — the TileMapService: one `<TileMap>` per layer×grid across all layers (D1).
 pub fn tilemapservice_xml(state: &ServeState, root: &str) -> String {
     let mut maps = String::new();
     for layer in &state.layers {
+        // Vector layers are listed too: `render_tms_tile` rasters them through
+        // `VectorLayer::render_tile`, so a <TileMap> href here resolves to a real PNG. It used to
+        // skip them because every vector tile request 400'd, which made an advertised href an
+        // always-400 endpoint. A layer publishing no grids still contributes nothing — the loop
+        // below is over `layer.grids` — which is correct: advertised must equal servable.
         for g in &layer.grids {
             maps.push_str(&format!(
                 "    <TileMap title=\"{n}\" srs=\"{crs}\" profile=\"{prof}\" href=\"{root}/{n}@{gid}\"/>\n",
@@ -126,8 +147,36 @@ pub fn tilemap_doc(
         .iter()
         .find(|l| l.name == lname)
         .ok_or((404u16, format!("no layer '{lname}'")))?;
-    let pg = pick_grid(layer, &gid).ok_or((404u16, format!("no grid {gid:?} on '{lname}'")))?;
+    let pg = pick_grid(layer, &gid).ok_or_else(|| (404u16, no_grid_msg(layer, &gid)))?;
     Ok(tilemap_xml_for(&layer.name, &pg.tms, pg.data_bounds, root))
+}
+
+/// A pre-baked PNG for this layer×grid×tile, or `None` to render live. **The single read-through
+/// used by BOTH raster tile front-ends** (`render_tms_tile` here and `wmts::get_tile`), so the two
+/// cannot diverge on which archive answers a request.
+///
+/// `grid_id` is the PUBLISHED grid's id, which is exactly the key `layer::build_vector_layer` filed
+/// the archive under (it resolved the archive's bare `grid_id` against the layer's grids at startup
+/// and verified the tile pixel size), so no matching happens here.
+///
+/// A read ERROR degrades to a live render with a log line, mirroring `mvt_http.rs`'s archive read:
+/// a corrupt or truncated archive must not take the layer down, but it must not be silent either.
+pub fn read_through_raster(
+    layer: &Layer,
+    grid_id: &str,
+    z: u32,
+    col: u32,
+    row: u32,
+) -> Option<Vec<u8>> {
+    let reader = layer.raster_pmtiles.get(grid_id)?;
+    match reader.get(z, col, row) {
+        Ok(Some(bytes)) => Some(bytes),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("raster pmtiles read {z}/{col}/{row}: {e}");
+            None
+        }
+    }
 }
 
 /// Render a TMS tile: parse the spec, pick the grid, apply the bottom-left→top-left y-flip, render.
@@ -145,7 +194,7 @@ pub fn render_tms_tile(
         .iter()
         .find(|l| l.name == lname)
         .ok_or((404u16, format!("no layer '{lname}'")))?;
-    let pg = pick_grid(layer, &gid).ok_or((404u16, format!("no grid {gid:?} on '{lname}'")))?;
+    let pg = pick_grid(layer, &gid).ok_or_else(|| (404u16, no_grid_msg(layer, &gid)))?;
     let lvl = pg
         .tms
         .level(z)
@@ -158,11 +207,27 @@ pub fn render_tms_tile(
     }
     let row =
         tms_y_to_core_row(&pg.tms, z, y).ok_or((404u16, format!("tile row {y} out of range")))?;
-    // Vector layers are not served on tile paths in the MVP (tiled labeling is a later rung) —
-    // fail cleanly instead of panicking on the now-optional COG.
+    // A vector layer rasters through the ONE vector renderer, shared with WMS GetMap and with
+    // `wmts::get_tile` (`VectorLayer::render_tile`) — geometry only, no labels
+    // (docs/postgis-layers.md, "Labels are WMS-only"). The range checks above already ran, so a
+    // failure below is a render/read error, not a bad request.
+    if let Some(vec) = &layer.vector {
+        // Archive-first, exactly as `/mvt` reads through `Layer::pmtiles`: a hit is a disk read of a
+        // pre-baked PNG, a miss renders live below. `row` (top-left) is the addressing PMTiles
+        // stores — the bottom-left y-flip already happened above, so this is the same (z, col, row)
+        // the bake wrote and the WMTS path reads.
+        if let Some(png) = read_through_raster(layer, &pg.tms.id, z, x, row) {
+            return Ok(png);
+        }
+        return vec
+            .render_tile(&layer.src_crs, &pg.tms, z, x, row)
+            .map_err(|e| (500u16, e));
+    }
+    // Neither a vector layer nor a COG one — fail cleanly instead of panicking on the
+    // now-optional COG (a `Layer` with both `vector` and `cog` unset never leaves layer building).
     let cog = layer.cog.as_deref().ok_or((
-        400u16,
-        "vector layer is not tiled — use WMS GetMap".to_string(),
+        500u16,
+        "layer has neither a COG nor a vector source".to_string(),
     ))?;
     let source = layer
         .source
@@ -191,16 +256,66 @@ pub fn render_tms_tile(
     TileFactory::render_tile(&req).map_err(|e| (500u16, e))
 }
 
-/// proj4 definition for the CRSs the built-in viewer needs (OpenLayers ships 3857/4326; the polar
-/// stereographic CRSs must be registered). `None` ⇒ rely on OL's built-in (or the viewer can't
-/// project a truly custom CRS — a convenience-viewer limitation, not a service one).
-fn proj4_def(crs: &str) -> Option<&'static str> {
+/// `GET /tileMatrixSets/{id}` — OGC TileMatrixSet 2.0 JSON for a published grid (Task 2; the first
+/// foothold of OGC API - Tiles, so a client can read a grid's CRS + tile geometry without hardcoding
+/// it — the X-ray viewer, Task 3, is the first consumer). Resolved against the UNION of every layer's
+/// `grids`, not one layer — a grid published anywhere is servable here without the caller knowing
+/// which layer(s) publish it. Same asymmetric match rule as the tile routes (`pick_grid` above,
+/// `mvt_http::resolve_grid`, `wmts::get_tile`): exact id, OR the STORED id's `_{px}` size suffix
+/// stripped against the raw (unstripped) request id. A published/custom grid always wins first.
+/// When no layer publishes a match, falls back to the same 4 built-in presets the MVT/WMTS-MVT
+/// routes serve (`mvt_http::resolve_grid`, `wmts::get_tile_mvt`), but advertised at the STANDARD
+/// `tile_px = 256` — the served tile bboxes are byte-identical (tile geometry is `tile_w`-invariant;
+/// see the inline note at the fallback) while the advertised `cellSize`/`tileWidth` stay the
+/// well-known WebMercatorQuad values a 256-based client expects. A vector layer with an empty `grids` list (the
+/// common case — `fixtures/fgb/multi.yaml`, `fixtures/cite/*.yaml`, the live cos2023/vida deploy
+/// configs) still serves `WebMercatorQuad`/etc. MVT tiles purely via that preset fallback, so this
+/// endpoint must resolve the same ids or it 404s on a grid the layer actually serves. `Err((404,_))`
+/// only when neither a published grid nor a preset matches. Injects a non-standard top-level
+/// `"proj4"` convenience field (`reproj::crs_to_proj4`) alongside the canonical OGC body — `null`
+/// when libproj can't resolve the CRS, never an error (the OGC document itself is still valid
+/// without it).
+pub fn tile_matrix_set_doc(state: &ServeState, id: &str) -> Result<String, (u16, String)> {
+    let published = state
+        .layers
+        .iter()
+        .flat_map(|l| l.grids.iter())
+        .find(|g| g.tms.id == id || strip_size_suffix(&g.tms.id) == id)
+        .map(|g| g.tms.clone());
+    // Advertise the STANDARD 256-px quad (not the route's internal 4096). Tile GEOMETRY is
+    // `tile_w`-invariant — `span = tile_w · resolution`, and `build_quad` sets `resolution =
+    // base_span / tile_px`, so `preset(id, 256)` and `mvt_http::resolve_grid`'s `preset(id, 4096)`
+    // yield byte-identical tile bboxes for every (z,x,y). What `tile_px` DOES change is the
+    // advertised `cellSize`/`tileWidth`, which a client uses to pick a zoom: a 4096 tileWidth makes
+    // z0 cellSize 16x finer (9784 vs the canonical 156543 m/px) and shifts an OpenLayers/OGC
+    // client's tile selection 4 levels coarser (log2(4096/256)) — clamping the viewer's startup to
+    // the whole-world z0 tile. 256 is the well-known WebMercatorQuad definition and the resolution
+    // a 256-based View expects; the MVT encoder is unaffected (it uses a fixed 4096-unit EXTENT,
+    // `vector::mvt::tile::EXTENT`, independent of the grid's tile_w).
+    let tms = published
+        .or_else(|| crate::tms::preset(id, 256))
+        .ok_or((404u16, format!("no TileMatrixSet '{id}'")))?;
+    let mut value = crate::tms::to_ogc_value(&tms);
+    let proj4 = crate::reproj::crs_to_proj4(&tms.crs);
+    value["proj4"] = match proj4 {
+        Some(p) => serde_json::Value::String(p),
+        None => serde_json::Value::Null,
+    };
+    serde_json::to_string(&value).map_err(|e| (500u16, format!("internal: {e}")))
+}
+
+/// proj4 definition for the CRS the built-in viewer needs. The 4 polar stereographic CRSs are
+/// hardcoded first — keeps the polar `/viewer` byte-identical to before — else falls back to
+/// `reproj::crs_to_proj4`, a general libproj export that covers any CRS PROJ knows (e.g. LV95 /
+/// EPSG:2056). `None` ⇒ rely on OL's built-in (or the viewer can't project a truly custom CRS —
+/// a convenience-viewer limitation, not a service one).
+fn proj4_def(crs: &str) -> Option<String> {
     match crs.to_ascii_uppercase().as_str() {
-        "EPSG:3413" => Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:3031" => Some("+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:5041" => Some("+proj=stere +lat_0=90 +lat_ts=90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs"),
-        "EPSG:5042" => Some("+proj=stere +lat_0=-90 +lat_ts=-90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs"),
-        _ => None,
+        "EPSG:3413" => Some("+proj=stere +lat_0=90 +lat_ts=70 +lon_0=-45 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:3031" => Some("+proj=stere +lat_0=-90 +lat_ts=-71 +lon_0=0 +k=1 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:5041" => Some("+proj=stere +lat_0=90 +lat_ts=90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs".to_string()),
+        "EPSG:5042" => Some("+proj=stere +lat_0=-90 +lat_ts=-90 +lon_0=0 +k=0.994 +x_0=2000000 +y_0=2000000 +datum=WGS84 +units=m +no_defs".to_string()),
+        _ => crate::reproj::crs_to_proj4(crs),
     }
 }
 
@@ -216,7 +331,7 @@ fn vector_viewer_html(base_url: &str, layer: &crate::server::Layer) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
-<title>TerraServe — {name} (vector)</title>
+<title>TerraServe · {name} (vector)</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}
@@ -251,15 +366,21 @@ var map = new ol.Map({{
     )
 }
 
-pub fn viewer_html(state: &ServeState) -> String {
-    let root = tms_root(&state.base_url);
+/// `origin` is the request's advertised origin (`ServeState::advertised_origin`), NOT
+/// `state.base_url`. The viewer templates ABSOLUTE tile and WMS URLs into its HTML, so behind a
+/// reverse proxy those must carry the public scheme and path prefix or every request the page
+/// makes lands on the origin root and 404s.
+pub fn viewer_html(state: &ServeState, origin: &str) -> String {
+    let root = tms_root(origin);
     let Some(layer) = state.layers.first() else {
         return "<!doctype html><meta charset=utf-8><title>TerraServe</title><p>No layers published.".to_string();
     };
-    // A vector (label) layer has no tile grids — serve it as a single WMS GetMap image
-    // (OpenLayers ImageWMS) over an OSM basemap so the labels are visible.
+    // A vector layer is shown as a single WMS GetMap image (OpenLayers ImageWMS) over an OSM
+    // basemap, because that is the one path that draws LABELS. It may well publish grids and serve
+    // WMTS/TMS raster tiles now; those carry geometry only, which is the wrong choice for a viewer
+    // whose whole point is the label engine.
     if layer.vector.is_some() {
-        return vector_viewer_html(&state.base_url, layer);
+        return vector_viewer_html(&format!("{origin}/wms"), layer);
     }
     let Some(pg) = layer.grids.first() else {
         return format!(
@@ -286,7 +407,7 @@ pub fn viewer_html(state: &ServeState) -> String {
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
-<title>TerraServe — {name} ({gid})</title>
+<title>TerraServe · {name} ({gid})</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}
