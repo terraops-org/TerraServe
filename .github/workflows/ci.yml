@@ -86,19 +86,43 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # bindgen (via proj-sys and libsqlite3-sys) needs libclang. The runner ships LLVM, but
-      # pinning it here means a runner-image change cannot silently break the build - and a
-      # WRONG LIBCLANG_PATH is exactly what confused the reporter of #9, who pointed it at an
-      # env named after a package that did not exist.
+      # PROJ from conda-forge rather than built from source.
+      #
+      # The first attempt used `--features bundled-proj`, which builds PROJ with CMake. That needs
+      # SQLite3 (the library AND the `sqlite3` binary, to generate proj.db) plus TIFF and curl,
+      # none of which a Windows runner has -- it died on "sqlite3 >= 3.11 required!". Installing
+      # those to build PROJ to build TerraServe is a yak-shave with no payoff.
+      #
+      # More importantly it is not what a Windows user does. The reporter of #9 ran
+      # `pixi global install proj zlib clang` and linked against it; conda-forge is the same
+      # prebuilt-binary route with one prefix, so PKG_CONFIG_PATH is a single directory instead
+      # of one per package -- which is exactly where he went wrong. CI now reproduces the real
+      # user path, which is the path we actually promise works.
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: latest
+          activate-environment: ts
+          auto-activate-base: false
+
+      - name: Install PROJ and pkg-config from conda-forge
+        shell: bash -el {0}
+        run: |
+          conda install -y -c conda-forge proj pkg-config sqlite
+          echo "PKG_CONFIG_PATH=$CONDA_PREFIX/Library/lib/pkgconfig" >> $GITHUB_ENV
+          echo "PROJ_DIR=$CONDA_PREFIX/Library" >> $GITHUB_ENV
+          echo "$CONDA_PREFIX/Library/bin" >> $GITHUB_PATH
+
+      # bindgen (via proj-sys and libsqlite3-sys) needs libclang.
+      #
+      # ⚠ `bin`, not `lib`. On Windows clang-sys looks for libclang.DLL, and DLLs live in bin/;
+      # lib/ holds the import libraries. Pointing at lib/ finds nothing and clang-sys falls back
+      # to whatever libclang is on PATH -- which is exactly the "unsupported version" failure the
+      # reporter of #9 hit.
       - uses: KyleMayes/install-llvm-action@v2
         with:
           version: "17.0"
           directory: ${{ runner.temp }}/llvm
 
-      # ⚠ `bin`, not `lib`. On Windows clang-sys looks for libclang.DLL, and DLLs live in bin/;
-      # lib/ holds the import libraries. Pointing at lib/ finds nothing and clang-sys falls back
-      # to whatever libclang is on PATH -- which is exactly the "unsupported version" failure the
-      # reporter of #9 hit.
       - name: Point bindgen at that LLVM
         shell: bash
         run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/bin" >> $GITHUB_ENV
@@ -107,26 +131,19 @@ jobs:
         with:
           key: windows-msvc
 
-      # `bundled-proj` builds PROJ from source. There is no usable system libproj on a Windows
-      # runner, and this is the same vendored path the Python wheels already use so they import
-      # on hosts without it. It makes the job slow; the cache above is what makes that bearable.
-      # ⚠ CMAKE_POLICY_VERSION_MINIMUM is not optional here, and this is not a Windows problem
-      # as such -- it is a CMake 4 problem that only the vendored-PROJ path meets. PROJ's own
-      # cmake/Ccache.cmake declares `cmake_minimum_required` below 3.5, and CMake 4 REMOVED
-      # compatibility with < 3.5, so configuring dies with "Compatibility with CMake < 3.5 has
-      # been removed". The Linux job never sees it because it links system libproj from apt and
-      # never runs PROJ's CMake at all.
-      #
-      # The value below is the escape hatch CMake's own error message recommends. It will stop
-      # being needed when proj-sys vendors a PROJ whose CMake baseline is >= 3.5.
+      # No `bundled-proj`: we link the conda-forge PROJ installed above, the same way a Windows
+      # user would.
       - name: Build
-        env:
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --release --features bundled-proj
+        shell: bash -el {0}
+        run: cargo build --release
 
       # Prove it RUNS, not just links: `--help` exercises clap and the whole startup path
       # without needing fixtures, a database, or a network.
+      # `bash -el {0}` so the conda environment is active: the binary links PROJ's DLLs from
+      # $CONDA_PREFIX/Library/bin, and without that on PATH it fails to start with a missing-DLL
+      # error that looks nothing like the real cause.
       - name: Smoke
+        shell: bash -el {0}
         run: |
           ./target/release/terraserve.exe --help
           ./target/release/terraserve.exe render --help
