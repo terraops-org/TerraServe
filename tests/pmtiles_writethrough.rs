@@ -40,12 +40,14 @@ fn countries_layer_no_overlay() -> Layer {
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
             area_scale: terraserve::vector::mvt::layer_area_scale(ext, ext),
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
         pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
         overlay: std::collections::BTreeMap::new(),
     }
 }

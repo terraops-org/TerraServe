@@ -72,8 +72,9 @@ pub struct Layer {
     /// (`mvt_http::resolve_grid`) and WMTS-MVT (`wmts::get_tile_mvt`) routes resolve `{tms}` against
     /// this list FIRST, falling back to the 4 built-in `tms::preset`s.
     pub grids: Vec<PublishedGrid>,
-    /// When set, this is a **vector** layer (features + labels, WMS GetMap only). Mutually
-    /// exclusive with `cog`/`source`/`style` being `Some`.
+    /// When set, this is a **vector** layer (features + labels). Served over WMS GetMap, MVT, and
+    /// — on any grid in `grids` — WMTS/TMS raster tiles via `VectorLayer::render_tile`; only the
+    /// GetMap path draws labels. Mutually exclusive with `cog`/`source`/`style` being `Some`.
     pub vector: Option<VectorLayer>,
     /// Pre-built PMTiles archives this layer can read through, keyed by the `grid_id` each archive
     /// self-describes in its metadata (design commitment: one archive per grid, never mixed). A
@@ -81,6 +82,17 @@ pub struct Layer {
     /// when no archive is registered for G). Empty = live encode only. Populated via one or more
     /// (repeatable) `serve --pmtiles <path>`.
     pub pmtiles: std::collections::BTreeMap<
+        String,
+        std::sync::Arc<crate::vector::pmtiles::read::PmtilesReader>,
+    >,
+    /// Pre-baked **PNG** archives this layer's WMTS/TMS raster path reads through, keyed by the
+    /// PUBLISHED grid id the archive was matched to at startup (`WebMercatorQuad_512`, not the bare
+    /// name the archive stamps) — so a tile request looks up `raster_pmtiles.get(&pg.tms.id)` with
+    /// no re-derivation. Mirrors `pmtiles` above in every other respect: opt-in, one archive per
+    /// grid, a hit is a disk read and a miss renders live. Populated via `serve --raster-pmtiles`
+    /// (or a layer's `raster_pmtiles:` in `--config`); the archives are validated at startup to
+    /// declare `tile_type` PNG and to match a published grid at the same pixel size.
+    pub raster_pmtiles: std::collections::BTreeMap<
         String,
         std::sync::Arc<crate::vector::pmtiles::read::PmtilesReader>,
     >,
@@ -99,8 +111,9 @@ pub struct Layer {
 pub struct VectorLayer {
     /// The feature source (GeoJSON/GPKG today, load-all; FlatGeoBuf the future windowed reader) —
     /// the `VectorSource` seam every vector-serving path (WMS GetMap/GetFeatureInfo, `/mvt`, WMTS
-    /// GetTile) reads through via `features_in(bbox)`. Always `LoadAll` today; `Windowed` is
-    /// unblocked but has no real implementer yet.
+    /// GetTile) reads through — via `features_in(bbox)`, or `features_in_gated` on the paths that
+    /// apply the min-feature-size gate. Always `LoadAll` today; `Windowed` is unblocked but has no
+    /// real implementer yet.
     pub source: crate::vector::source::VectorSource,
     /// The vector style (rule-based Style IR: scale + filter rule selection → symbolizers).
     pub style: crate::vector::style::Style,
@@ -117,6 +130,14 @@ pub struct VectorLayer {
     /// recomputing it (removing the byte-lock duplication). `0.0` if not computable → the
     /// min-feature-size gate fails OPEN (see `mvt::min_area_src_for_zoom`).
     pub area_scale: f64,
+    /// `--mvt-min-feature-px` for this layer (`0.0` = gate off). The other half of the size gate:
+    /// with `area_scale` it turns a display-px² budget into a source-CRS area threshold. Carried on
+    /// the LAYER, not read off `ServeState` per request, because the RASTER paths that apply it do
+    /// not all see a `ServeState` — `wms::handle_layers` takes a bare `&[Layer]`, and the
+    /// `build-pmtiles --tile-format png` bake runs with no server at all. The MVT path still reads
+    /// `ServeState::mvt_min_feature_px` via `MvtOptimizations::for_layer`; both come from the same
+    /// flag, so they agree by construction (folding that read onto this field is a queued cleanup).
+    pub min_feature_px: f64,
     /// Optional per-zoom level-of-detail pools (topology serve): when `Some`, the MVT/WMTS/WMS paths
     /// pick a zoom/scale-appropriate `FeatureSource` from here instead of `source`. `None` = no LOD
     /// (serve `source` at all zooms — the raw / single-tolerance path).
@@ -146,6 +167,68 @@ impl VectorLayer {
             }
             None => self.source.clone(),
         }
+    }
+
+    /// Render one RASTER tile of this layer as a PNG — the single implementation behind both tile
+    /// front-ends (`tms_http::render_tms_tile` and `wmts::get_tile`). A tile IS a `GetMap` with a
+    /// bbox computed from the grid, so this does exactly what `wms::get_map_vector` does, through
+    /// the same `render_vector_from`: a second render path would drift, and drift here means two
+    /// different maps of the same data.
+    ///
+    /// Two deliberate differences from GetMap, both documented at their cause:
+    /// * **No labels** (`labels = false`) — see `vector::render::render_vector_from`.
+    /// * **Alpha is kept** — no `TRANSPARENT`/`BGCOLOR` flattening, matching the raster tile path
+    ///   (`tms::TileFactory::render_tile`), because tiles are composited by the client.
+    ///
+    /// LOD comes from `source_for_scale` on the tile's OWN pixel resolution, NOT `source_for_zoom`:
+    /// a 512-px grid packs twice the detail of a 256-px grid at the same `z`, and the point of
+    /// deriving the scale denominator is that a tile and the GetMap covering the same ground at the
+    /// same pixel size pick the SAME pool. (`/mvt` correctly uses `source_for_zoom` — its encoder
+    /// has a fixed 4096-unit extent, so zoom is its only resolution.)
+    ///
+    /// Note there is no empty-tile short-circuit here: `data_bounds` is `None` for every vector
+    /// layer, so a tile entirely outside the data still costs a source query (a real round trip for
+    /// PostGIS/S3). That is a caching/precompute concern, tracked in the plan's Task 5.
+    pub fn render_tile(
+        &self,
+        src_crs: &str,
+        grid: &crate::tms::TileMatrixSet,
+        z: u32,
+        col: u32,
+        row: u32,
+    ) -> Result<Vec<u8>, String> {
+        let bbox = grid
+            .tile_bounds(z, col, row)
+            .ok_or_else(|| format!("tile out of range: z={z} col={col} row={row}"))?;
+        let (tw, th) = (grid.tile_w, grid.tile_h);
+        // Per-zoom LOD: the scale denominator of THIS tile, exactly as `wms::get_map_vector`
+        // derives it for a GetMap. Skipping it would render full detail at z2 — the 34-second
+        // whole-country request the tile pyramid exists to avoid, once per tile.
+        let scale = crate::vector::render::request_scale_denominator(bbox, tw, &grid.crs);
+        let vs = self.source_for_scale(scale);
+        // Min-feature-size gate, derived from the SAME scale denominator the LOD pick above uses
+        // (`mvt::min_area_src_for_scale` shares the inversion), so a tile cannot thin at one
+        // effective zoom while its geometry pool was chosen at another. `0.0` unless the operator
+        // set `--mvt-min-feature-px`. This is the raster half of a gate that used to be MVT-only —
+        // the reason a z1 tile of a 107.9M-row PostGIS layer once fetched every row.
+        let min_area_src =
+            crate::vector::mvt::min_area_src_for_scale(scale, self.area_scale, self.min_feature_px);
+        // Truncation stays loud on this path: the per-query feature cap
+        // (TERRASERVE_{FGB,GPKG,PG}_MAX_QUERY_FEATURES) warns from inside `features_in`, which is
+        // where this read goes. A tile is not a reason for a dropped feature to go unlogged.
+        let rgba = crate::vector::render::render_vector_from(
+            &vs,
+            &self.style,
+            src_crs,
+            &grid.crs,
+            bbox,
+            tw,
+            th,
+            &self.shaper,
+            false,
+            min_area_src,
+        )?;
+        crate::pngio::encode_rgba(&rgba, tw, th)
     }
 }
 
@@ -498,8 +581,15 @@ fn grid_zoom_range(layer: &Layer, grid_id: &str) -> (u8, u8) {
     }
 }
 
-async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery) -> Response {
+async fn wms_handler(
+    State(state): State<Arc<ServeState>>,
+    headers: axum::http::HeaderMap,
+    RawQuery(q): RawQuery,
+) -> Response {
     let query = q.unwrap_or_default();
+    // Resolve the advertised endpoint HERE, while the request headers are still in scope — the
+    // render runs on a blocking worker that only sees what we move into it.
+    let base_url = wms_base(&state, &headers);
     // Log each incoming request so we can see exactly what a client (QGIS) sends.
     println!("--> WMS: {query}");
     // Admission control: acquire a render permit (queues under burst) so concurrent renders — and
@@ -522,7 +612,7 @@ async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery
                         content_type: Some("image/png".to_string()),
                     };
                 }
-                let r = wms::handle_layers(&st.layers, &query, Some(&st.base_url));
+                let r = wms::handle_layers(&st.layers, &query, Some(&base_url));
                 // Cache ONLY a successful PNG — never an exception XML (it'd be served as image/png).
                 if r.bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
                     cache.insert(query.clone(), Arc::new(r.bytes.clone()));
@@ -530,7 +620,7 @@ async fn wms_handler(State(state): State<Arc<ServeState>>, RawQuery(q): RawQuery
                 return r;
             }
         }
-        wms::handle_layers(&st.layers, &query, Some(&st.base_url))
+        wms::handle_layers(&st.layers, &query, Some(&base_url))
     })
     .await;
 
@@ -738,6 +828,20 @@ fn trim_origin(url: &str) -> String {
 fn origin_of(state: &ServeState, headers: &axum::http::HeaderMap) -> String {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     state.advertised_origin(host, forwarded_proto(headers))
+}
+
+/// The advertised WMS endpoint for THIS request: the shared origin plus the `/wms` path.
+///
+/// `wms::online_resource` (the `<OnlineResource xlink:href>` in GetCapabilities, and the one a
+/// client is supposed to append its KVP to) was the last front-end still reading
+/// `state.base_url` directly. Without `--public-url` that field has fallen back to the BIND
+/// address, so a proxied deployment published `http://127.0.0.1:8080/wms?` — a href QGIS
+/// follows straight to an unreachable host — while the MVT/TMS/WMTS roots on the same server,
+/// already routed through `origin_of`, published the real public URL. Going through the same
+/// derivation gives all four the same precedence: `--public-url` > `Host` + `X-Forwarded-Proto`
+/// > `base_url`.
+fn wms_base(state: &ServeState, headers: &axum::http::HeaderMap) -> String {
+    format!("{}/wms", origin_of(state, headers))
 }
 
 /// The client-facing scheme, as reported by the reverse proxy's `X-Forwarded-Proto`.
@@ -1095,6 +1199,38 @@ mod advertised_origin_tests {
             "http://localhost:8080"
         );
         assert_eq!(st.advertised_origin(None, None), "http://127.0.0.1:8080");
+    }
+
+    /// `wms::online_resource` was the LAST front-end still reading `state.base_url` directly,
+    /// so a GetCapabilities behind a TLS-terminating proxy advertised the BIND address while
+    /// the MVT/TMS/WMTS roots on the SAME server advertised the public one. It composes on the
+    /// shared origin now, so all four agree.
+    #[test]
+    fn the_wms_endpoint_composes_on_the_shared_origin() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "terraserve.io".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        // No --public-url: derived from the request, NOT from the useless bind address.
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(super::wms_base(&st, &headers), "https://terraserve.io/wms");
+
+        // An explicit --public-url still wins, path prefix and all.
+        let st = state_with(
+            Some("https://terraserve.io/demo/vida/wms"),
+            "http://127.0.0.1:8080/wms",
+        );
+        assert_eq!(
+            super::wms_base(&st, &headers),
+            "https://terraserve.io/demo/vida/wms"
+        );
+
+        // No Host header at all (a direct local run) still yields the old answer.
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        assert_eq!(
+            super::wms_base(&st, &axum::http::HeaderMap::new()),
+            "http://127.0.0.1:8080/wms"
+        );
     }
 
     /// The TMS/WMTS path builders now only append to an already-derived origin, so a

@@ -8,7 +8,7 @@
 //! `simplify_topology` run ONCE over the shared arcs → seam-free at that zoom. See
 //! `docs/superpowers/specs/2026-07-14-per-zoom-lod-design.md`.
 
-use crate::vector::mvt::tile::{merc_m_per_px, DISPLAY_TILE_PX, WORLD_MERC_M};
+use crate::vector::mvt::tile::merc_m_per_px;
 
 /// One display-pixel's length in SOURCE-CRS units at zoom `z`. `merc_m_per_px(z)` is the mercator m/px
 /// (shared with the MVT size gate); `area_scale` = mercator-m² per source-unit², so `sqrt` converts
@@ -63,19 +63,13 @@ impl LodSet {
         &self.per_zoom[i]
     }
 
-    /// The pool for a WMS GetMap scale-denominator. `request_scale_denominator` computes
-    /// `scale = res_grid · metres_per_unit / 0.00028`, so `scale · 0.00028` = ground metres per pixel;
-    /// invert the Web-Mercator px formula to an effective zoom.
+    /// The pool for a WMS GetMap scale-denominator, via the shared
+    /// [`crate::vector::mvt::zoom_for_scale_denominator`] inversion — the SAME effective zoom the
+    /// raster min-feature-size gate derives, so a request cannot pick its LOD pool from one zoom
+    /// and its size threshold from another. A degenerate scale (`None`) keeps this path's
+    /// pre-existing behaviour: `u32::MAX`, which `for_zoom` clamps to the finest pool.
     pub fn for_scale_denominator(&self, scale: f64) -> &Arc<dyn FeatureSource> {
-        let res_merc = scale * 0.00028; // ground metres / pixel
-        let z = if res_merc > 0.0 {
-            (WORLD_MERC_M / (DISPLAY_TILE_PX * res_merc))
-                .log2()
-                .round()
-                .clamp(0.0, u32::MAX as f64) as u32
-        } else {
-            u32::MAX
-        };
+        let z = crate::vector::mvt::zoom_for_scale_denominator(scale).unwrap_or(u32::MAX);
         self.for_zoom(z)
     }
 
@@ -130,6 +124,9 @@ pub fn build_lod(
 mod tests {
     use super::*;
     use crate::vector::feature::{Feature, Geometry, Props};
+    // Only the scale<->zoom round-trip test needs these; the module itself now goes through
+    // `mvt::zoom_for_scale_denominator` for the inversion.
+    use crate::vector::mvt::tile::{DISPLAY_TILE_PX, WORLD_MERC_M};
 
     #[test]
     fn min_area_is_monotonic_and_floored() {

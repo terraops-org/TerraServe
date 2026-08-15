@@ -82,6 +82,19 @@ pub fn decode_gpkg_geometry(blob: &[u8]) -> Result<Option<Geometry>, String> {
     read_geom(&mut r)
 }
 
+/// Decode a bare ISO WKB geometry — `ST_AsBinary` output, with NO GeoPackage header.
+///
+/// `decode_gpkg_geometry` is the GeoPackage-flavoured entry point: it strips the 8-byte `GP`
+/// header and envelope, then calls the same reader. PostGIS hands us the body directly, so this
+/// exposes that reader without inventing a fake header.
+pub fn decode_wkb(wkb: &[u8]) -> Result<Option<Geometry>, String> {
+    if wkb.is_empty() {
+        return Err("wkb: empty geometry buffer".to_string());
+    }
+    let mut r = Rdr { b: wkb, pos: 0 };
+    read_geom(&mut r)
+}
+
 /// A bounds-checked byte cursor over a WKB slice. Every read validates the range against
 /// `b.len()` first and returns `Err` on overrun — no `panic!`, no unchecked indexing.
 struct Rdr<'a> {
@@ -580,5 +593,29 @@ mod tests {
         let body = wkb_point_body(true, 999, &[1.0, 2.0]); // 999 is not a valid base type
         let blob = gpkg_blob(false, &body);
         assert!(decode_gpkg_geometry(&blob).is_err());
+    }
+
+    // -- decode_wkb: bare ISO WKB, no GeoPackage header -----------------------------------
+
+    #[test]
+    fn decode_wkb_reads_bare_iso_wkb_with_no_gpkg_header() {
+        // POINT(1 2), little-endian ISO WKB: byte order 01, type 0000_0001, then two f64.
+        let mut wkb = vec![0x01, 0x01, 0x00, 0x00, 0x00];
+        wkb.extend_from_slice(&1.0f64.to_le_bytes());
+        wkb.extend_from_slice(&2.0f64.to_le_bytes());
+        assert_eq!(decode_wkb(&wkb).unwrap(), Some(Geometry::Point([1.0, 2.0])));
+    }
+
+    #[test]
+    fn decode_wkb_rejects_a_gpkg_blob() {
+        // The GP-headered form is decode_gpkg_geometry's job. Passing one here must ERROR rather
+        // than silently misparse the header bytes as a geometry type.
+        let blob = [b'G', b'P', 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00];
+        assert!(decode_wkb(&blob).is_err());
+    }
+
+    #[test]
+    fn decode_wkb_rejects_empty_input() {
+        assert!(decode_wkb(&[]).is_err());
     }
 }

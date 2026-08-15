@@ -20,7 +20,11 @@ echo "  ok"
 echo "== banned-crate gate =="
 # The COG container + IFD/tiling + windowed read must be BESPOKE. Ban GDAL and any
 # GeoTIFF/COG/TIFF *reader* crate (the `tiff` crate is the usual shortcut). Codec
-# crates (flate2/zstd/zune-jpeg/jpeg-decoder/png) and proj4rs/proj are allowed. The FlatGeoBuf
+# crates (flate2/zstd/zune-jpeg/jpeg-decoder/png) and proj4rs/proj are allowed. Database CLIENTS
+# are allowed on the same footing — rusqlite for GeoPackage, tokio-postgres/deadpool-postgres for
+# PostGIS: they move bytes, they do not interpret a geo format. PostGIS hands us plain ISO WKB
+# from ST_AsBinary and src/vector/wkb.rs decodes it, and no pushdown (ST_Transform / ST_Simplify /
+# ST_AsMVT) is permitted — see the PostGIS design spec §1. The FlatGeoBuf
 # container/header/R-tree/feature decode must also be BESPOKE — `flatbuffers` (the runtime
 # codec, like zstd) is allowed, but `flatgeobuf`/`flatbush` (format-reader shortcuts) are not.
 BANNED_RE='name = "(gdal|gdal-sys|tiff|geotiff|geotiff-rs|cog|cog-rs|async-tiff|tiff-decoder|libtiff-sys|geotiff2|flatgeobuf|flatbush)"'

@@ -252,6 +252,37 @@ impl Header {
 mod tests {
     use super::*;
 
+    /// The column schema is stable across repeated calls and matches the file. Written while
+    /// investigating whether to CACHE this list (it is rebuilt on every call, and
+    /// `feat::decode_feature` calls it per feature). Caching measured SLOWER and was reverted
+    /// -- see docs/performance-analysis-2026-08-05.md A.10 -- but the test is worth keeping:
+    /// nothing else pinned the decoded schema, and any future attempt at this needs it.
+    #[test]
+    fn columns_are_stable_across_calls() {
+        let src = crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap();
+        let prefix = crate::cog::RangeSource::read_range(&src, 0, 12).unwrap();
+        let header_size = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
+        let buf = crate::cog::RangeSource::read_range(&src, 12, header_size as usize).unwrap();
+        let header = Header::parse(buf).unwrap();
+
+        let snap = |h: &Header| -> Vec<(String, u8)> {
+            h.columns()
+                .iter()
+                .map(|(n, t)| (n.to_string(), *t))
+                .collect()
+        };
+        let first = snap(&header);
+        assert_eq!(
+            first,
+            vec![("name".to_string(), 11), ("pop".to_string(), 5)]
+        );
+        assert_eq!(
+            snap(&header),
+            first,
+            "a second call must agree with the first"
+        );
+    }
+
     #[test]
     fn parse_rejects_truncated_buffer() {
         assert!(Header::parse(vec![]).is_err());

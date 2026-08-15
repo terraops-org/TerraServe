@@ -292,16 +292,21 @@ impl<R: RangeSource> FgbSource<R> {
     /// delegates here with `cap = max_query_features()`) — the cap bounds per-request memory:
     /// `rtree_query` returning a big `Vec<u64>` of offsets is cheap (8 bytes each), but
     /// `decode_at`-ing every hit into a full `Feature` is the expensive part, so the cap bounds
-    /// the decode loop, not the candidate list. Fail-open: warns once and returns the first
-    /// `cap` (R-tree/spatial order) if more than `cap` match, rather than allocating unbounded.
-    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Vec<Feature>
+    /// the decode loop, not the candidate list. The CAP is still fail-open: it warns once and
+    /// returns the first `cap` (R-tree/spatial order) rather than allocating unbounded.
+    ///
+    /// ⚠ READ errors are not fail-open, and used to be — silently, with no log at all. An index
+    /// traversal or feature fetch that failed returned an empty `Vec`, so a dropped connection or
+    /// a truncated HTTP range read against an `s3://…fgb` layer arrived as a blank map behind a
+    /// **200 OK**. That is the most dangerous shape this bug takes, because the remote reader is
+    /// exactly the one whose reads fail transiently.
+    pub fn query_capped(&self, bbox: [f64; 4], cap: usize) -> Result<Vec<Feature>, String>
     where
         R: Send + Sync,
     {
-        let hits = match self.rtree_query(bbox) {
-            Ok(h) => h,
-            Err(_) => return Vec::new(),
-        };
+        let hits = self
+            .rtree_query(bbox)
+            .map_err(|e| format!("fgb: index query failed: {e}"))?;
         if hits.len() > cap {
             eprintln!(
                 "fgb: query matched {} features; capping decode at {} (raise TERRASERVE_FGB_MAX_QUERY_FEATURES)",
@@ -313,17 +318,26 @@ impl<R: RangeSource> FgbSource<R> {
         // Fetch + decode in parallel on the dedicated I/O pool. rayon's ordered `collect` preserves
         // the R-tree/Hilbert order of `capped`, so the kept features are in the same order the
         // serial loop produced — render output is byte-identical.
-        let decoded: Vec<Option<Feature>> = crate::render::io_pool().install(|| {
-            use rayon::prelude::*;
-            capped
-                .par_iter()
-                .map(|&rel_offset| match self.decode_at(rel_offset) {
-                    Ok(Some(f)) if bbox_intersects(f.bbox, bbox) => Some(f),
-                    _ => None,
-                })
-                .collect()
-        });
-        decoded.into_iter().flatten().collect()
+        //
+        // `Ok(None)` (an unmodeled geometry — MultiPoint / GeometryCollection) and a feature whose
+        // own bbox misses the window are both legitimate skips. An `Err` is not: it means a range
+        // read failed, and dropping that feature would quietly hand back a window with a hole in
+        // it. Collected as `Result` so rayon short-circuits and the first real read error wins.
+        let decoded: Result<Vec<Option<Feature>>, String> =
+            crate::render::io_pool().install(|| {
+                use rayon::prelude::*;
+                capped
+                    .par_iter()
+                    .map(|&rel_offset| match self.decode_at(rel_offset) {
+                        Ok(Some(f)) if bbox_intersects(f.bbox, bbox) => Ok(Some(f)),
+                        Ok(_) => Ok(None),
+                        Err(e) => Err(format!(
+                            "fgb: feature read failed at offset {rel_offset}: {e}"
+                        )),
+                    })
+                    .collect()
+            });
+        Ok(decoded?.into_iter().flatten().collect())
     }
 
     /// Windowed bbox query (`[minx, miny, maxx, maxy]`): top-down packed-R-tree traversal via
@@ -396,12 +410,16 @@ impl<R: RangeSource> FgbSource<R> {
         Ok(feature)
     }
 
-    /// Read one size-prefixed Feature FlatBuffer at `rel_offset` (relative to `features_start`):
-    /// the `u32 feat_size` prefix (consumed, not returned) plus the `feat_size`-byte body.
-    /// Returns `(body, 4 + feat_size)` — the second value is how far a sequential-scan cursor
-    /// (`decode_all`) should advance to reach the next record. Same read shape as
-    /// `bruteforce_query`'s loop (kept separate: that one also decodes+tests a bbox inline,
-    /// this one just fetches raw bytes for `feat::decode_feature`).
+    /// Read one size-prefixed Feature FlatBuffer at `rel_offset` (relative to `features_start`),
+    /// returning the WHOLE record — `u32 feat_size` prefix INCLUDED — plus `4 + feat_size`, how
+    /// far a sequential-scan cursor (`decode_all`) advances to reach the next record.
+    ///
+    /// The prefix is returned rather than consumed because `feat::verify_feature_buf` needs the
+    /// size-prefixed frame to check field alignment (see its doc). It used to be dropped here
+    /// and then RE-SYNTHESIZED per feature by allocating a new buffer and copying the whole body
+    /// into it behind 4 placeholder bytes. The second read below therefore starts at the record,
+    /// not the body: re-reading 4 bytes is far cheaper than an allocation plus a full copy of
+    /// every feature.
     fn read_feature_record(&self, rel_offset: u64) -> io::Result<(Vec<u8>, u64)> {
         let size_bytes = self.src.read_range(self.features_start + rel_offset, 4)?;
         if size_bytes.len() != 4 {
@@ -413,13 +431,14 @@ impl<R: RangeSource> FgbSource<R> {
         if size > MAX_FEATURE_BYTES {
             return Err(invalid("fgb: feature size prefix implausibly large"));
         }
-        let body = self
+        let record_len = 4 + size as usize;
+        let record = self
             .src
-            .read_range(self.features_start + rel_offset + 4, size as usize)?;
-        if body.len() != size as usize {
+            .read_range(self.features_start + rel_offset, record_len)?;
+        if record.len() != record_len {
             return Err(invalid("fgb: short read on a Feature FlatBuffer"));
         }
-        Ok((body, 4 + size))
+        Ok((record, 4 + size))
     }
 
     /// Sequential scan of every feature (decoding just enough of each Feature FlatBuffer to
@@ -441,13 +460,14 @@ impl<R: RangeSource> FgbSource<R> {
             if size > MAX_FEATURE_BYTES {
                 return Err(invalid("fgb: feature size prefix implausibly large"));
             }
-            let body = self
+            let record_len = 4 + size as usize;
+            let record = self
                 .src
-                .read_range(self.features_start + rel_offset + 4, size as usize)?;
-            if body.len() != size as usize {
+                .read_range(self.features_start + rel_offset, record_len)?;
+            if record.len() != record_len {
                 return Err(invalid("fgb: short read on a Feature FlatBuffer"));
             }
-            if let Some(fb) = feature_bbox(&body) {
+            if let Some(fb) = feature_bbox(&record) {
                 if bbox_intersects(fb, bbox) {
                     hits.push(rel_offset);
                 }
@@ -475,12 +495,12 @@ impl<R: RangeSource + Send + Sync> crate::vector::source::WindowedSource for Fgb
     /// `bbox` — the R-tree only proves the *node* bbox overlaps, not the feature's actual
     /// geometry (a node packs several features under one conservative bbox). A `decode_at`
     /// that returns `Ok(None)` (unmodeled geometry — MultiPoint/GeometryCollection) is skipped,
-    /// not an error. On an I/O error from `rtree_query` itself, fails open (empty result) —
-    /// `WindowedSource::query` has no error channel; a request-time read failure should not
-    /// panic the server. Delegates to `query_capped` with `max_query_features()` — a wide/
-    /// low-zoom query against a dense `.fgb` decodes at most that many features, bounding
-    /// per-request memory (see `query_capped`'s doc comment).
-    fn query(&self, bbox: [f64; 4]) -> Vec<Feature> {
+    /// not an error. An I/O error IS one and is propagated — it used to fail open with an empty
+    /// result because `WindowedSource::query` had no error channel; it has one now, and no caller
+    /// panics on it (they answer 500 / an OWS exception). Delegates to `query_capped` with
+    /// `max_query_features()` — a wide/low-zoom query against a dense `.fgb` decodes at most that
+    /// many features, bounding per-request memory (see `query_capped`'s doc comment).
+    fn query(&self, bbox: [f64; 4]) -> Result<Vec<Feature>, String> {
         self.query_capped(bbox, max_query_features())
     }
 
@@ -564,16 +584,20 @@ fn validate_root_table(buf: &[u8]) -> Option<usize> {
 /// 18) is transcribed from the schema's field order (`ends, xy, z, m, t, tm, type, parts`) but
 /// **not** exercised by any fixture here — `tiny.fgb` has no Multi*/GeometryCollection
 /// features. Flagged for Task 6 (the PRT.fgb / real-world MultiPolygon run) to confirm.
-fn feature_bbox(body: &[u8]) -> Option<[f64; 4]> {
-    let root_loc = validate_root_table(body)?;
+/// `record` is the WHOLE on-disk record, `u32 feat_size` prefix INCLUDED — the same convention
+/// `feat::decode_feature` takes, because `verify_feature_buf` needs that frame to check field
+/// alignment.
+fn feature_bbox(record: &[u8]) -> Option<[f64; 4]> {
     // Task 7: `accumulate_geometry_bbox` below recurses into `Geometry.parts` unboundedly and,
     // like every other accessor here, reads through unchecked `flatbuffers::Table::get` calls
     // -- so it needs the exact same full structural verification (bounds AND the verifier's
     // `max_depth` recursion cap) `feat::decode_feature` gates on, or a crafted deeply-nested
     // `parts` chain / out-of-bounds field offset could stack-overflow or OOB-read here instead.
-    if !feat::verify_feature_buf(body) {
+    if record.len() < 4 || !feat::verify_feature_buf(record) {
         return None;
     }
+    let body = &record[4..];
+    let root_loc = validate_root_table(body)?;
     let feature = unsafe { Table::new(body, root_loc) };
     let geometry = unsafe { feature.get::<ForwardsUOffset<Table<'_>>>(4, None) }?;
     let mut acc: Option<[f64; 4]> = None;
@@ -968,14 +992,14 @@ mod tests {
         let fgb = FgbSource::open(src).unwrap();
         let bbox = [-1.0, -1.0, 6.0, 7.0]; // covers all 3 tiny.fgb features
 
-        let capped = fgb.query_capped(bbox, 2);
+        let capped = fgb.query_capped(bbox, 2).expect("read the fixture");
         assert!(
             capped.len() <= 2,
             "cap=2 must bound the decode to at most 2 features, got {}",
             capped.len()
         );
 
-        let uncapped = fgb.query_capped(bbox, 1000);
+        let uncapped = fgb.query_capped(bbox, 1000).expect("read the fixture");
         assert_eq!(
             uncapped.len(),
             3,
@@ -1010,6 +1034,7 @@ mod tests {
 
         let got: Vec<u64> = s
             .query_capped(bbox, 1000)
+            .expect("read the fixture")
             .into_iter()
             .map(|f| f.fid)
             .collect();
@@ -1028,7 +1053,8 @@ mod tests {
         let src = crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap();
         let fgb = FgbSource::open(src).unwrap();
         // a bbox around point b (5,6) returns exactly 1 feature with name="b"
-        let got = crate::vector::source::WindowedSource::query(&fgb, [4.5, 5.5, 5.5, 6.5]);
+        let got = crate::vector::source::WindowedSource::query(&fgb, [4.5, 5.5, 5.5, 6.5])
+            .expect("read the fixture");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].props.get_str("name"), Some("b"));
     }
@@ -1114,7 +1140,8 @@ mod tests {
         let fgb = FgbSource::open(counting).unwrap();
         assert_eq!(fgb.features_count(), 6_097_126);
 
-        let feats = crate::vector::source::WindowedSource::query(&fgb, bbox);
+        let feats =
+            crate::vector::source::WindowedSource::query(&fgb, bbox).expect("read the fixture");
         assert!(!feats.is_empty());
 
         // Every returned feature's own decoded bbox must actually overlap the query bbox (the
@@ -1192,7 +1219,8 @@ mod tests {
         assert_eq!(fgb.crs(), Some("EPSG:3763"));
 
         let bbox = [88839.18, -179394.11, 96883.47, -173740.15];
-        let feats = crate::vector::source::WindowedSource::query(&fgb, bbox);
+        let feats =
+            crate::vector::source::WindowedSource::query(&fgb, bbox).expect("read the fixture");
         assert!(
             !feats.is_empty(),
             "no features in feature 699772's own bbox"

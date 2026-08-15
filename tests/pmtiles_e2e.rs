@@ -41,12 +41,14 @@ fn countries_layer() -> Layer {
         vector: Some(VectorLayer {
             fields: terraserve::mvt_http::feature_field_schema(src.as_ref()),
             area_scale: terraserve::vector::mvt::layer_area_scale(ext, ext),
+            min_feature_px: 0.0, // size gate off (the default)
             source: VectorSource::LoadAll(src),
             style,
             shaper,
             lod: None,
         }),
         pmtiles: std::collections::BTreeMap::new(),
+        raster_pmtiles: std::collections::BTreeMap::new(),
         overlay: std::collections::BTreeMap::new(),
     }
 }
@@ -90,7 +92,8 @@ fn generated_pmtiles_reads_back_identical_tiles() {
             let vs = v.source_for_zoom(z);
             for x in c0..=c1 {
                 for y in r0..=r1 {
-                    let feats = features_for_tile(&vs, &grid, z, x, y, &layer.src_crs);
+                    let feats = features_for_tile(&vs, &grid, z, x, y, &layer.src_crs, &opts)
+                        .expect("load-all fixture read never fails");
                     let live = encode_tile_opt(
                         feats.as_slice(),
                         &grid,
@@ -136,6 +139,8 @@ fn build_pmtiles_uses_the_given_layer_name() {
         min_zoom: 0,
         max_zoom: 2,
         bbox: None,
+        // Only a postgis:// source needs this; a file source carries its own extent.
+        extent: None,
         tmpdir: Some(tmpdir.to_string_lossy().into_owned()),
         vec_style: Some("fixtures/styles/countries.vec.json".into()),
         src_crs: None,
@@ -143,6 +148,7 @@ fn build_pmtiles_uses_the_given_layer_name() {
         name: Some("roads".into()),
         mvt_max_features: terraserve::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
         mvt_min_feature_px: 0.0,
+        raster_min_feature_px: None,
         mvt_no_optimizations: false,
         mvt_no_safety_limit: false,
         mvt_cell_px: 0.0,
@@ -156,6 +162,10 @@ fn build_pmtiles_uses_the_given_layer_name() {
         topology_dissolve_rollup: None,
         keep_fields: None,
         grid: "WebMercatorQuad".into(),
+        // MVT is the default format; the raster bake has its own end-to-end test
+        // (tests/pmtiles_raster_serve.rs).
+        tile_format: "mvt".into(),
+        tile_px: 512,
     };
 
     terraserve::run_build_pmtiles(&args).unwrap();

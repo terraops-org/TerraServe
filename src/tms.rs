@@ -218,6 +218,10 @@ impl TileMatrixSet {
 struct OgcTms {
     id: String,
     crs: String,
+    /// OGC TMS 2.0 `orderedAxes`: the axis order the document's OWN coordinates are written in.
+    /// Optional; absent means "the CRS's declared order applies" (see `origin_is_northing_first`).
+    #[serde(rename = "orderedAxes")]
+    ordered_axes: Option<Vec<String>>,
     #[serde(rename = "tileMatrices")]
     tile_matrices: Vec<OgcTileMatrix>,
 }
@@ -257,6 +261,70 @@ fn normalize_crs(crs: &str) -> String {
     crs.to_string()
 }
 
+/// Is this document's `pointOfOrigin` written NORTHING-FIRST?
+///
+/// ⚠ This is the difference between a working grid and 3.5 MILLION METRES of error, which renders
+/// as empty tiles behind a 200 — the same failure the WMS 1.3.0 axis flip (`deb77cb`) and the Swiss
+/// `+towgs84` drop produced. It went unnoticed here because `swissLV95` (EPSG:2056) is
+/// easting-first, so the only custom grid ever shipped happened to be the case where the naive
+/// `[0]`=x, `[1]`=y reading is correct.
+///
+/// Precedence, and it matters:
+///  1. **The document's own `orderedAxes`**, when present. A TMS document declares the order its
+///     numbers are in, and that declaration is authoritative for reading them — even if it
+///     disagrees with the CRS registry, because the numbers are what they are.
+///  2. Otherwise **the CRS's declared order**, via `reproj::crs_is_northing_first` (the same PROJ
+///     query the WMS 1.3.0 path uses — one definition, so the two can never drift).
+///  3. Otherwise easting-first, matching that helper's own documented fallback: it is right for the
+///     easting-first majority, and it is what every grid parsed before this fix assumed.
+///
+/// The real case: OGC's registered `EuropeanETRS89_LAEAQuad` (EPSG:3035) declares
+/// `orderedAxes: ["Y","X"]` and writes `pointOfOrigin: [5500000, 2000000]` — northing 5 500 000,
+/// easting 2 000 000. Read naively that becomes x=5 500 000, y=2 000 000: off the grid entirely.
+fn origin_is_northing_first(ordered_axes: Option<&Vec<String>>, crs: &str) -> bool {
+    let from_crs = crate::reproj::crs_is_northing_first(crs);
+    if let Some(axes) = ordered_axes {
+        if let Some(first) = axes.first() {
+            let a = first.trim().to_ascii_lowercase();
+            // OGC documents spell it "Y" / "N" / "Lat" depending on the CRS kind.
+            let declared = matches!(
+                a.as_str(),
+                "y" | "n" | "lat" | "north" | "northing" | "latitude"
+            );
+            // ⚠ WARN when the document contradicts the CRS registry, because one spelling really is
+            // ambiguous and silently guessing wrong costs millions of metres. On EPSG:3301
+            // (Estonia), 2180 (Poland) and the German Gauss-Krüger zones the axis literally NAMED
+            // "X" is the NORTHING — so a hand-written `["X","Y"]` there means northing-first, the
+            // opposite of what it means on EPSG:3035 where X genuinely is the easting.
+            //
+            // We still honour the declaration (the document owns its own numbers, and the
+            // registered LAEA document's `["X","Y"]` override case is legitimate), but a mismatch
+            // is far more often a typo than an intention, and it renders as an empty tile behind a
+            // 200 rather than an error. Say so once, at load, where an operator will see it.
+            if from_crs == Some(!declared) {
+                eprintln!(
+                    "WARNING: tile grid for {crs}: document declares orderedAxes[0]={first:?} \
+                     ({}), but {crs} declares {} first. Honouring the document. If tiles come back \
+                     blank behind a 200, this is the first thing to check — on some CRSs the axis \
+                     named \"X\" IS the northing.",
+                    if declared {
+                        "northing-first"
+                    } else {
+                        "easting-first"
+                    },
+                    if from_crs == Some(true) {
+                        "northing"
+                    } else {
+                        "easting"
+                    },
+                );
+            }
+            return declared;
+        }
+    }
+    from_crs.unwrap_or(false)
+}
+
 /// Parse an OGC TileMatrixSet 2.0 JSON document into a `TileMatrixSet`.
 pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
     let doc: OgcTms = serde_json::from_str(json).map_err(|e| format!("OGC TMS JSON: {e}"))?;
@@ -266,7 +334,13 @@ pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
     let crs = normalize_crs(&doc.crs);
     let mpu = meters_per_unit(&crs);
     // OGC origin is shared across levels (single pointOfOrigin per matrix; take level 0's).
-    let origin = doc.tile_matrices[0].point_of_origin;
+    // The pair is (x, y) ONLY for an easting-first CRS — see `origin_is_northing_first`.
+    let raw = doc.tile_matrices[0].point_of_origin;
+    let origin = if origin_is_northing_first(doc.ordered_axes.as_ref(), &crs) {
+        [raw[1], raw[0]]
+    } else {
+        raw
+    };
     let tile_w = doc.tile_matrices[0].tile_width;
     let tile_h = doc.tile_matrices[0].tile_height;
     let levels = doc
@@ -320,7 +394,26 @@ fn to_ogc_crs_uri(crs: &str) -> String {
 /// schema), `cellSize`=resolution, `pointOfOrigin`=`[origin_x, origin_y]` (the ORIGIN IS SHARED across
 /// levels in this model — `from_ogc_json` takes it from level 0 only, so emitting it on every level
 /// is what makes the round-trip exact), `tileWidth`/`tileHeight`/`matrixWidth`/`matrixHeight` verbatim.
+///
+/// ⚠ ALWAYS EMITS `[x, y]`, and DECLARES `orderedAxes: ["X","Y"]` to say so. This is deliberate and
+/// it is not the same choice as the parse side above.
+///
+/// A TMS 2.0 document declares the order of its own coordinates, so `["X","Y"]` + `[x, y]` is fully
+/// spec-legal for ANY CRS — including a northing-first one — and it round-trips exactly through
+/// `from_ogc_json`, which honours the declaration. What it also does is keep every NAIVE client
+/// working: a reader that assumes `[x, y]` and ignores `orderedAxes` still gets the right grid.
+///
+/// That is not hypothetical. Mirroring the official northing-first byte order here (the first cut
+/// of this change) broke two live things at once: `src/xray.html` reads `pointOfOrigin[0]` as x and
+/// never looks at `orderedAxes`, and `/tileMatrixSets/WorldCRS84Quad` flipped from `[-180, 90]` to
+/// `[90, -180]` because EPSG:4326 is latitude-first — a regression on already-shipping demos, for a
+/// fidelity nobody had asked for. Byte-identity with the OGC registry document is a nice property;
+/// not breaking every client that reads us is a requirement.
+///
+/// (`xray.html` was ALSO taught to honour `orderedAxes`, so it can consume a third-party document
+/// that makes the other choice. Belt and braces: this side stays maximally compatible regardless.)
 pub(crate) fn to_ogc_value(tms: &TileMatrixSet) -> serde_json::Value {
+    let origin = [tms.origin_x, tms.origin_y];
     let tile_matrices: Vec<serde_json::Value> = tms
         .levels
         .iter()
@@ -328,7 +421,7 @@ pub(crate) fn to_ogc_value(tms: &TileMatrixSet) -> serde_json::Value {
             serde_json::json!({
                 "id": l.z.to_string(),
                 "cellSize": l.resolution,
-                "pointOfOrigin": [tms.origin_x, tms.origin_y],
+                "pointOfOrigin": origin,
                 "tileWidth": tms.tile_w,
                 "tileHeight": tms.tile_h,
                 "matrixWidth": l.matrix_w,
@@ -339,6 +432,10 @@ pub(crate) fn to_ogc_value(tms: &TileMatrixSet) -> serde_json::Value {
     serde_json::json!({
         "id": tms.id,
         "crs": to_ogc_crs_uri(&tms.crs),
+        // See the doc comment: we always write x,y and say so, rather than mirroring the CRS's
+        // declared order. A reader that honours this gets it right; a reader that ignores it and
+        // assumes x,y ALSO gets it right, which is the whole point.
+        "orderedAxes": ["X", "Y"],
         "tileMatrices": tile_matrices,
     })
 }
@@ -602,5 +699,131 @@ mod tests {
         assert!((tms.levels[26].resolution - 0.5).abs() < 1e-9);
         assert_eq!(tms.levels[26].matrix_w, 3750);
         assert_eq!(tms.levels[26].matrix_h, 2500);
+    }
+}
+
+#[cfg(test)]
+mod axis_order_tests {
+    use super::*;
+
+    /// The real OGC-registered document, trimmed to two levels. Note `orderedAxes: ["Y","X"]` and
+    /// `pointOfOrigin: [5500000, 2000000]` — northing FIRST, which is what EPSG:3035 declares.
+    const LAEA_OFFICIAL: &str = r#"{
+      "id": "EuropeanETRS89_LAEAQuad",
+      "crs": "http://www.opengis.net/def/crs/EPSG/0/3035",
+      "orderedAxes": ["Y", "X"],
+      "tileMatrices": [
+        { "id": "0", "scaleDenominator": 62779017.857142866, "cellSize": 17578.125,
+          "pointOfOrigin": [5500000.0, 2000000.0], "tileWidth": 256, "tileHeight": 256,
+          "matrixWidth": 1, "matrixHeight": 1 },
+        { "id": "1", "scaleDenominator": 31389508.928571433, "cellSize": 8789.0625,
+          "pointOfOrigin": [5500000.0, 2000000.0], "tileWidth": 256, "tileHeight": 256,
+          "matrixWidth": 2, "matrixHeight": 2 }
+      ]
+    }"#;
+
+    /// ⚠ THE BUG THIS FIXES. Read naively as `[x, y]` the origin becomes x=5 500 000,
+    /// y=2 000 000 — 3.5 MILLION METRES off, which serves empty tiles behind a 200 rather than
+    /// failing loudly. `swissLV95` never caught it because EPSG:2056 is easting-first.
+    #[test]
+    fn official_laea_grid_reads_its_northing_first_origin_correctly() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse the OGC document");
+        assert_eq!(g.crs, "EPSG:3035");
+        assert_eq!(g.origin_x, 2_000_000.0, "easting is the SECOND number here");
+        assert_eq!(g.origin_y, 5_500_000.0, "northing is the FIRST number here");
+    }
+
+    /// The origin is the top-left, so the grid must cover a 4 500 km square reaching DOWN and
+    /// RIGHT from it — and Europe (and our EU5 extent) must land inside. This is the assertion
+    /// that would fail on a swapped origin even if someone "fixed" the field order by accident.
+    #[test]
+    fn official_laea_grid_covers_europe() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse");
+        let b = g.tile_bounds(0, 0, 0).expect("z0 tile exists");
+        assert_eq!(b, [2_000_000.0, 1_000_000.0, 6_500_000.0, 5_500_000.0]);
+        // EU5's own extent in EPSG:3035, from ST_Extent at import time.
+        for (x, y) in [(3_155_046.0, 2_026_265.0), (4_673_364.0, 3_550_864.0)] {
+            assert!(
+                x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3],
+                "EU5 corner ({x}, {y}) must fall inside the grid"
+            );
+        }
+    }
+
+    /// An easting-first CRS must be untouched: this is the swissLV95 shape, and every grid parsed
+    /// before this fix assumed it.
+    #[test]
+    fn an_easting_first_grid_is_unchanged() {
+        let doc = r#"{
+          "id": "swissLV95", "crs": "http://www.opengis.net/def/crs/EPSG/0/2056",
+          "tileMatrices": [{ "id": "0", "cellSize": 4000.0,
+            "pointOfOrigin": [2420000.0, 1350000.0], "tileWidth": 256, "tileHeight": 256,
+            "matrixWidth": 1, "matrixHeight": 1 }]
+        }"#;
+        let g = from_ogc_json(doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (2_420_000.0, 1_350_000.0));
+    }
+
+    /// `orderedAxes` absent → fall back to the CRS's declared order, which is what the OGC spec
+    /// says and what `reproj::crs_is_northing_first` answers. Same document as above minus the
+    /// declaration; EPSG:3035 is northing-first, so the result must be identical.
+    #[test]
+    fn a_missing_ordered_axes_falls_back_to_the_crs_declaration() {
+        let doc = LAEA_OFFICIAL.replace("\"orderedAxes\": [\"Y\", \"X\"],", "");
+        // Without this, a reformat of the fixture makes the replace a no-op and this test quietly
+        // degenerates into a copy of `official_laea_grid_reads_...` — still green, testing nothing.
+        assert!(
+            !doc.contains("orderedAxes"),
+            "the fixture changed shape; this test is no longer removing the declaration"
+        );
+        let g = from_ogc_json(&doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (2_000_000.0, 5_500_000.0));
+    }
+
+    /// The document's own declaration WINS over the CRS registry: the numbers are what they are.
+    #[test]
+    fn an_explicit_ordered_axes_overrides_the_crs_declaration() {
+        let doc = LAEA_OFFICIAL.replace("[\"Y\", \"X\"]", "[\"X\", \"Y\"]");
+        let g = from_ogc_json(&doc).expect("parse");
+        assert_eq!((g.origin_x, g.origin_y), (5_500_000.0, 2_000_000.0));
+    }
+
+    /// The published document must stay readable by a NAIVE client — one that takes
+    /// `pointOfOrigin` as `[x, y]` and never looks at `orderedAxes`. That is what `xray.html` did,
+    /// and mirroring the registry's northing-first byte order broke it. `WorldCRS84Quad` is the
+    /// sharpest case: EPSG:4326 is latitude-first, so a CRS-derived emit order would have flipped
+    /// its long-published origin from `[-180, 90]` to `[90, -180]`.
+    #[test]
+    fn published_grids_keep_an_x_y_origin_for_naive_clients() {
+        for id in ["WorldCRS84Quad", "WebMercatorQuad"] {
+            let g = preset(id, 256).expect("preset exists");
+            let v = to_ogc_value(&g);
+            assert_eq!(v["orderedAxes"], serde_json::json!(["X", "Y"]), "{id}");
+            assert_eq!(
+                v["tileMatrices"][0]["pointOfOrigin"],
+                serde_json::json!([g.origin_x, g.origin_y]),
+                "{id}: origin must be published x,y"
+            );
+        }
+    }
+
+    /// ⚠ A round-trip alone CANNOT catch a swapped origin — swapping on both read and write is
+    /// self-consistent. So this asserts the round trip AND the absolute value, plus that we
+    /// publish `orderedAxes` so a client never has to guess.
+    #[test]
+    fn emitted_json_declares_its_axis_order_and_round_trips() {
+        let g = from_ogc_json(LAEA_OFFICIAL).expect("parse");
+        let v = to_ogc_value(&g);
+        // We publish x,y ALWAYS and declare it, even for a northing-first CRS. Spec-legal, and it
+        // is what keeps a naive reader correct — mirroring the registry's byte order instead broke
+        // xray.html and flipped WorldCRS84Quad's published origin. See `to_ogc_value`.
+        assert_eq!(v["orderedAxes"], serde_json::json!(["X", "Y"]));
+        assert_eq!(
+            v["tileMatrices"][0]["pointOfOrigin"],
+            serde_json::json!([2_000_000.0, 5_500_000.0]),
+            "easting first, matching the declaration we just made"
+        );
+        let back = from_ogc_json(&serde_json::to_string(&v).unwrap()).expect("reparse");
+        assert_eq!((back.origin_x, back.origin_y), (2_000_000.0, 5_500_000.0));
     }
 }

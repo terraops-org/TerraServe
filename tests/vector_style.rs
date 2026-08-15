@@ -341,3 +341,68 @@ fn filter_and_or_vacuous_semantics() {
     assert!(Filter::And(vec![]).eval(&p));
     assert!(!Filter::Or(vec![]).eval(&p));
 }
+
+#[test]
+fn referenced_fields_collects_filter_and_label_fields_but_not_literals() {
+    use terraserve::vector::style::{
+        FeatureTypeStyle, LabelPart, PolygonSym, Priority, Rule, TextSym,
+    };
+    let style = Style {
+        feature_type_styles: vec![FeatureTypeStyle {
+            rules: vec![
+                Rule {
+                    // Nested And/Or/IsNull -- pins that collection recurses through the
+                    // combinators, not just the top-level filter.
+                    filter: Some(Filter::And(vec![
+                        Filter::Cmp(Cmp::Eq, "rank".to_string(), "1".to_string()),
+                        Filter::IsNull("dropped".to_string()),
+                    ])),
+                    else_filter: false,
+                    min_scale: None,
+                    max_scale: None,
+                    symbolizers: vec![
+                        Symbolizer::Polygon(PolygonSym {
+                            fill: [0, 0, 0, 255],
+                            stroke: None,
+                            stroke_width: 0.0,
+                        }),
+                        Symbolizer::Text(TextSym {
+                            label: vec![
+                                LabelPart::Literal("N: ".to_string()),
+                                LabelPart::Field("name".to_string()),
+                            ],
+                            priority: Some(Priority::Field("prio".to_string())),
+                            priority_higher_wins: false,
+                            size: 12.0,
+                            color: [0, 0, 0, 255],
+                            halo_color: [255, 255, 255, 255],
+                            halo_radius: 0.0,
+                            offset: 0.0,
+                        }),
+                    ],
+                    title: None,
+                },
+                // A second rule with no filter and no text symbolizer: contributes nothing, and
+                // must not panic or clear what the first rule already found.
+                Rule {
+                    filter: None,
+                    else_filter: true,
+                    min_scale: None,
+                    max_scale: None,
+                    symbolizers: vec![Symbolizer::Polygon(PolygonSym {
+                        fill: [1, 1, 1, 255],
+                        stroke: None,
+                        stroke_width: 0.0,
+                    })],
+                    title: None,
+                },
+            ],
+        }],
+    };
+    let fields = style.referenced_fields();
+    let expected: std::collections::BTreeSet<String> = ["rank", "dropped", "name", "prio"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert_eq!(fields, expected, "the literal label part must not appear");
+}

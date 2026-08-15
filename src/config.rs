@@ -42,9 +42,20 @@ pub struct LayerConfig {
     /// Vector style (point/text/polygon/line Style IR JSON) for a `vector` layer. Required with `vector`.
     #[serde(default)]
     pub vec_style: Option<String>,
-    /// The COG's own CRS. Defaults to the cascais grid.
-    #[serde(default = "default_src_crs")]
-    pub src_crs: String,
+    /// The layer's source CRS, as the operator declared it. `None` = NOT declared.
+    ///
+    /// Deliberately an `Option` with no serde default. It used to be a `String` defaulting to
+    /// `EPSG:3763`, which made "the operator wrote `src_crs: EPSG:3763`" and "the operator wrote
+    /// nothing" the same value. `build_vector_layer` needs to tell those apart -- an unset CRS
+    /// means "adopt the file header's", an explicit one must win over it -- so with no way to
+    /// ask this field, it consulted the GLOBAL `--src-crs` flag instead. Under `--config` that
+    /// flag is normally unset, so EVERY per-layer `src_crs:` was silently discarded in favour of
+    /// the file header. The live Swiss demo (7 vector layers, all `src_crs: EPSG:2056`) was
+    /// masked only because its FlatGeoBuf headers happened to agree.
+    ///
+    /// The COG path applies `default_src_crs()` itself, so its behaviour is unchanged.
+    #[serde(default)]
+    pub src_crs: Option<String>,
     /// On-the-fly band-math expression, e.g. `(B08 - B04) / (B08 + B04)`. When set, the layer
     /// is served as band math + value-domain pseudocolor instead of RGB passthrough.
     #[serde(default)]
@@ -74,6 +85,36 @@ pub struct LayerConfig {
     /// is just a plain path list — one entry per grid, never mixed (design commitment 1). Default empty.
     #[serde(default)]
     pub pmtiles: Vec<String>,
+    /// Pre-baked **PNG** archive path(s) for this layer's WMTS/TMS raster path (read-through; a tile
+    /// not in the matching-grid archive is rendered live). The raster twin of `pmtiles:` above, kept
+    /// separate because the two feed different front-ends with different payload formats — an
+    /// archive listed under the wrong key is refused at startup, naming both formats, rather than
+    /// serving image bytes to an MVT client (or the reverse). Bake with
+    /// `build-pmtiles --tile-format png`. Default empty.
+    #[serde(default)]
+    pub raster_pmtiles: Vec<String>,
+    /// Layer bounds in the source CRS, `[minx, miny, maxx, maxy]`.
+    ///
+    /// REQUIRED for a `postgis://` layer and authoritative there: TerraServe never issues
+    /// `ST_EstimatedExtent` (NULL on a never-ANALYZEd table) or `ST_Extent` (a full-table scan
+    /// that reproduced the 101-second cos2023 startup). Making the config the source of truth
+    /// buys a deterministic startup. A wrong value gives wrong ADVERTISED bounds; queries are
+    /// unaffected.
+    #[serde(default)]
+    pub extent: Option<[f64; 4]>,
+    /// Extra attribute columns to fetch for a `postgis://` layer, on top of the ones the layer's
+    /// `vec_style` references.
+    ///
+    /// A file source (`.gpkg`/`.fgb`) reads whatever the feature carries, but a database query has
+    /// to name its columns up front, and TerraServe derives that list from the SERVER-side style
+    /// (`Style::referenced_fields`). Anything the server-side style cannot see needs naming here —
+    /// above all `--mvt-style`, which is client-side JSON served verbatim and never parsed into a
+    /// `Style`, so its `["get", FIELD]` expressions are invisible to the engine. Without this, such
+    /// a layer ships tiles with no class attribute and the client draws the whole map in its
+    /// fallback colour. Ignored (with no effect) for every non-PostGIS source. Every name is
+    /// checked against the table at startup, so a typo fails loudly instead of blanking the map.
+    #[serde(default)]
+    pub columns: Vec<String>,
 }
 
 /// A config-defined custom TileMatrixSet: explicit CRS + top-left origin + full extent + tile size
@@ -123,7 +164,7 @@ impl GridConfig {
     }
 }
 
-fn default_src_crs() -> String {
+pub(crate) fn default_src_crs() -> String {
     "EPSG:3763".to_string()
 }
 
@@ -303,7 +344,7 @@ layers:
         assert_eq!(cfg.layers.len(), 2);
         let ndvi = &cfg.layers[0];
         assert_eq!(ndvi.name, "ndvi");
-        assert_eq!(ndvi.src_crs, "EPSG:32629");
+        assert_eq!(ndvi.src_crs.as_deref(), Some("EPSG:32629"));
         assert_eq!(ndvi.nodata, Some(-32768.0));
         assert_eq!(
             ndvi.expression.as_deref(),
@@ -314,7 +355,7 @@ layers:
         // second layer defaults: no expression, src_crs from file
         let cas = &cfg.layers[1];
         assert!(cas.expression.is_none());
-        assert_eq!(cas.src_crs, "EPSG:3763");
+        assert_eq!(cas.src_crs.as_deref(), Some("EPSG:3763"));
     }
 
     #[test]
@@ -322,7 +363,9 @@ layers:
         let cfg: Config =
             serde_yaml::from_str("layers:\n  - name: a\n    cog: a.tif\n    style: s.json\n")
                 .unwrap();
-        assert_eq!(cfg.layers[0].src_crs, "EPSG:3763");
+        // An omitted `src_crs:` is now None, NOT the cascais default. The COG path applies
+        // that default itself; the vector path needs the None to mean "use the header".
+        assert_eq!(cfg.layers[0].src_crs, None);
     }
 
     #[test]
@@ -342,5 +385,30 @@ layers:
         let neither = "layers:\n  - name: y\n";
         let c2: Config = serde_yaml::from_str(neither).unwrap();
         assert!(c2.layers[0].validate().is_err());
+    }
+
+    // NOTE: the plan's brief called for `Config::parse_str(...)`, which does not exist on this
+    // struct — every neighbouring test above parses via `serde_yaml::from_str::<Config>(...)`
+    // directly, so these two follow that existing pattern instead of inventing a new helper.
+    #[test]
+    fn extent_parses_as_four_floats() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: p\n    vector: postgis://ts:${P}@db/gis/parcels\n    \
+             vec_style: s.json\n    extent: [2485000.0, 1075000.0, 2834000.0, 1296000.0]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.layers[0].extent,
+            Some([2485000.0, 1075000.0, 2834000.0, 1296000.0])
+        );
+    }
+
+    #[test]
+    fn extent_is_none_when_omitted() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: p\n    vector: a.fgb\n    vec_style: s.json\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.layers[0].extent, None);
     }
 }

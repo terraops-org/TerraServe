@@ -21,6 +21,31 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
+/// PMTiles v3 `tile_type` values (header byte 99). The archive SAYS what it holds, so a reader
+/// (ours or anyone else's) can refuse a payload it cannot draw. `1` = MVT, `2` = PNG; the spec also
+/// defines 3/4/5 (JPEG/WEBP/AVIF) and `0` = unknown, none of which this writer produces.
+pub const TILE_TYPE_MVT: u8 = 1;
+pub const TILE_TYPE_PNG: u8 = 2;
+/// PMTiles v3 `tile_compression` values (header byte 98). MVT tiles are stored gzip'd; PNG is
+/// already a compressed container, so a raster archive stores its tiles verbatim (`None`) — which
+/// is also what every other raster PMTiles archive in the wild does.
+pub const COMPRESSION_NONE: u8 = 1;
+pub const COMPRESSION_GZIP: u8 = 2;
+
+/// Human name for a `tile_type` byte — used only in the "this archive holds X, this path needs Y"
+/// startup error, so an operator reads a format name rather than a magic number.
+pub fn tile_type_name(t: u8) -> &'static str {
+    match t {
+        0 => "unknown",
+        TILE_TYPE_MVT => "MVT",
+        TILE_TYPE_PNG => "PNG",
+        3 => "JPEG",
+        4 => "WEBP",
+        5 => "AVIF",
+        _ => "unrecognised",
+    }
+}
+
 #[derive(Clone)]
 pub struct HeaderFields {
     pub min_zoom: u8,
@@ -44,6 +69,12 @@ pub struct PmtilesWriter {
     entries: Vec<Entry>,
     addressed: u64,
     last_id: Option<u64>,
+    /// What the header will DECLARE this archive holds. Defaults to gzip'd MVT — the only thing
+    /// this writer produced before raster archives existed, so every existing call site (the MVT
+    /// pyramid generator, the write-through overlay compactor) keeps its exact bytes without
+    /// mentioning the format at all. A raster bake opts in with `tile_format`.
+    tile_type: u8,
+    tile_compression: u8,
 }
 
 impl PmtilesWriter {
@@ -60,10 +91,23 @@ impl PmtilesWriter {
             entries: Vec::new(),
             addressed: 0,
             last_id: None,
+            tile_type: TILE_TYPE_MVT,
+            tile_compression: COMPRESSION_GZIP,
         })
     }
 
-    /// Add one already-gzip'd tile at `tile_id`. MUST be called in strictly ascending tile_id order.
+    /// Declare what this archive holds. An archive whose header says MVT while its blobs are PNG
+    /// would break every other PMTiles reader (and ours: `PmtilesReader::get` decompresses
+    /// according to `tile_compression`), so the two travel together and are set in one call.
+    pub fn tile_format(mut self, tile_type: u8, tile_compression: u8) -> Self {
+        self.tile_type = tile_type;
+        self.tile_compression = tile_compression;
+        self
+    }
+
+    /// Add one tile at `tile_id`, ALREADY encoded the way the header will declare (gzip'd for the
+    /// default MVT format, verbatim PNG under `tile_format(TILE_TYPE_PNG, COMPRESSION_NONE)`).
+    /// MUST be called in strictly ascending tile_id order.
     pub fn add(&mut self, tile_id: u64, gzipped_tile: Vec<u8>) -> PmResult<()> {
         if let Some(prev) = self.last_id {
             if tile_id <= prev {
@@ -131,8 +175,8 @@ impl PmtilesWriter {
             num_tile_contents: self.dedup.len() as u64,
             clustered: 1,
             internal_compression: 2,
-            tile_compression: 2,
-            tile_type: 1,
+            tile_compression: self.tile_compression,
+            tile_type: self.tile_type,
             min_zoom: hf.min_zoom,
             max_zoom: hf.max_zoom,
             min_lon_e7: hf.bounds_e7[0],
@@ -240,6 +284,89 @@ mod tests {
         assert_eq!(r.get(1, 0, 1).unwrap(), Some(b"AAAA".to_vec())); // covered by the run
         assert_eq!(r.get(1, 1, 1).unwrap(), Some(b"BBBB".to_vec()));
         std::fs::remove_file(&out).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A raster archive must DECLARE PNG in its header (`tile_type` 2, `tile_compression` 1) and
+    /// hand the stored bytes back verbatim. Both halves matter: an archive that says MVT while
+    /// holding PNG breaks every other PMTiles reader, and a PNG re-gzip'd on the way in would come
+    /// back mangled through `get`, which decompresses by what the header says.
+    #[test]
+    fn png_archive_declares_png_and_round_trips_bytes_verbatim() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ts_pmt_png_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("png_out.pmtiles");
+        // Not a real image — the writer/reader never parse the payload; the magic bytes are what a
+        // client keys on, and what the serving tests assert.
+        let png = b"\x89PNG\r\n\x1a\ntile-bytes".to_vec();
+        let mut w = PmtilesWriter::new(&tmp)
+            .unwrap()
+            .tile_format(TILE_TYPE_PNG, COMPRESSION_NONE);
+        w.add(zxy_to_tileid(1, 0, 0), png.clone()).unwrap();
+        let hf = HeaderFields {
+            min_zoom: 1,
+            max_zoom: 1,
+            bounds_e7: [0, 0, 0, 0],
+            center: (1, 0, 0),
+        };
+        w.finish(hf, r#"{"format":"png"}"#, &out).unwrap();
+
+        // The header on disk, read with the same codec the writer used.
+        let mut head = [0u8; 127];
+        {
+            let mut f = File::open(&out).unwrap();
+            f.read_exact(&mut head).unwrap();
+        }
+        let header = crate::vector::pmtiles::codec::read_header(&head).unwrap();
+        assert_eq!(header.tile_type, TILE_TYPE_PNG, "header must declare PNG");
+        assert_eq!(header.tile_compression, COMPRESSION_NONE);
+
+        let r = PmtilesReader::open(&out).unwrap();
+        assert_eq!(r.tile_type(), TILE_TYPE_PNG);
+        let got = r.get(1, 0, 0).unwrap().expect("tile present");
+        assert_eq!(&got[..8], b"\x89PNG\r\n\x1a\n", "PNG magic must survive");
+        assert_eq!(got, png, "stored bytes must come back verbatim");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The loud refusal: a raster path handed an MVT archive (and the reverse) must fail naming the
+    /// FILE and BOTH formats, not serve the bytes and hope.
+    #[test]
+    fn require_tile_type_names_the_file_and_both_formats() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ts_pmt_mismatch_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("mvt_out.pmtiles");
+        let mut w = PmtilesWriter::new(&tmp).unwrap(); // default = MVT + gzip
+        w.add(zxy_to_tileid(1, 0, 0), gzip(b"mvt")).unwrap();
+        let hf = HeaderFields {
+            min_zoom: 1,
+            max_zoom: 1,
+            bounds_e7: [0, 0, 0, 0],
+            center: (1, 0, 0),
+        };
+        w.finish(hf, r#"{"vector_layers":[]}"#, &out).unwrap();
+
+        let r = PmtilesReader::open(&out).unwrap();
+        let path = out.to_string_lossy().to_string();
+        r.require_tile_type(TILE_TYPE_MVT, &path)
+            .expect("an MVT archive is fine on the MVT path");
+        let err = r
+            .require_tile_type(TILE_TYPE_PNG, &path)
+            .expect_err("an MVT archive must be REFUSED on the raster path");
+        assert!(err.contains(&path), "error must name the file: {err}");
+        assert!(err.contains("MVT"), "error must name what it found: {err}");
+        assert!(
+            err.contains("PNG"),
+            "error must name what was needed: {err}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
