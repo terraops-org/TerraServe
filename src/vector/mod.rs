@@ -27,4 +27,5 @@ pub mod sld_lower;
 pub mod source;
 pub mod style;
 pub mod topology;
+pub mod uri;
 pub mod wkb;

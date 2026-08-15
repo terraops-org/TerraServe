@@ -426,11 +426,12 @@ pub fn get_feature_info(
 }
 
 /// XML-escape a dynamic value for interpolation into a document (`&` first).
+/// Thin alias for the shared escaper (`crate::xml::escape`), kept so this module's call
+/// sites (and `wms.rs`, which reaches in here in two places) read unchanged. It used to
+/// cover `& < > "` while `wms::xml_escape` covered only `& < >`; having two that differed
+/// is what let the weaker one end up building an attribute value. See `crate::xml`.
 pub fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    crate::xml::escape(s)
 }
 
 /// An `ows:ExceptionReport` (OWS 1.1). `version="1.1.0"`.
@@ -446,11 +447,13 @@ pub fn exception_xml(code: &str, text: &str, locator: Option<&str>) -> String {
 }
 
 /// Derive `(kvp_base, rest_base)` from the advertised WMS base (`…/wms` → `…/wmts`, `…/wmts/1.0.0`).
-pub fn bases(base_url: &str) -> (String, String) {
-    let origin = base_url
-        .strip_suffix("/wms")
-        .unwrap_or(base_url)
-        .trim_end_matches('/');
+/// The WMTS KVP and RESTful bases, composed on an ALREADY-DERIVED origin.
+///
+/// This used to take `base_url` and derive the origin itself, with logic byte-identical to
+/// `tms_http::tms_root`'s copy, which is why WMTS could not honour `X-Forwarded-Proto`: it
+/// never saw the request. Derivation now lives in exactly one place,
+/// `ServeState::advertised_origin`, and this only appends the paths.
+pub fn bases(origin: &str) -> (String, String) {
     (format!("{origin}/wmts"), format!("{origin}/wmts/1.0.0"))
 }
 

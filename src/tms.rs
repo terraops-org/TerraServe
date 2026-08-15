@@ -528,7 +528,7 @@ mod tests {
         assert_eq!(tms.levels.len(), 2);
         assert_eq!(tms.levels[0].z, 0);
         assert!((tms.levels[0].resolution - 4000.0).abs() < 1e-6); // cellSize path
-        // scaleDenominator 7142857.14 * 0.00028 / meters_per_unit(EPSG:2056=1.0) = 2000.0
+                                                                   // scaleDenominator 7142857.14 * 0.00028 / meters_per_unit(EPSG:2056=1.0) = 2000.0
         assert!((tms.levels[1].resolution - 2000.0).abs() < 1e-3);
         assert_eq!(tms.origin_x, 2420000.0);
         assert_eq!(tms.origin_y, 1350000.0);

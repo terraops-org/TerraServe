@@ -66,13 +66,22 @@ fn tilemap_xml_has_bbox_bottom_left_origin_and_tilesets() {
     assert!(xml.contains("href=\"http://h/tms/1.0.0/basemap@WebMercatorQuad/0\""));
 }
 
+/// `tms_root` now COMPOSES on an already-derived origin rather than deriving one itself.
+/// Stripping `/wms` and the trailing slash moved to `ServeState::advertised_origin`, which is
+/// the single derivation shared by WMS, WMTS, TMS and MVT; keeping a private copy here is what
+/// left TMS unable to honour `X-Forwarded-Proto`. The derivation is tested in
+/// `server::advertised_origin_tests`; this only pins the path composition.
 #[test]
-fn tms_root_derives_from_wms_base() {
+fn tms_root_appends_the_service_path_to_an_origin() {
     assert_eq!(
-        tms_http::tms_root("http://localhost:8080/wms"),
+        tms_http::tms_root("http://localhost:8080"),
         "http://localhost:8080/tms/1.0.0"
     );
-    assert_eq!(tms_http::tms_root("http://h/"), "http://h/tms/1.0.0");
+    // A proxied origin carrying a path prefix composes the same way.
+    assert_eq!(
+        tms_http::tms_root("https://terraserve.io/demo/swiss"),
+        "https://terraserve.io/demo/swiss/tms/1.0.0"
+    );
 }
 
 /// Task 2: `GET /tileMatrixSets/{id}` (`tms_http::tile_matrix_set_doc`, the handler's pure-function

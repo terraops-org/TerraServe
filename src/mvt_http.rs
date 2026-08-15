@@ -164,12 +164,13 @@ pub fn tilejson_doc(
     layer: &str,
     tms_id: &str,
     request_host: Option<&str>,
+    forwarded_proto: Option<&str>,
 ) -> Result<String, (u16, String)> {
     let (l, v) = resolve_vector(state, layer)?;
     let grid = resolve_grid(l, tms_id)?;
     let minzoom = grid.levels.iter().map(|lv| lv.z).min().unwrap_or(0);
     let maxzoom = grid.levels.iter().map(|lv| lv.z).max().unwrap_or(0);
-    let origin = advertised_origin(state, request_host);
+    let origin = advertised_origin(state, request_host, forwarded_proto);
     let tile_url = format!("{origin}/mvt/{layer}/{tms_id}/{{z}}/{{x}}/{{y}}.pbf");
 
     // Attribute schema is precomputed once at layer load (see `feature_field_schema`); reading it
@@ -217,16 +218,14 @@ pub fn pmtiles_metadata_json(layer: &Layer, grid_id: Option<&str>) -> String {
 /// `Host` header (the address the client actually reached us on) so URLs are reachable even when the
 /// server binds `0.0.0.0` (whose literal address is not routable from another machine). Falls back
 /// to the configured `base_url` (e.g. an explicit `--public-url`) when there's no Host header.
-fn advertised_origin(state: &ServeState, request_host: Option<&str>) -> String {
-    match request_host {
-        Some(h) if !h.is_empty() => format!("http://{h}"),
-        _ => state
-            .base_url
-            .strip_suffix("/wms")
-            .unwrap_or(&state.base_url)
-            .trim_end_matches('/')
-            .to_string(),
-    }
+/// Thin delegate to the single shared derivation, `ServeState::advertised_origin`. Kept as a
+/// named function because this module's call sites and its regression tests read through it.
+fn advertised_origin(
+    state: &ServeState,
+    request_host: Option<&str>,
+    forwarded_proto: Option<&str>,
+) -> String {
+    state.advertised_origin(request_host, forwarded_proto)
 }
 
 /// A **MapLibre/Mapbox GL Style JSON** (`version: 8`) for `{layer}` — the "one URL" a client
@@ -315,10 +314,11 @@ pub fn style_json(
     layer: &str,
     grid_id: &str,
     request_host: Option<&str>,
+    forwarded_proto: Option<&str>,
 ) -> Result<String, (u16, String)> {
     // Validate: the layer must exist and be a vector layer (MVT/style only applies to vectors).
     let (_, v) = resolve_vector(state, layer)?;
-    let origin = advertised_origin(state, request_host);
+    let origin = advertised_origin(state, request_host, forwarded_proto);
     let source_url = format!("{origin}/mvt/{layer}/{grid_id}.json");
 
     // An operator-supplied `--mvt-style` (a JSON object `{ "layers": [...], "metadata": {...} }`,
@@ -1045,5 +1045,93 @@ mod tests {
         assert_ne!(got_a, got_b);
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---- advertised origin (TileJSON / style.json `sources.*.url`) ----------------------------
+    //
+    // Regression tests for a LIVE production bug, reproduced 2026-08-02 against terraserve.io:
+    //
+    //   GET https://terraserve.io/demo/vida/mvt/vida/style.json
+    //     -> "url": "http://terraserve.io/mvt/vida/WebMercatorQuad.json"   (404, and mixed-content
+    //                                                                       blocked before that)
+    //   correct:  https://terraserve.io/demo/vida/mvt/vida/WebMercatorQuad.json   (200)
+    //
+    // `advertised_origin` preferred the Host header unconditionally, which (a) hardcoded the
+    // `http://` scheme even behind TLS-terminating Traefik and (b) rebuilt the origin from the
+    // host alone, discarding the `/demo/vida` path prefix. Because HTTP/1.1 always sends `Host`,
+    // the configured `--public-url` branch was effectively dead code.
+
+    fn state_with(public_url: Option<&str>, base_url: &str) -> crate::server::ServeState {
+        let mut st = crate::server::ServeState::new(vec![], base_url.into(), 1);
+        st.public_url = public_url.map(|s| s.to_string());
+        st
+    }
+
+    /// The bug itself: an explicitly configured `--public-url` is authoritative. It is the only
+    /// source that carries BOTH the public scheme and the path prefix, neither of which any
+    /// request header reliably provides, so it must win over the Host header.
+    #[test]
+    fn advertised_origin_prefers_explicit_public_url_over_host_header() {
+        let st = state_with(
+            Some("https://terraserve.io/demo/vida/wms"),
+            "https://terraserve.io/demo/vida/wms",
+        );
+        let got = super::advertised_origin(&st, Some("terraserve.io"), None);
+        assert_eq!(
+            got, "https://terraserve.io/demo/vida",
+            "configured --public-url must win over the Host header (scheme AND path prefix)"
+        );
+    }
+
+    /// Traefik terminates TLS, so the origin scheme must come from `X-Forwarded-Proto`, never be
+    /// assumed. Applies when there is no `--public-url` to be authoritative.
+    #[test]
+    fn advertised_origin_honours_forwarded_proto_when_no_public_url() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        let got = super::advertised_origin(&st, Some("example.org"), Some("https"));
+        assert_eq!(got, "https://example.org");
+    }
+
+    /// A proxy may send a comma-separated `X-Forwarded-Proto` chain; the FIRST entry is the
+    /// original client-facing scheme.
+    #[test]
+    fn advertised_origin_takes_first_forwarded_proto_of_a_chain() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        let got = super::advertised_origin(&st, Some("example.org"), Some("https, http"));
+        assert_eq!(got, "https://example.org");
+    }
+
+    /// Unchanged behaviour for a plain local run: no `--public-url`, no proxy headers -> derive
+    /// from the Host header over http. This is what keeps `serve` working with no configuration.
+    #[test]
+    fn advertised_origin_falls_back_to_http_host_without_public_url_or_proto() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        let got = super::advertised_origin(&st, Some("localhost:8080"), None);
+        assert_eq!(got, "http://localhost:8080");
+    }
+
+    /// With neither a `--public-url` nor a Host header, fall back to the bind-address base_url,
+    /// with the `/wms` suffix trimmed (the origin is the mount point, not the WMS endpoint).
+    #[test]
+    fn advertised_origin_falls_back_to_base_url_without_host() {
+        let st = state_with(None, "http://127.0.0.1:8080/wms");
+        let got = super::advertised_origin(&st, None, None);
+        assert_eq!(got, "http://127.0.0.1:8080");
+    }
+
+    /// A `--public-url` given WITHOUT the conventional `/wms` suffix must not be mangled, and a
+    /// trailing slash must not produce a doubled separator in the composed tile URL.
+    #[test]
+    fn advertised_origin_normalises_public_url_without_wms_suffix_or_trailing_slash() {
+        let a = state_with(Some("https://maps.example.org/ts/"), "unused");
+        assert_eq!(
+            super::advertised_origin(&a, Some("maps.example.org"), None),
+            "https://maps.example.org/ts"
+        );
+        let b = state_with(Some("https://maps.example.org/ts"), "unused");
+        assert_eq!(
+            super::advertised_origin(&b, Some("maps.example.org"), None),
+            "https://maps.example.org/ts"
+        );
     }
 }

@@ -64,7 +64,7 @@ FROM debian:trixie-slim AS runtime
 # — it just appears as an orphan under the org.
 LABEL org.opencontainers.image.source="https://github.com/terraops-org/TerraServe" \
       org.opencontainers.image.description="Clean-room raster + vector map tile server in Rust — WMS/WMTS/TMS/MVT, no GDAL." \
-      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.licenses="MPL-2.0" \
       org.opencontainers.image.title="TerraServe"
 
 # Runtime deps:
