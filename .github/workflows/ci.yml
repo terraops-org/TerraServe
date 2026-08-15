@@ -109,7 +109,7 @@ jobs:
             || { echo "FAIL: GetCapabilities"; exit 1; }
           echo "ok GetCapabilities"
 
-      - name: Viewers are served (regression: /xray 404'd on any layer not named "vector")
+      - name: 'Viewers are served (regression: /xray 404''d on any layer not named "vector")'
         run: |
           for path in / /xray; do
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
@@ -117,7 +117,7 @@ jobs:
             echo "ok $path"
           done
 
-      - name: Advertised tile URLs honour --public-url (regression: shipped http:// + no prefix)
+      - name: 'Advertised tile URLs honour --public-url (regression: shipped http:// + no prefix)'
         run: |
           EXPECT_PREFIX="https://example.org/demo/air"
 
