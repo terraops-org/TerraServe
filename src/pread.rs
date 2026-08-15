@@ -66,11 +66,17 @@ mod tests {
     use super::read_exact_at;
     use std::io::Write;
 
+    /// ⚠ The name must be unique PER CALL, not per content. Naming it after `bytes.len()` meant
+    /// the two tests that both use `b"abc"` shared one path, ran in parallel, and deleted the file
+    /// from under each other - a race that passed locally on timing luck and failed in CI with a
+    /// bare `NotFound`. An atomic counter is what the GPKG windowed tests already use.
     fn temp_file(bytes: &[u8]) -> (std::path::PathBuf, std::fs::File) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
             "ts_pread_{}_{}.bin",
             std::process::id(),
-            bytes.len()
+            N.fetch_add(1, Ordering::Relaxed)
         ));
         let mut w = std::fs::File::create(&p).unwrap();
         w.write_all(bytes).unwrap();
