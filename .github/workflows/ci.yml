@@ -104,25 +104,24 @@ jobs:
           activate-environment: ts
           auto-activate-base: false
 
-      - name: Install PROJ and pkg-config from conda-forge
+      # `zlib` is NOT redundant with what proj pulls in. conda-forge SPLITS it: `libzlib` is the
+      # DLL that everything depends on transitively, `zlib` is the headers plus zlib.pc. proj.pc
+      # declares `Requires.private: sqlite3, libtiff-4, libcurl`, and pkg-config resolves
+      # Requires.private for --cflags, so the probe walks proj -> libcurl -> libssh2 -> zlib and
+      # dies if only libzlib is present. That is what killed the previous attempt, NOT the
+      # PKG_CONFIG_PATH problem below - fixing only the path would still have failed here.
+      - name: Install PROJ and friends from conda-forge
         shell: bash -el {0}
-        run: |
-          conda install -y -c conda-forge proj pkg-config sqlite
-          echo "PKG_CONFIG_PATH=$CONDA_PREFIX/Library/lib/pkgconfig" >> $GITHUB_ENV
-          echo "PROJ_DIR=$CONDA_PREFIX/Library" >> $GITHUB_ENV
-          echo "$CONDA_PREFIX/Library/bin" >> $GITHUB_PATH
+        run: conda install -y -c conda-forge proj pkg-config sqlite zlib libtiff
 
-      # bindgen (via proj-sys and libsqlite3-sys) needs libclang.
-      #
-      # ⚠ `bin`, not `lib`. On Windows clang-sys looks for libclang.DLL, and DLLs live in bin/;
-      # lib/ holds the import libraries. Pointing at lib/ finds nothing and clang-sys falls back
-      # to whatever libclang is on PATH -- which is exactly the "unsupported version" failure the
-      # reporter of #9 hit.
       - uses: KyleMayes/install-llvm-action@v2
         with:
           version: "17.0"
           directory: ${{ runner.temp }}/llvm
 
+      # ⚠ `bin`, not `lib`: on Windows clang-sys wants libclang.DLL, and DLLs live in bin/.
+      # Pointing at lib/ finds nothing and clang-sys silently falls back to whatever libclang is
+      # on PATH - the "unsupported version" error the reporter of #9 hit.
       - name: Point bindgen at that LLVM
         shell: bash
         run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/bin" >> $GITHUB_ENV
@@ -131,11 +130,42 @@ jobs:
         with:
           key: windows-msvc
 
-      # No `bundled-proj`: we link the conda-forge PROJ installed above, the same way a Windows
-      # user would.
+      # TWO INDEPENDENT ROUTES TO GREEN, because the previous four attempts each fixed one layer
+      # and discovered the next. Either the pkg-config probe succeeds, or the source-build
+      # fallback does; both are set up here so one run tests both.
+      #
+      # ⚠ PKG_CONFIG_PATH IS EXPORTED INSIDE THIS BLOCK, not via `env:` or $GITHUB_ENV. Both of
+      # those lose: `bash -el` is a LOGIN shell, and Git-for-Windows' /etc/profile unconditionally
+      # reassigns PKG_CONFIG_PATH to the MINGW64 defaults. That is precisely why the previous run
+      # showed `C:\Program Files\Git\mingw64\lib\pkgconfig` instead of the conda prefix.
+      #
+      # ROUTE A - make the probe work:
+      #   PKG_CONFIG        pin WHICH pkg-config runs (the crate honours it), removing PATH-order
+      #                     ambiguity between conda's pkgconf and Git's.
+      #   ..._MAXIMUM_TRAVERSE_DEPTH=1  make success depend on proj.pc ALONE. Requires.private
+      #                     chains reach zstd/openssl/etc; the log can only ever show the FIRST
+      #                     missing one, so bounding the walk beats guessing the rest one CI round
+      #                     at a time.
+      # ROUTE B - make the fallback work, since proj-sys builds PROJ from source whenever the
+      # probe fails, with or without `bundled-proj` (build.rs: `.or_else(|| build_from_source())`):
+      #   CMAKE_POLICY_VERSION_MINIMUM  CMake 4 removed compatibility with PROJ's pre-3.5 minimum.
+      #                     This was in attempt 2, worked, and I dropped it in attempt 4's rewrite.
+      #   CMAKE_PREFIX_PATH lets PROJ's CMake find conda's SQLite (sqlite3.exe is on PATH already).
+      #   LIB               essential: build.rs emits `cargo:rustc-link-lib=dylib=sqlite3` with NO
+      #                     link-search path, so without this the fallback fails at LINK time even
+      #                     after CMake succeeds.
       - name: Build
         shell: bash -el {0}
-        run: cargo build --release
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          export PKG_CONFIG_PATH="$CONDA_PREFIX/Library/lib/pkgconfig"
+          export PKG_CONFIG="$CONDA_PREFIX/Library/bin/pkg-config.exe"
+          export PKG_CONFIG_MAXIMUM_TRAVERSE_DEPTH=1
+          export CMAKE_PREFIX_PATH="$CONDA_PREFIX/Library"
+          export LIB="$(cygpath -w "$CONDA_PREFIX/Library/lib");$LIB"
+          echo "probe: $($PKG_CONFIG --modversion proj || echo 'FAILED - falling back to source build')"
+          cargo build --release
 
       # Prove it RUNS, not just links: `--help` exercises clap and the whole startup path
       # without needing fixtures, a database, or a network.
