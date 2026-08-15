@@ -444,6 +444,12 @@ fn get_map_vector(
     // Reads through the `VectorSource` seam (windowed-seam refactor) — LoadAll today, so
     // byte-identical to the old `render_vector(src.as_ref(), ...)` call.
     let vs = vec.source_for_scale(scale);
+    // Min-feature-size gate from the same scale denominator (see `server::VectorLayer::render_tile`,
+    // which does the identical derivation for a tile). `0.0` unless `--mvt-min-feature-px` is set.
+    // A GetMap has no tile `z`, which is exactly why the threshold is derived from the request's
+    // resolution: a GetMap and a tile covering the same ground at the same pixel size thin alike.
+    let min_area_src =
+        crate::vector::mvt::min_area_src_for_scale(scale, vec.area_scale, vec.min_feature_px);
     let mut rgba = crate::vector::render::render_vector_from(
         &vs,
         &vec.style,
@@ -453,6 +459,10 @@ fn get_map_vector(
         f.width,
         f.height,
         &vec.shaper,
+        // Labels ON: GetMap is one image over the whole viewport, so placement sees everything it
+        // needs to. The tile paths pass `false` (see `server::VectorLayer::render_tile`).
+        true,
+        min_area_src,
     )
     .map_err(WmsError::plain)?;
     // WMS TRANSPARENT (default FALSE) => flatten onto BGCOLOR (default white); TRUE keeps alpha.
@@ -703,10 +713,14 @@ fn get_feature_info_vector(
     // transform is unavailable (fail-open, matches the pre-filter's own fallback). GFI intentionally
     // ignores LOD (reads `vec.source` directly, not `source_for_zoom`/`source_for_scale`) — when the
     // layer has LOD, `vec.source` IS the finest full-detail pool (see `build_vector_layer`), so this
-    // stays the lossless GFI source exactly as before this migration.
+    // stays the lossless GFI source exactly as before this migration. It likewise ignores the
+    // min-feature-size gate that GetMap now applies: the gate decides what is worth DRAWING, and
+    // clicking a sub-pixel parcel to read its attributes is legitimate at any zoom.
     let gfi_bbox = crate::vector::geom::source_filter_bbox(&f.render_crs, &layer.src_crs, f.bbox)
         .unwrap_or_else(|| vec.source.full_extent());
-    let gfi_batch = vec.source.features_in(gfi_bbox);
+    // A failed read here becomes a ServiceException, not "no features found at this point" — the
+    // two answers look identical to a user clicking the map, and only one of them is true.
+    let gfi_batch = vec.source.features_in(gfi_bbox).map_err(WmsError::plain)?;
     let hits = collect_gfi_hits(
         gfi_batch.as_slice().iter(),
         &proj,
@@ -955,10 +969,25 @@ fn parse_map_frame(
         return Err(WmsError::plain("invalid BBOX: values must be finite"));
     }
 
-    // Axis order: WMS 1.3.0 uses the CRS-declared order. For EPSG:4326 that is lat,lon,
-    // so BBOX = miny,minx,maxy,maxx and we must swap back to minx,miny,maxx,maxy.
+    // Axis order: WMS 1.3.0 orders a BBOX by the CRS's OWN declared axis order, so a
+    // northing-first CRS sends miny,minx,maxy,maxx and we must swap back.
+    //
+    // This used to test `crs == "EPSG:4326"`. That is one member of a class, not the class.
+    // EPSG:3301 (Estonia) is a PROJECTED CRS declaring `AXIS["northing (X)",north]` first, and
+    // the hardcoded check missed it: QGIS sent a correctly-ordered BBOX, we read it transposed,
+    // the envelope landed nowhere near the data, and every request returned a BLANK 200. Found
+    // 2026-08-06 against real Estonian OSM data. EPSG:2180 (Poland) and EPSG:3035 (ETRS89-LAEA)
+    // are the same shape.
+    //
+    // So ask PROJ (`reproj::crs_is_northing_first`) instead of keeping a list that is wrong the
+    // moment somebody serves a CRS nobody thought of. `None` (unresolvable CRS) keeps the bytes
+    // as they arrived — the right default, since easting-first is the majority and an
+    // unresolvable CRS fails later anyway with a clearer message.
     let crs_up = crs_raw.trim().to_ascii_uppercase();
-    let bbox = if is_130 && crs_up == "EPSG:4326" {
+    let northing_first = is_130
+        && crs_up != "CRS:84"  // CRS:84 is explicitly lon,lat by definition, unlike EPSG:4326
+        && crate::reproj::crs_is_northing_first(&crs_up).unwrap_or(false);
+    let bbox = if northing_first {
         [vals[1], vals[0], vals[3], vals[2]]
     } else {
         [vals[0], vals[1], vals[2], vals[3]]
@@ -1991,6 +2020,7 @@ mod tests {
             grids: Vec::new(),
             vector: None,
             pmtiles: std::collections::BTreeMap::new(),
+            raster_pmtiles: std::collections::BTreeMap::new(),
             overlay: std::collections::BTreeMap::new(),
         }
     }

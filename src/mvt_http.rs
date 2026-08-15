@@ -87,7 +87,8 @@ pub fn render_mvt_tile(
         }
         let opts = MvtOptimizations::for_layer(state, v);
         let vs = v.source_for_zoom(z);
-        let batch = features_for_tile(&vs, &grid, z, x, y, &l.src_crs);
+        let batch =
+            features_for_tile(&vs, &grid, z, x, y, &l.src_crs, &opts).map_err(read_failed)?;
         let live = encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts);
         if !live.is_empty() && !ov.is_compacting() {
             let id = crate::vector::pmtiles::zxy_to_tileid(z, x, y);
@@ -118,10 +119,18 @@ pub fn render_mvt_tile(
     // the source CRS (`features_for_tile`) BEFORE reading, so a future windowed source's window is
     // correct — a harmless no-op for `LoadAll` (encode_tile_opt still runs its own candidate filter
     // over whatever slice it's handed).
-    let batch = features_for_tile(&vs, &grid, z, x, y, &l.src_crs);
+    let batch = features_for_tile(&vs, &grid, z, x, y, &l.src_crs, &opts).map_err(read_failed)?;
     Ok(cached_or_encode(state, &l.name, tms_id, z, x, y, || {
         encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts)
     }))
+}
+
+/// A failed source READ is a 500, never an empty tile. Encoding whatever came back from a broken
+/// query would emit a valid, empty MVT with a 200 — the silent-blank failure this whole error
+/// channel exists to remove. Rendering nothing is a legitimate answer only when the window really
+/// is empty, which is `Ok(vec![])`, not `Err`.
+fn read_failed(e: String) -> (u16, String) {
+    (500, e)
 }
 
 /// Build a bounded byte-cache of `String → Arc<Vec<u8>>` sized in **MiB** (`--mvt-cache` /
@@ -436,11 +445,52 @@ pub fn feature_field_schema_vs(
     source: &crate::vector::source::VectorSource,
 ) -> BTreeMap<String, String> {
     match source {
-        crate::vector::source::VectorSource::LoadAll(_) => {
-            let batch = source.features_in(source.full_extent());
-            feature_field_schema_slice(batch.as_slice())
+        // Read the slice straight off the load-all source: it is already parsed, so there is no
+        // read to fail and therefore no `Result` worth unwrapping here.
+        crate::vector::source::VectorSource::LoadAll(s) => {
+            feature_field_schema_slice(crate::vector::source::FeatureSource::features(s))
         }
         crate::vector::source::VectorSource::Windowed(w) => w.field_schema(),
+    }
+}
+
+/// Every feature property a MapLibre/Mapbox `--mvt-style` reads, i.e. the `FIELD` of every
+/// `["get", "FIELD"]` expression anywhere in the document.
+///
+/// `--mvt-style` is pass-through JSON: it is served to the client and never parsed into a
+/// [`crate::vector::style::Style`], so `Style::referenced_fields` cannot see any of this. That is
+/// harmless for a file source, which carries every field regardless, and quietly fatal for a
+/// `postgis://` layer, whose `SELECT` list is derived from `referenced_fields` — the class column
+/// is then never fetched and the client styles the whole map with its fallback paint, 200 OK
+/// throughout. This is deliberately a shallow syntactic scan, not a style-spec parser: it powers a
+/// startup WARNING, so over-reporting a field that is really there costs a line of text, while
+/// under-reporting costs a blank map.
+pub fn mvt_style_fields(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    collect_get_fields(v, &mut out);
+    out
+}
+
+fn collect_get_fields(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        serde_json::Value::Array(items) => {
+            // `["get", "name"]` — and only that shape. The 3-argument form `["get", k, obj]` reads
+            // a property of some other object, not of the feature, so it is deliberately skipped.
+            if items.len() == 2 {
+                if let (Some("get"), Some(f)) = (items[0].as_str(), items[1].as_str()) {
+                    out.insert(f.to_string());
+                }
+            }
+            for it in items {
+                collect_get_fields(it, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values() {
+                collect_get_fields(val, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -463,7 +513,45 @@ fn feature_field_schema_slice(
 
 #[cfg(test)]
 mod tests {
+    use super::mvt_style_fields;
     use super::sld_class_fill_layer;
+
+    #[test]
+    fn mvt_style_fields_finds_every_get_expression_however_deeply_nested() {
+        // Shaped like a real MapLibre style: `get` appears inside a paint expression, inside a
+        // filter, and nested several arrays deep in a `match`. Missing any of these on a postgis://
+        // layer means that column is never SELECTed and the client paints its fallback colour.
+        let v: serde_json::Value = serde_json::from_str(
+            r##"{
+                 "layers": [
+                   { "id": "a",
+                     "filter": ["all", ["==", ["get", "kind"], "road"]],
+                     "paint": { "fill-color":
+                       ["match", ["get", "COS23_n4_C"], "1.1.1.1", "#aaa", "#bbb"] } },
+                   { "id": "b", "layout": { "text-field": ["get", "name"] } }
+                 ] }"##,
+        )
+        .unwrap();
+        let got = mvt_style_fields(&v);
+        assert!(got.contains("kind"), "{got:?}");
+        assert!(got.contains("COS23_n4_C"), "{got:?}");
+        assert!(got.contains("name"), "{got:?}");
+        assert_eq!(got.len(), 3, "nothing else should be reported: {got:?}");
+    }
+
+    #[test]
+    fn mvt_style_fields_ignores_the_three_argument_get_and_non_string_keys() {
+        // `["get", k, obj]` reads a property of ANOTHER object, not of the feature, so requesting
+        // that column would be wrong. A non-string key is not a column name either.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"[["get","k",{"k":1}], ["get", 3], ["get"]]"#).unwrap();
+        assert!(
+            mvt_style_fields(&v).is_empty(),
+            "{:?}",
+            mvt_style_fields(&v)
+        );
+    }
+
     use crate::vector::style::{
         Cmp, FeatureTypeStyle, Filter, PolygonSym, Rule, Style, Symbolizer,
     };
@@ -566,12 +654,14 @@ mod tests {
             vector: Some(VectorLayer {
                 fields: super::feature_field_schema(src.as_ref()),
                 area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                min_feature_px: 0.0, // size gate off (the default)
                 source: VectorSource::LoadAll(src),
                 style,
                 shaper,
                 lod: None,
             }),
             pmtiles: std::collections::BTreeMap::new(),
+            raster_pmtiles: std::collections::BTreeMap::new(),
             overlay: std::collections::BTreeMap::new(),
         };
 
@@ -640,12 +730,14 @@ mod tests {
             vector: Some(VectorLayer {
                 fields: super::feature_field_schema(src.as_ref()),
                 area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                min_feature_px: 0.0, // size gate off (the default)
                 source: VectorSource::LoadAll(src),
                 style,
                 shaper,
                 lod: None,
             }),
             pmtiles: std::collections::BTreeMap::new(),
+            raster_pmtiles: std::collections::BTreeMap::new(),
             overlay: std::collections::BTreeMap::new(),
         };
 
@@ -902,12 +994,14 @@ mod tests {
             vector: Some(VectorLayer {
                 fields: super::feature_field_schema(src.as_ref()),
                 area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                min_feature_px: 0.0, // size gate off (the default)
                 source: VectorSource::LoadAll(src),
                 style,
                 shaper,
                 lod: None,
             }),
             pmtiles: std::collections::BTreeMap::new(),
+            raster_pmtiles: std::collections::BTreeMap::new(),
             overlay: std::collections::BTreeMap::new(),
         };
 
@@ -1025,12 +1119,14 @@ mod tests {
             vector: Some(VectorLayer {
                 fields: super::feature_field_schema(src.as_ref()),
                 area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                min_feature_px: 0.0, // size gate off (the default)
                 source: VectorSource::LoadAll(src),
                 style,
                 shaper,
                 lod: None,
             }),
             pmtiles,
+            raster_pmtiles: std::collections::BTreeMap::new(),
             overlay: std::collections::BTreeMap::new(),
         };
         let st = ServeState::new(vec![layer], "http://h/wms".into(), 16);

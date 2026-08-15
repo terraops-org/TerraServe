@@ -32,10 +32,12 @@ pub enum SourceKind {
     GeoPackage,
     /// GeoJSON. Load-all; no spatial index.
     GeoJson,
+    /// PostGIS. Windowed by definition — every query is a bbox filter against a GiST index.
+    PostGis,
     /// A scheme this build does not know how to open. Carried rather than rejected here so the
-    /// CALLER produces the error, with a message naming what it does support. `postgis://` lands
-    /// here until a PostGIS reader exists, which is the intended shape: adding one means adding
-    /// a variant and a match arm, not another `ends_with` somewhere.
+    /// CALLER produces the error, with a message naming what it does support. This is the seam a
+    /// new source type attaches to: adding one means adding a variant and a match arm, not
+    /// another `ends_with` somewhere — `postgis://` is the first example, above.
     Unsupported(String),
 }
 
@@ -73,7 +75,10 @@ pub fn classify(spec: &str) -> SourceKind {
         {
             rest
         }
-        // An unknown scheme IS the format claim. This is where postgis:// will attach.
+        // `postgis` is a format claim like any other unknown scheme, just one this build DOES
+        // know how to open — checked before the generic fallback below.
+        Some((scheme, _)) if scheme.eq_ignore_ascii_case("postgis") => return SourceKind::PostGis,
+        // An unknown scheme IS the format claim, carried out to the caller.
         Some((scheme, _)) => return SourceKind::Unsupported(scheme.to_ascii_lowercase()),
         None => spec,
     };
@@ -120,13 +125,11 @@ mod tests {
     }
 
     /// An unknown scheme is a FORMAT claim, and is carried out to the caller rather than being
-    /// silently misread as a GeoPackage path. This is the seam a database source attaches to.
+    /// silently misread as a GeoPackage path. `postgres` (not `postgis`) is used here as the
+    /// still-unsupported example: `postgis` itself now classifies as `SourceKind::PostGis`,
+    /// covered separately by `postgis_scheme_classifies_as_postgis_not_unsupported`.
     #[test]
     fn unknown_scheme_is_reported_as_a_format_not_guessed_as_a_file() {
-        assert_eq!(
-            classify("postgis://user@host/db?table=roads"),
-            SourceKind::Unsupported("postgis".into())
-        );
         assert_eq!(
             classify("POSTGRES://host/db"),
             SourceKind::Unsupported("postgres".into())
@@ -164,5 +167,21 @@ mod tests {
     fn unknown_extension_still_defaults_to_geopackage() {
         assert_eq!(classify("/data/mystery"), SourceKind::GeoPackage);
         assert_eq!(classify("/data/thing.sqlite"), SourceKind::GeoPackage);
+    }
+
+    #[test]
+    fn postgis_scheme_classifies_as_postgis_not_unsupported() {
+        assert!(matches!(
+            classify("postgis://ts:${P}@db/gis/public.parcels"),
+            SourceKind::PostGis
+        ));
+    }
+
+    #[test]
+    fn an_unknown_scheme_is_still_unsupported() {
+        assert!(matches!(
+            classify("mysql://x/y"),
+            SourceKind::Unsupported(_)
+        ));
     }
 }

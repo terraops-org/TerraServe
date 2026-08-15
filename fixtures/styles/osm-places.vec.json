@@ -1,0 +1,10 @@
+{
+  "mode": "vector",
+  "point": { "radius": 3.0, "fill": [40, 40, 45, 255], "stroke": [255, 255, 255, 255], "stroke_width": 1.0 },
+  "text": {
+    "label": "name",
+    "size": 14.0, "color": [25, 25, 30, 255],
+    "halo": { "color": [255, 255, 255, 230], "radius": 2.0 },
+    "offset": 5.0
+  }
+}

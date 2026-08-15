@@ -37,7 +37,46 @@ impl<T: FeatureSource + ?Sized> FeatureSource for Arc<T> {
 /// traversal); `FeatureSource` and every existing reader are untouched by this trait's existence.
 pub trait WindowedSource: Send + Sync {
     /// Features overlapping `bbox` (source CRS), read from just that window.
-    fn query(&self, bbox: [f64; 4]) -> Vec<Feature>;
+    ///
+    /// **`Err` means the read FAILED; it never means "no features here".** That distinction is the
+    /// whole reason this returns a `Result`. Every windowed reader used to answer a failed read
+    /// with an empty `Vec` -- PostGIS logged a line, GeoPackage swallowed six different SQLite
+    /// errors, and FlatGeoBuf returned silently -- so a dropped connection, a truncated S3 range
+    /// read or a statement timeout arrived at the client as a blank map behind a **200 OK**. Worse,
+    /// `build-pmtiles` froze that blank into an archive, where it then shadows the live path
+    /// forever: two EU5 bakes lost 10 and 4 tiles that way, and the archive cannot tell you which.
+    ///
+    /// Every front-end above this seam already maps an error to a 500 / OWS exception, so
+    /// propagating is all that was ever missing. Return `Ok(vec![])` ONLY for a genuinely empty
+    /// window.
+    fn query(&self, bbox: [f64; 4]) -> Result<Vec<Feature>, String>;
+
+    /// The same window, but allowed to skip features whose source-CRS area is below
+    /// `min_area_src` — the per-zoom threshold from `mvt::min_area_src_for_zoom` (raster callers
+    /// go through `mvt::min_area_src_for_scale`, which is the same number derived from a
+    /// resolution), in source-CRS units². This is the seam that lets a source push the
+    /// min-feature-size gate down to where the data lives instead of fetching, transferring and
+    /// decoding rows the caller is about to discard (`PostgisSource` puts it in the SQL `WHERE`;
+    /// measured on a 17.8M-feature layer, the low-zoom tile is dominated by exactly those rows,
+    /// and on a 107.9M-feature one an ungated z1 raster tile cost 52.6 GiB against 0.11 gated).
+    ///
+    /// **Implementing this is optional and skipping is always optional.** The default ignores the
+    /// threshold entirely, so every existing reader keeps its behaviour with no edit — a source
+    /// with no cheap area to test (FlatGeoBuf and GeoPackage know a bbox from their index, not an
+    /// area) is right to fall through here rather than decode geometry just to measure it.
+    ///
+    /// **Contract for an override: it may only drop what the Rust gate would drop anyway** —
+    /// `f.area > 0.0 && f.area < min_area_src`, i.e. sub-threshold POLYGONS only, never a line and
+    /// never a point (both have zero area). That containment is what makes this a pure
+    /// optimization: the caller re-applies the identical test (`encode_tile_opt` on the MVT path,
+    /// `render::skip_below_min_area` on the raster one), so a gated read and an ungated one must
+    /// produce the same tile. `min_area_src <= 0.0` means the gate is off and MUST behave
+    /// exactly like `query`.
+    fn query_gated(&self, bbox: [f64; 4], min_area_src: f64) -> Result<Vec<Feature>, String> {
+        let _ = min_area_src;
+        self.query(bbox)
+    }
+
     fn full_extent(&self) -> [f64; 4];
     fn crs(&self) -> Option<&str>;
 
@@ -99,11 +138,36 @@ impl VectorSource {
         }
     }
     /// Features to consider for `bbox`. LoadAll borrows its whole slice (caller filters/clips as
-    /// today); Windowed returns only the R-tree window.
-    pub fn features_in(&self, bbox: [f64; 4]) -> FeatureBatch<'_> {
+    /// today); Windowed returns only the R-tree window. `Err` is a failed READ, never an empty
+    /// window -- see [`WindowedSource::query`] for why that distinction is load-bearing.
+    pub fn features_in(&self, bbox: [f64; 4]) -> Result<FeatureBatch<'_>, String> {
+        self.features_in_gated(bbox, 0.0)
+    }
+
+    /// `features_in`, with the per-zoom min-feature-size threshold offered to the source (see
+    /// [`WindowedSource::query_gated`]). `0.0` = no gate, and is what `features_in` passes.
+    ///
+    /// **A caller may pass a non-zero threshold only if it applies the matching Rust gate itself**,
+    /// because a source is free to ignore the pushdown (the default `query_gated` does) — without
+    /// the caller's own filter the layer would thin on one backend and not on another. Two callers
+    /// qualify: the MVT path (`encode_tile_opt`) and, since 2026-08-14, the raster path
+    /// (`render_vector_from` -> `render::skip_below_min_area`, which covers WMS GetMap, WMTS/TMS
+    /// raster tiles and the PNG PMTiles bake). **GetFeatureInfo passes no threshold** and goes
+    /// through `features_in`: the gate decides what is worth DRAWING, and clicking a sub-pixel
+    /// parcel to read its attributes is legitimate at any zoom. `LoadAll` is unaffected either way:
+    /// it borrows its whole slice and the caller filters it.
+    pub fn features_in_gated(
+        &self,
+        bbox: [f64; 4],
+        min_area_src: f64,
+    ) -> Result<FeatureBatch<'_>, String> {
         match self {
-            VectorSource::LoadAll(s) => FeatureBatch::Borrowed(s.features()),
-            VectorSource::Windowed(s) => FeatureBatch::Owned(s.query(bbox)),
+            // A load-all source parsed at construction and cannot fail here -- the file was either
+            // read at startup or the layer never came up. Always `Ok`.
+            VectorSource::LoadAll(s) => Ok(FeatureBatch::Borrowed(s.features())),
+            VectorSource::Windowed(s) => {
+                Ok(FeatureBatch::Owned(s.query_gated(bbox, min_area_src)?))
+            }
         }
     }
 }
@@ -127,7 +191,9 @@ mod tests {
         let gj = super::super::geojson::GeoJsonSource::from_str(TINY_GEOJSON).unwrap();
         let n = gj.features().len();
         let vs = VectorSource::LoadAll(Arc::new(gj));
-        let batch = vs.features_in([-1e9, -1e9, 1e9, 1e9]);
+        let batch = vs
+            .features_in([-1e9, -1e9, 1e9, 1e9])
+            .expect("LoadAll never fails");
         assert_eq!(batch.as_slice().len(), n);
         assert!(matches!(batch, FeatureBatch::Borrowed(_)));
     }

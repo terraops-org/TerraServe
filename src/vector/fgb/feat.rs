@@ -64,19 +64,18 @@ use crate::vector::feature::{Feature, Geometry, Props, Value};
 use super::header::Header;
 
 /// Run `flatbuffers::Verifier` over a Feature FlatBuffer, treating it as a `size_prefixed`
-/// buffer per FlatGeoBuf's `u32 feat_size · Feature FlatBuffer` container section, with the
-/// `feat_size` prefix already stripped by the caller (`bytes` starts at the root uoffset,
-/// matching `decode_feature`'s existing contract). See `header.rs`'s `verify_size_prefixed` for
-/// why this reconstruction matters: `Verifier::is_aligned` checks alignment relative to the
-/// TRUE flatbuffers position 0 the original writer padded against, which for a size-prefixed
-/// buffer is 4 bytes before where `bytes` starts here -- verifying at position 0 directly
-/// shifts every alignment check by 4 bytes and spuriously rejects real `ogr2ogr` files
-/// (confirmed empirically the same way).
-fn verify_size_prefixed<T: Verifiable>(buf: &[u8], opts: &VerifierOptions) -> bool {
-    let mut framed = Vec::with_capacity(4 + buf.len());
-    framed.extend_from_slice(&[0u8; 4]);
-    framed.extend_from_slice(buf);
-    let mut verifier = Verifier::new(opts, &framed);
+/// buffer per FlatGeoBuf's `u32 feat_size · Feature FlatBuffer` container section. `record` is
+/// the WHOLE on-disk record, `u32 feat_size` prefix INCLUDED.
+///
+/// The prefix is load-bearing, not noise: `Verifier::is_aligned` checks alignment relative to
+/// the TRUE flatbuffers position 0 the original writer padded against, which for a size-prefixed
+/// buffer is the prefix's own first byte. Verifying a prefix-stripped body at position 0 shifts
+/// every alignment check by 4 bytes and spuriously rejects real `ogr2ogr` files (confirmed
+/// empirically). This previously allocated a fresh buffer and COPIED the whole body just to
+/// prepend 4 placeholder bytes and rebuild that frame -- one allocation plus a full copy of
+/// EVERY feature. Keeping the prefix the reader already fetched removes both.
+fn verify_size_prefixed<T: Verifiable>(record: &[u8], opts: &VerifierOptions) -> bool {
+    let mut verifier = Verifier::new(opts, record);
     <SkipSizePrefix<ForwardsUOffset<T>>>::run_verifier(&mut verifier, 0).is_ok()
 }
 
@@ -140,9 +139,9 @@ impl Verifiable for FeatureV {
     }
 }
 
-/// Run the full recursive `flatbuffers::Verifier` over a Feature FlatBuffer (`bytes` = the
-/// per-record bytes with the `u32 feat_size` container prefix already stripped, same convention
-/// as `decode_feature`). `true` iff every field this reader can possibly walk into -- geometry,
+/// Run the full recursive `flatbuffers::Verifier` over a Feature FlatBuffer (`record` = the
+/// whole on-disk record, `u32 feat_size` prefix INCLUDED -- same convention as
+/// `decode_feature`). `true` iff every field this reader can possibly walk into -- geometry,
 /// `xy`/`ends`/`type`, `parts` recursively, and `properties` -- resolves in-bounds, with
 /// `VerifierOptions::default()`'s `max_depth` (64) bounding a crafted `parts` chain's recursion
 /// depth well short of any stack-overflow risk (native recursion of 64 frames is trivial; no
@@ -150,14 +149,14 @@ impl Verifiable for FeatureV {
 /// `mod.rs::feature_bbox` (the bruteforce-query path, whose own recursive `parts` walker,
 /// `accumulate_geometry_bbox`, needs the exact same pre-validation to stay panic/UB-free and
 /// depth-bounded).
-pub(super) fn verify_feature_buf(bytes: &[u8]) -> bool {
-    verify_size_prefixed::<FeatureV>(bytes, &VerifierOptions::default())
+pub(super) fn verify_feature_buf(record: &[u8]) -> bool {
+    verify_size_prefixed::<FeatureV>(record, &VerifierOptions::default())
 }
 
-/// Decode one Feature FlatBuffer. `bytes` is the Feature record's bytes with the leading `u32
-/// feat_size` container prefix already stripped by the caller (`FgbSource::read_feature_record`
-/// in `mod.rs`) — the same convention `mod.rs::feature_bbox`'s `body` parameter uses, since a
-/// FlatBuffer root offset is always relative to the start of its own buffer. `fid` is left `0`;
+/// Decode one Feature FlatBuffer. `record` is the WHOLE on-disk record as `read_feature_record`
+/// returns it — `u32 feat_size` prefix INCLUDED — because `verify_feature_buf` needs that frame
+/// to check alignment (see its doc). The prefix is sliced off here for the accessors, since a
+/// FlatBuffer root offset is relative to the start of its own buffer. `fid` is left `0`;
 /// `FgbSource::decode_all`/`decode_at` assign the feature's byte offset as its stable `fid`
 /// after this returns.
 ///
@@ -165,21 +164,26 @@ pub(super) fn verify_feature_buf(bytes: &[u8]) -> bool {
 /// model (`MultiPoint`/`GeometryCollection`/unrecognized) — the caller skips the feature, the
 /// same contract as `wkb::decode_gpkg_geometry`. `Err`: the feature bytes don't even parse as a
 /// well-formed FlatBuffer root table (truncated/corrupt) — never a panic.
-pub(super) fn decode_feature(bytes: &[u8], header: &Header) -> io::Result<Option<Feature>> {
-    let Some(root_loc) = super::validate_root_table(bytes) else {
-        return Err(super::invalid("fgb: feature root table invalid"));
-    };
-    // Task 7: full recursive structural verification -- geometry, xy/ends/type, parts
-    // (recursively, depth-bounded), and properties -- BEFORE any accessor below reads a nested
-    // field. `validate_root_table` above only proves the root table's own vtable is safe to
-    // read slot offsets from; every accessor past that point is still an unchecked
-    // `flatbuffers::Table::get` (see the module doc's "Task 7 hardening" section), so this gate
-    // is what actually makes them safe.
-    if !verify_feature_buf(bytes) {
+pub(super) fn decode_feature(record: &[u8], header: &Header) -> io::Result<Option<Feature>> {
+    // Full recursive structural verification -- geometry, xy/ends/type, parts (recursively,
+    // depth-bounded), and properties -- BEFORE any accessor below reads a nested field. Every
+    // accessor past this point is an unchecked `flatbuffers::Table::get` (see the module doc's
+    // "Task 7 hardening" section), so this gate is what makes them safe. It runs on the FRAMED
+    // record; `validate_root_table` below then re-checks the body's own root offset/vtable.
+    if record.len() < 4 {
+        return Err(super::invalid(
+            "fgb: feature record shorter than its size prefix",
+        ));
+    }
+    if !verify_feature_buf(record) {
         return Err(super::invalid(
             "fgb: feature failed FlatBuffer structural verification",
         ));
     }
+    let bytes = &record[4..];
+    let Some(root_loc) = super::validate_root_table(bytes) else {
+        return Err(super::invalid("fgb: feature root table invalid"));
+    };
     // Safety: `validate_root_table` just proved the root offset + vtable resolve in-bounds —
     // the same precondition `header.rs`'s `Header::table()` relies on for the Header table —
     // and `verify_feature_buf` above just proved every field this reader touches (transitively,
@@ -699,9 +703,45 @@ mod tests {
         );
     }
 
-    /// Read `tiny.fgb`'s Header plus the raw bytes of feature "c" (the Polygon, at relative
-    /// offset 192 -- see `decode_tiny_features`'s doc comment for how that layout was
-    /// established), the same size-prefix-then-body shape `mod.rs::read_feature_record` reads.
+    /// The framing contract, pinned. `decode_feature` takes the WHOLE record and verifies it in
+    /// place, instead of allocating a copy of the body behind 4 placeholder bytes.
+    ///
+    /// The assertion that matters is the second one: the prefix-STRIPPED body must NOT verify.
+    /// That is the whole reason the prefix is carried rather than discarded --
+    /// `Verifier::is_aligned` measures alignment from the true position 0 the writer padded
+    /// against, which is the prefix's first byte. If someone "tidies up" by stripping it again,
+    /// this fails loudly instead of silently rejecting every real `ogr2ogr` file at runtime.
+    #[test]
+    fn the_size_prefix_is_load_bearing_for_verification() {
+        let (header, record) = tiny_header_and_polygon_feature_body();
+        assert!(record.len() > 4);
+        let declared = u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            declared,
+            record.len() - 4,
+            "fixture sanity: the prefix describes the body exactly"
+        );
+
+        assert!(
+            super::verify_feature_buf(&record),
+            "the framed record must verify"
+        );
+        assert!(
+            !super::verify_feature_buf(&record[4..]),
+            "the prefix-stripped body must NOT verify -- the frame is load-bearing"
+        );
+        assert!(
+            matches!(decode_feature(&record, &header), Ok(Some(_))),
+            "the real framed record must decode"
+        );
+        // Shorter than its own prefix: a clean Err, never a slice panic.
+        assert!(decode_feature(&record[..3], &header).is_err());
+    }
+
+    /// Read `tiny.fgb`'s Header plus the WHOLE on-disk record of feature "c" (the Polygon, at
+    /// relative offset 192 -- see `decode_tiny_features`'s doc comment for how that layout was
+    /// established), `u32 feat_size` prefix INCLUDED, exactly as `mod.rs::read_feature_record`
+    /// now returns it and as `decode_feature`/`verify_feature_buf` expect it.
     fn tiny_header_and_polygon_feature_body() -> (super::Header, Vec<u8>) {
         let src = crate::cog::LocalFileRangeSource::open("fixtures/fgb/tiny.fgb").unwrap();
         let prefix = crate::cog::RangeSource::read_range(&src, 0, 12).unwrap();
@@ -719,13 +759,13 @@ mod tests {
             crate::cog::RangeSource::read_range(&src, FEATURES_START + POLYGON_REL_OFFSET, 4)
                 .unwrap();
         let size = u32::from_le_bytes(size_bytes[0..4].try_into().unwrap()) as usize;
-        let body = crate::cog::RangeSource::read_range(
+        let record = crate::cog::RangeSource::read_range(
             &src,
-            FEATURES_START + POLYGON_REL_OFFSET + 4,
-            size,
+            FEATURES_START + POLYGON_REL_OFFSET,
+            4 + size,
         )
         .unwrap();
-        (header, body)
+        (header, record)
     }
 
     /// A minimal, structurally-valid Header FlatBuffer with every field absent (this reader
@@ -750,8 +790,9 @@ mod tests {
     /// FlatBuffers requires) via `flatbuffers::FlatBufferBuilder` directly -- the same low-level
     /// API this crate's hand-written accessors read, just used to write instead. Only the
     /// nesting SHAPE matters here (proving the depth bound), not realistic geometry content.
-    /// `size_prefixed` + stripped, same reasoning as `minimal_header_bytes` above (this one
-    /// feeds `decode_feature`, whose `feat_size` prefix is stripped by `mod.rs` the same way).
+    /// Returned `size_prefixed` and NOT stripped -- this feeds `decode_feature`, which takes the
+    /// whole record including its `feat_size` prefix (unlike `minimal_header_bytes` above, whose
+    /// consumer `Header::parse` still takes a stripped buffer).
     fn build_nested_parts_feature(depth: usize) -> Vec<u8> {
         let mut fbb = flatbuffers::FlatBufferBuilder::new();
         let mut inner: Option<flatbuffers::WIPOffset<flatbuffers::TableFinishedWIPOffset>> = None;
@@ -769,6 +810,8 @@ mod tests {
         }
         let feat_end = fbb.end_table(feat_start);
         fbb.finish_size_prefixed(feat_end, None);
-        fbb.finished_data()[4..].to_vec()
+        // Kept size-prefixed (NOT stripped): `verify_feature_buf`/`decode_feature` take the
+        // whole record, prefix included.
+        fbb.finished_data().to_vec()
     }
 }

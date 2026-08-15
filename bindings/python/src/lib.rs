@@ -45,11 +45,9 @@ fn render_png<'py>(
     };
     let src_crs = src_crs.unwrap_or_else(|| reproj::SRC_CRS.to_string());
 
-    // CPU-bound render off the GIL: nothing inside touches Python. `detach` is PyO3 0.25+'s
-    // name for what used to be `allow_threads`; same signature, same semantics (the GIL is
-    // released for the closure and reacquired after, even on panic).
+    // CPU-bound render off the GIL: nothing inside touches Python.
     let png = py
-        .detach(move || -> Result<Vec<u8>, String> {
+        .allow_threads(move || -> Result<Vec<u8>, String> {
             let sty = Style::load(&style)?;
             let req = render::RenderRequest {
                 cog_path: &cog_path,

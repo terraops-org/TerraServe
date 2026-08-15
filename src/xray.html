@@ -501,7 +501,18 @@ function boot(tmsDoc) {
   var origin, resolutions, tileW, tileH, extent, tileGrid;
   if (matrices) {
     var m0 = matrices[0];
-    origin = m0.pointOfOrigin; // top-left corner, shared across every level (tms.rs `to_ogc_value`)
+    // Top-left corner, shared across every level (tms.rs `to_ogc_value`).
+    //
+    // `pointOfOrigin` is [x, y] ONLY when the document says so. OGC TMS 2.0 lets a document
+    // declare the order of its own coordinates via `orderedAxes`, and the registered
+    // EuropeanETRS89_LAEAQuad (EPSG:3035, northing-first) writes [northing, easting] with
+    // `orderedAxes: ["Y","X"]`. Reading that pair naively puts the origin 3.5 MILLION metres out
+    // and the map silently shows nothing. Our own /tileMatrixSets always emits x,y and says so, so
+    // this branch is inert against our server — it is here so a hand-supplied or third-party grid
+    // document works too.
+    var axes = tmsDoc.orderedAxes;
+    var northingFirst = !!(axes && axes.length && /^(y|n|lat|north|northing|latitude)$/i.test(String(axes[0]).trim()));
+    origin = northingFirst ? [m0.pointOfOrigin[1], m0.pointOfOrigin[0]] : m0.pointOfOrigin;
     tileW = m0.tileWidth;
     tileH = m0.tileHeight;
     resolutions = matrices.map(function (m) { return m.cellSize; });

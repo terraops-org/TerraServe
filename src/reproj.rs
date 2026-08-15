@@ -52,6 +52,120 @@ impl Transformer {
 /// `proj` (the safe wrapper crate) doesn't expose `proj_create`/`proj_as_proj_string`, so
 /// this drops to the raw `proj-sys` FFI directly — pinned to the exact version `proj`
 /// already pulls transitively (see Cargo.toml), so it's the same libproj build, not a
+/// Does this CRS declare its NORTHING (or latitude) axis FIRST?
+///
+/// WMS 1.3.0 orders a BBOX by the CRS's own declared axis order, not by an easting-first
+/// convention. `EPSG:4326` being lat,lon is the famous case but it is one member of a class, not
+/// the class: `EPSG:3301` (Estonia), `EPSG:2180` (Poland) and `EPSG:3035` (ETRS89-LAEA) are all
+/// PROJECTED and all northing-first. A hardcoded 4326 check misses them, and the symptom is
+/// nasty — QGIS sends a correctly-ordered BBOX, the server reads it transposed, the envelope
+/// lands nowhere near the data, and every request returns a BLANK 200.
+///
+/// ⚠ **Decide on the axis NAME, not its direction.** Direction is a trap: `EPSG:3413` (NSIDC
+/// polar stereographic) declares `AXIS["easting (X)",south]` — an EASTING whose direction is
+/// `south`, because both axes of a polar projection point away from the pole. A direction-only
+/// test calls 3413 northing-first and transposes the Arctic. Found by the GetFeatureInfo tests,
+/// which serve exactly that CRS.
+///
+/// The abbreviation is the fallback for CRSs whose name is bare (`EPSG:2056` is just `"(E)"`),
+/// and direction is the last resort.
+///
+/// `None` when the CRS cannot be resolved or has fewer than two axes; the caller then keeps the
+/// bytes in the order they arrived, which is right for the easting-first majority.
+pub fn crs_is_northing_first(crs: &str) -> Option<bool> {
+    use proj_sys::{
+        proj_context_create, proj_context_destroy, proj_create, proj_crs_get_coordinate_system,
+        proj_cs_get_axis_count, proj_cs_get_axis_info, proj_destroy,
+    };
+    use std::ffi::{CStr, CString};
+
+    let c_crs = CString::new(crs).ok()?;
+
+    // SAFETY: every pointer is null-checked before use, and `ctx`, `pj` and `cs` are destroyed on
+    // EVERY exit path including the early returns. The strings PROJ writes belong to `cs` and are
+    // only valid until it is destroyed, so they are copied out strictly before that. Out-params
+    // we do not need are null, which `proj_cs_get_axis_info` documents as permitted.
+    unsafe {
+        let ctx = proj_context_create();
+        if ctx.is_null() {
+            return None;
+        }
+        let pj = proj_create(ctx, c_crs.as_ptr());
+        if pj.is_null() {
+            proj_context_destroy(ctx);
+            return None;
+        }
+        let cs = proj_crs_get_coordinate_system(ctx, pj);
+        if cs.is_null() {
+            proj_destroy(pj);
+            proj_context_destroy(ctx);
+            return None;
+        }
+
+        let mut out = None;
+        if proj_cs_get_axis_count(ctx, cs) >= 2 {
+            let mut name: *const std::os::raw::c_char = std::ptr::null();
+            let mut abbrev: *const std::os::raw::c_char = std::ptr::null();
+            let mut direction: *const std::os::raw::c_char = std::ptr::null();
+            let ok = proj_cs_get_axis_info(
+                ctx,
+                cs,
+                0, // the FIRST axis is the one that decides BBOX order
+                &mut name,
+                &mut abbrev,
+                &mut direction,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if ok != 0 {
+                let s = |p: *const std::os::raw::c_char| -> String {
+                    if p.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(p)
+                            .to_str()
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                    }
+                };
+                out = classify_first_axis(&s(name), &s(abbrev), &s(direction));
+            }
+        }
+
+        proj_destroy(cs);
+        proj_destroy(pj);
+        proj_context_destroy(ctx);
+        out
+    }
+}
+
+/// The decision, split out so it is testable without a PROJ handle.
+///
+/// Order matters: NAME, then ABBREVIATION, then direction. See `crs_is_northing_first` for why
+/// direction cannot come first.
+fn classify_first_axis(name: &str, abbrev: &str, direction: &str) -> Option<bool> {
+    if name.contains("northing") || name.contains("latitude") {
+        return Some(true);
+    }
+    if name.contains("easting") || name.contains("longitude") {
+        return Some(false);
+    }
+    // A bare name like "(E)" (EPSG:2056, EPSG:3031) carries nothing; the abbreviation does.
+    match abbrev {
+        "n" | "y" | "lat" => return Some(true),
+        "e" | "x" | "lon" | "long" => return Some(false),
+        _ => {}
+    }
+    // Last resort. Only reached when both name and abbreviation are unhelpful.
+    match direction {
+        "north" | "south" => Some(true),
+        "east" | "west" => Some(false),
+        _ => None,
+    }
+}
+
 /// second one.
 pub fn crs_to_proj4(crs: &str) -> Option<String> {
     use proj_sys::{
@@ -291,5 +405,87 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod axis_order_tests {
+    use super::crs_is_northing_first;
+
+    /// The bug this exists to prevent: EPSG:3301 (Estonia) is a PROJECTED CRS that declares
+    /// `AXIS["northing (X)",north]` FIRST. A hardcoded `crs == "EPSG:4326"` axis check misses it,
+    /// so QGIS sends a correctly-ordered northing-first BBOX, the server reads it transposed, and
+    /// every request renders blank behind a 200 OK.
+    #[test]
+    fn estonia_3301_is_northing_first() {
+        assert_eq!(crs_is_northing_first("EPSG:3301"), Some(true));
+    }
+
+    /// Geographic lat,lon — the case that WAS handled, kept so the general rule still covers it.
+    #[test]
+    fn wgs84_4326_is_latitude_first() {
+        assert_eq!(crs_is_northing_first("EPSG:4326"), Some(true));
+    }
+
+    /// The mutation guard. Without an easting-first case, an implementation that always returned
+    /// `Some(true)` would pass every other test here and transpose the whole world.
+    #[test]
+    fn web_mercator_and_swiss_lv95_are_easting_first() {
+        assert_eq!(crs_is_northing_first("EPSG:3857"), Some(false));
+        // Swiss LV95 is projected AND easting-first, so it proves "projected" alone does not
+        // decide this — the axis declaration does. It is also the CRS a live demo serves.
+        assert_eq!(crs_is_northing_first("EPSG:2056"), Some(false));
+        assert_eq!(crs_is_northing_first("EPSG:3763"), Some(false));
+    }
+
+    /// ⚠ THE REGRESSION GUARD. EPSG:3413 (NSIDC polar stereographic) declares
+    /// `AXIS["easting (X)",south]` — an EASTING whose DIRECTION is `south`, because both axes of
+    /// a polar projection point away from the pole. The first version of this function tested
+    /// direction only, called 3413 northing-first, and transposed the Arctic. The existing
+    /// GetFeatureInfo tests, which serve exactly this CRS, caught it.
+    #[test]
+    fn polar_crss_are_easting_first_despite_a_south_pointing_axis() {
+        assert_eq!(crs_is_northing_first("EPSG:3413"), Some(false));
+        assert_eq!(crs_is_northing_first("EPSG:3031"), Some(false)); // Antarctic, name is "(E)"
+    }
+
+    /// The decision table, without needing PROJ. Pins the PRECEDENCE: name beats abbreviation
+    /// beats direction. Reverse any two and a real CRS above breaks.
+    #[test]
+    fn classification_precedence_name_then_abbrev_then_direction() {
+        use super::classify_first_axis;
+        // Name wins even when the direction disagrees — the 3413 shape.
+        assert_eq!(
+            classify_first_axis("easting (x)", "x", "south"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_first_axis("northing (x)", "x", "north"),
+            Some(true)
+        );
+        // Bare name falls through to the abbreviation — the 2056 shape.
+        assert_eq!(classify_first_axis("(e)", "e", "east"), Some(false));
+        assert_eq!(classify_first_axis("(n)", "n", "north"), Some(true));
+        // Both unhelpful: direction is the last resort.
+        assert_eq!(classify_first_axis("", "", "north"), Some(true));
+        assert_eq!(classify_first_axis("", "", "east"), Some(false));
+        // Nothing usable at all.
+        assert_eq!(classify_first_axis("", "", ""), None);
+    }
+
+    /// Two more northing-first PROJECTED CRSs, so the fix is not quietly Estonia-specific.
+    #[test]
+    fn other_northing_first_projected_crss() {
+        assert_eq!(crs_is_northing_first("EPSG:2180"), Some(true)); // Poland CS92
+        assert_eq!(crs_is_northing_first("EPSG:3035"), Some(true)); // ETRS89-LAEA Europe
+    }
+
+    /// An unresolvable CRS must not panic and must not guess. `None` makes the caller keep the
+    /// bytes as they arrived, which is right for the easting-first majority.
+    #[test]
+    fn an_unknown_crs_is_none_not_a_panic() {
+        assert_eq!(crs_is_northing_first("EPSG:99999999"), None);
+        assert_eq!(crs_is_northing_first("not-a-crs"), None);
+        assert_eq!(crs_is_northing_first(""), None);
     }
 }

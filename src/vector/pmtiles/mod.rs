@@ -7,10 +7,67 @@
 pub mod codec;
 pub mod generate;
 pub mod overlay;
+pub mod raster;
 pub mod read;
 pub mod write;
 
 pub type PmResult<T> = Result<T, String>;
+
+/// How many times a bake re-attempts one tile whose SOURCE READ failed before giving up.
+///
+/// Not a style choice — a measurement. Two consecutive EU5 bakes lost 10 then 4 tiles to
+/// `connection closed`, always with NOTHING in the Postgres log, i.e. closed client-side and
+/// transient. Aborting the whole bake on the first of those would kill a 12-minute run at minute
+/// nine for a fault that clears on the next attempt.
+const TILE_READ_ATTEMPTS: u32 = 3;
+/// Backoff between attempts. Short: this covers a dropped connection or a pool hiccup, not an
+/// outage, and a bake with thousands of tiles should not spend minutes sleeping.
+const TILE_RETRY_BACKOFF_MS: u64 = 250;
+
+/// Run one tile's build, retrying a failed SOURCE READ, and on final failure return an error that
+/// names the tile.
+///
+/// ⚠ This exists because the alternative shipped and was worse. A tile whose query failed used to
+/// be baked as an EMPTY tile: the reader `postgis.rs`/`fgb.rs`/`gpkg.rs` returned `Vec::new()` on
+/// error, so the bake saw "no features here" and froze a hole into the archive — where it then
+/// shadows the live path FOREVER, because a read-through archive hit never falls back. The failure
+/// was silent, permanent, and the archive cannot tell you which tiles it hit.
+///
+/// So: retry, then ABORT. A bake that stops with "z9/271/164 failed after 3 attempts" costs the
+/// operator a re-run; a bake that quietly writes blanks costs them a wrong map they cannot see.
+pub(crate) fn build_tile_with_retry<T>(
+    z: u32,
+    x: u32,
+    y: u32,
+    mut build: impl FnMut() -> PmResult<T>,
+) -> PmResult<T> {
+    let mut last = String::new();
+    for attempt in 1..=TILE_READ_ATTEMPTS {
+        match build() {
+            Ok(v) => {
+                if attempt > 1 {
+                    eprintln!("build-pmtiles: z{z}/{x}/{y} succeeded on attempt {attempt}");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                eprintln!(
+                    "build-pmtiles: z{z}/{x}/{y} attempt {attempt}/{TILE_READ_ATTEMPTS} failed: {e}"
+                );
+                last = e;
+                if attempt < TILE_READ_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(TILE_RETRY_BACKOFF_MS));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "build-pmtiles: tile z{z}/{x}/{y} failed after {TILE_READ_ATTEMPTS} attempts: {last}. \
+         Aborting rather than writing an empty tile — a blank baked here would shadow the live \
+         path permanently. Fix the source (for PostGIS, often TERRASERVE_PG_STATEMENT_TIMEOUT_MS \
+         at its 30 s default on a low-zoom query) and re-run."
+    ))
+}
 
 /// `base(z) = (4^z - 1)/3` via accumulation (overflow-safe).
 fn zoom_base(z: u32) -> u64 {

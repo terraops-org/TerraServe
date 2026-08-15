@@ -346,6 +346,60 @@ impl Style {
                 _ => None,
             })
     }
+
+    /// Every property name this style actually reads: filter fields (recursively through
+    /// `And`/`Or`/`Not`) plus label text/priority fields on every `Text` symbolizer, across every
+    /// rule.
+    ///
+    /// This is the column set a source that gets to CHOOSE what it fetches (PostGIS: a `SELECT`
+    /// list, not a whole-row read) must ask for. Under-asking is silent and wrong in two different
+    /// directions: a `Cmp`/`Between`/`Like` against a property that was never fetched always
+    /// evaluates false (a rule that should fire never does), while `IsNull` against the same
+    /// vacuously evaluates true (a rule that should NOT fire matches every feature) — see
+    /// `Filter::eval`. A label field that was never fetched just renders blank. Nothing panics or
+    /// warns either way, which is exactly why this has to be right rather than "good enough": a
+    /// source that reads the whole row (`.gpkg`/`.fgb`) never needs this at all.
+    pub fn referenced_fields(&self) -> std::collections::BTreeSet<String> {
+        let mut fields = std::collections::BTreeSet::new();
+        for rule in self.all_rules() {
+            if let Some(f) = &rule.filter {
+                collect_filter_fields(f, &mut fields);
+            }
+            for sym in &rule.symbolizers {
+                if let Symbolizer::Text(t) = sym {
+                    for part in &t.label {
+                        if let LabelPart::Field(name) = part {
+                            fields.insert(name.clone());
+                        }
+                    }
+                    if let Some(Priority::Field(name)) = &t.priority {
+                        fields.insert(name.clone());
+                    }
+                }
+            }
+        }
+        fields
+    }
+}
+
+/// Walk a `Filter` tree collecting every property name it tests, recursively through the boolean
+/// combinators. Split out of `Style::referenced_fields` so the recursion is a plain function, not
+/// a closure capturing `&mut` across `And`/`Or`'s `Vec<Filter>`.
+fn collect_filter_fields(f: &Filter, out: &mut std::collections::BTreeSet<String>) {
+    match f {
+        Filter::Cmp(_, prop, _) | Filter::Between(prop, _, _) | Filter::Like(prop, _) => {
+            out.insert(prop.clone());
+        }
+        Filter::IsNull(prop) => {
+            out.insert(prop.clone());
+        }
+        Filter::And(fs) | Filter::Or(fs) => {
+            for g in fs {
+                collect_filter_fields(g, out);
+            }
+        }
+        Filter::Not(g) => collect_filter_fields(g, out),
+    }
 }
 
 /// Parse the vec-style JSON into the rule's `symbolizers` list. `point`+`text` are a pair — if

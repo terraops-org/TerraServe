@@ -82,27 +82,33 @@ pub fn build_pmtiles(
         }
         ids.sort_by_key(|t| t.0);
         for tile_batch in ids.chunks(BATCH) {
-            let rendered: Vec<(u64, Vec<u8>)> = tile_batch
+            let rendered: Vec<(u64, crate::vector::pmtiles::PmResult<Vec<u8>>)> = tile_batch
                 .par_iter()
                 .map(|&(id, x, y)| {
-                    // Reads through the `VectorSource` seam (windowed-seam refactor): reproject the
-                    // tile bbox into the source CRS before reading — a harmless no-op for `LoadAll`
-                    // (every reader today), correct once a windowed source (FlatGeoBuf) lands.
-                    let feats = features_for_tile(&vs, grid, z, x, y, &layer.src_crs);
-                    let mvt = encode_tile_opt(
-                        feats.as_slice(),
-                        grid,
-                        z,
-                        x,
-                        y,
-                        &layer.src_crs,
-                        &layer.name,
-                        opts,
-                    );
+                    // Retry a failed SOURCE READ, then abort. An `Err` from `features_for_tile` is
+                    // a broken query, NOT an empty region — and an empty MVT tile is `continue`d
+                    // below, so without this the failure would be indistinguishable from empty
+                    // ground and silently omitted from the archive.
+                    let mvt = crate::vector::pmtiles::build_tile_with_retry(z, x, y, || {
+                        // Reads through the `VectorSource` seam: reproject the tile bbox into the
+                        // source CRS before reading — a no-op for `LoadAll`, correct for windowed.
+                        let feats = features_for_tile(&vs, grid, z, x, y, &layer.src_crs, &opts)?;
+                        Ok(encode_tile_opt(
+                            feats.as_slice(),
+                            grid,
+                            z,
+                            x,
+                            y,
+                            &layer.src_crs,
+                            &layer.name,
+                            opts,
+                        ))
+                    });
                     (id, mvt)
                 })
                 .collect();
             for (id, mvt) in rendered {
+                let mvt = mvt?;
                 if mvt.is_empty() {
                     continue; // omit empty tiles entirely (no address, no blob)
                 }

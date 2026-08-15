@@ -60,17 +60,31 @@ fn pick_grid<'a>(layer: &'a Layer, grid_id: &Option<String>) -> Option<&'a Publi
     }
 }
 
+/// The 404 body when a grid cannot be resolved. A layer publishing NO grids at all gets a message
+/// that says what to do about it: `grids:` defaults to `from_cog`, which `build_vector_layer` drops
+/// (a vector layer has no COG), so a vector layer whose config never set `grids:` explicitly serves
+/// MVT fine (the preset fallback) yet has no grid to raster on — and "no grid None on 'x'" does not
+/// hint at that at all.
+fn no_grid_msg(layer: &Layer, gid: &Option<String>) -> String {
+    if layer.grids.is_empty() {
+        format!(
+            "layer '{}' publishes no tile grids; add e.g. `grids: [WebMercatorQuad]` to it",
+            layer.name
+        )
+    } else {
+        format!("no grid {gid:?} on '{}'", layer.name)
+    }
+}
+
 /// `/tms/1.0.0/` — the TileMapService: one `<TileMap>` per layer×grid across all layers (D1).
 pub fn tilemapservice_xml(state: &ServeState, root: &str) -> String {
     let mut maps = String::new();
     for layer in &state.layers {
-        // A vector (label) layer serves no RASTER tiles — `render_tms_tile` gates on `layer.cog`
-        // and 400s unconditionally, even when the layer publishes tile grids (the MVT/WMTS-MVT
-        // path). Skip it so the TMS root never advertises an always-400 <TileMap> href; it is
-        // discovered instead via the `/mvt` route + TileJSON.
-        if layer.vector.is_some() {
-            continue;
-        }
+        // Vector layers are listed too: `render_tms_tile` rasters them through
+        // `VectorLayer::render_tile`, so a <TileMap> href here resolves to a real PNG. It used to
+        // skip them because every vector tile request 400'd, which made an advertised href an
+        // always-400 endpoint. A layer publishing no grids still contributes nothing — the loop
+        // below is over `layer.grids` — which is correct: advertised must equal servable.
         for g in &layer.grids {
             maps.push_str(&format!(
                 "    <TileMap title=\"{n}\" srs=\"{crs}\" profile=\"{prof}\" href=\"{root}/{n}@{gid}\"/>\n",
@@ -133,8 +147,36 @@ pub fn tilemap_doc(
         .iter()
         .find(|l| l.name == lname)
         .ok_or((404u16, format!("no layer '{lname}'")))?;
-    let pg = pick_grid(layer, &gid).ok_or((404u16, format!("no grid {gid:?} on '{lname}'")))?;
+    let pg = pick_grid(layer, &gid).ok_or_else(|| (404u16, no_grid_msg(layer, &gid)))?;
     Ok(tilemap_xml_for(&layer.name, &pg.tms, pg.data_bounds, root))
+}
+
+/// A pre-baked PNG for this layer×grid×tile, or `None` to render live. **The single read-through
+/// used by BOTH raster tile front-ends** (`render_tms_tile` here and `wmts::get_tile`), so the two
+/// cannot diverge on which archive answers a request.
+///
+/// `grid_id` is the PUBLISHED grid's id, which is exactly the key `layer::build_vector_layer` filed
+/// the archive under (it resolved the archive's bare `grid_id` against the layer's grids at startup
+/// and verified the tile pixel size), so no matching happens here.
+///
+/// A read ERROR degrades to a live render with a log line, mirroring `mvt_http.rs`'s archive read:
+/// a corrupt or truncated archive must not take the layer down, but it must not be silent either.
+pub fn read_through_raster(
+    layer: &Layer,
+    grid_id: &str,
+    z: u32,
+    col: u32,
+    row: u32,
+) -> Option<Vec<u8>> {
+    let reader = layer.raster_pmtiles.get(grid_id)?;
+    match reader.get(z, col, row) {
+        Ok(Some(bytes)) => Some(bytes),
+        Ok(None) => None,
+        Err(e) => {
+            eprintln!("raster pmtiles read {z}/{col}/{row}: {e}");
+            None
+        }
+    }
 }
 
 /// Render a TMS tile: parse the spec, pick the grid, apply the bottom-left→top-left y-flip, render.
@@ -152,7 +194,7 @@ pub fn render_tms_tile(
         .iter()
         .find(|l| l.name == lname)
         .ok_or((404u16, format!("no layer '{lname}'")))?;
-    let pg = pick_grid(layer, &gid).ok_or((404u16, format!("no grid {gid:?} on '{lname}'")))?;
+    let pg = pick_grid(layer, &gid).ok_or_else(|| (404u16, no_grid_msg(layer, &gid)))?;
     let lvl = pg
         .tms
         .level(z)
@@ -165,11 +207,27 @@ pub fn render_tms_tile(
     }
     let row =
         tms_y_to_core_row(&pg.tms, z, y).ok_or((404u16, format!("tile row {y} out of range")))?;
-    // Vector layers are not served on tile paths in the MVP (tiled labeling is a later rung) —
-    // fail cleanly instead of panicking on the now-optional COG.
+    // A vector layer rasters through the ONE vector renderer, shared with WMS GetMap and with
+    // `wmts::get_tile` (`VectorLayer::render_tile`) — geometry only, no labels
+    // (docs/postgis-layers.md, "Labels are WMS-only"). The range checks above already ran, so a
+    // failure below is a render/read error, not a bad request.
+    if let Some(vec) = &layer.vector {
+        // Archive-first, exactly as `/mvt` reads through `Layer::pmtiles`: a hit is a disk read of a
+        // pre-baked PNG, a miss renders live below. `row` (top-left) is the addressing PMTiles
+        // stores — the bottom-left y-flip already happened above, so this is the same (z, col, row)
+        // the bake wrote and the WMTS path reads.
+        if let Some(png) = read_through_raster(layer, &pg.tms.id, z, x, row) {
+            return Ok(png);
+        }
+        return vec
+            .render_tile(&layer.src_crs, &pg.tms, z, x, row)
+            .map_err(|e| (500u16, e));
+    }
+    // Neither a vector layer nor a COG one — fail cleanly instead of panicking on the
+    // now-optional COG (a `Layer` with both `vector` and `cog` unset never leaves layer building).
     let cog = layer.cog.as_deref().ok_or((
-        400u16,
-        "vector layer is not tiled — use WMS GetMap".to_string(),
+        500u16,
+        "layer has neither a COG nor a vector source".to_string(),
     ))?;
     let source = layer
         .source
@@ -317,8 +375,10 @@ pub fn viewer_html(state: &ServeState, origin: &str) -> String {
     let Some(layer) = state.layers.first() else {
         return "<!doctype html><meta charset=utf-8><title>TerraServe</title><p>No layers published.".to_string();
     };
-    // A vector (label) layer has no tile grids — serve it as a single WMS GetMap image
-    // (OpenLayers ImageWMS) over an OSM basemap so the labels are visible.
+    // A vector layer is shown as a single WMS GetMap image (OpenLayers ImageWMS) over an OSM
+    // basemap, because that is the one path that draws LABELS. It may well publish grids and serve
+    // WMTS/TMS raster tiles now; those carry geometry only, which is the wrong choice for a viewer
+    // whose whole point is the label engine.
     if layer.vector.is_some() {
         return vector_viewer_html(&format!("{origin}/wms"), layer);
     }
