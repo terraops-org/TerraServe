@@ -1357,9 +1357,9 @@ dependencies = [
 
 [[package]]
 name = "proj"
-version = "0.31.0"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10730bc2a73edc2eb5673204b51d5459eae92a87c813cb6267c64066cbce9de2"
+checksum = "58e0c01de214d7ea50ee6519969be9efdc6f0dc5ce6c64fbd4f054ea26d43ca4"
 dependencies = [
  "geo-types",
  "libc",
@@ -1370,9 +1370,9 @@ dependencies = [
 
 [[package]]
 name = "proj-sys"
-version = "0.27.0"
+version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48ffa255a853264169516c9fc21f524446aca5b091daab6052f2a9b3e5e90359"
+checksum = "a208129995443a4c475464c33308274be1578993b0ad266c9139188ed0dc7e91"
 dependencies = [
  "cmake",
  "flate2",
