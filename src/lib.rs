@@ -23,6 +23,7 @@ pub mod layer;
 pub mod legend;
 pub mod mvt_http;
 pub mod pngio;
+pub mod pread;
 pub mod render;
 pub mod reproj;
 pub mod s3;

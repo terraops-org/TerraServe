@@ -14,7 +14,8 @@ use crate::vector::pmtiles::PmResult;
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+// Positional reads go through `pread`, which works on Windows too (issue #9).
+use crate::pread::read_exact_at;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -235,8 +236,7 @@ impl TileOverlay {
             }
         };
         let mut buf = vec![0u8; len as usize];
-        self.log_r
-            .read_exact_at(&mut buf, off)
+        read_exact_at(&self.log_r, &mut buf, off)
             .map_err(|e| format!("overlay read_exact_at: {e}"))?;
         Ok(Some(gunzip(&buf)?))
     }
@@ -251,8 +251,7 @@ impl TileOverlay {
             }
         };
         let mut buf = vec![0u8; len as usize];
-        self.log_r
-            .read_exact_at(&mut buf, off)
+        read_exact_at(&self.log_r, &mut buf, off)
             .map_err(|e| format!("overlay read_exact_at: {e}"))?;
         Ok(Some(buf))
     }

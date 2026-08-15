@@ -11,7 +11,8 @@
 //! transparency. The source CRS is given (EPSG:3763) — no GeoKey CRS decoding needed.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
+// Positional reads go through `pread`, which works on Windows too (issue #9).
+use crate::pread::read_exact_at;
 
 /// GRADED SEAM: every COG byte read flows through this trait. The pilot ships
 /// `LocalFileRangeSource`; the S3 impl (`s3::S3RangeSource`) reads over signed HTTP ranges.
@@ -38,7 +39,7 @@ impl LocalFileRangeSource {
 impl RangeSource for LocalFileRangeSource {
     fn read_range(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
-        self.file.read_exact_at(&mut buf, offset)?;
+        read_exact_at(&self.file, &mut buf, offset)?;
         Ok(buf)
     }
 }
