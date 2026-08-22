@@ -69,6 +69,149 @@ jobs:
       - name: Test (unit + integration; COG-dependent tests self-skip without fixtures)
         run: cargo test --release
 
+  # Windows exists to catch ONE thing: "does not compile on MSVC at all". That is not
+  # hypothetical - it is what happened. `default = ["jemalloc"]` plus a `tikv-jemalloc-sys` that
+  # does not build for x86_64-pc-windows-msvc meant a plain `cargo build --release` on Windows
+  # could never succeed, and we only learned it when an outside user opened issue #9 three weeks
+  # later. jemalloc now sits under a `cfg(not(target_env = "msvc"))` target table; this job is
+  # what keeps that true.
+  #
+  # Deliberately a BUILD, not the full suite: nobody deploys TerraServe on Windows, and running
+  # the tests here would roughly double CI wall-clock for a platform we only promise to compile
+  # on. Add the suite later if this proves stable and cheap.
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # PROJ from conda-forge rather than built from source.
+      #
+      # The first attempt used `--features bundled-proj`, which builds PROJ with CMake. That needs
+      # SQLite3 (the library AND the `sqlite3` binary, to generate proj.db) plus TIFF and curl,
+      # none of which a Windows runner has -- it died on "sqlite3 >= 3.11 required!". Installing
+      # those to build PROJ to build TerraServe is a yak-shave with no payoff.
+      #
+      # More importantly it is not what a Windows user does. The reporter of #9 ran
+      # `pixi global install proj zlib clang` and linked against it; conda-forge is the same
+      # prebuilt-binary route with one prefix, so PKG_CONFIG_PATH is a single directory instead
+      # of one per package -- which is exactly where he went wrong. CI now reproduces the real
+      # user path, which is the path we actually promise works.
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: latest
+          activate-environment: ts
+          auto-activate-base: false
+
+      # `zlib` is NOT redundant with what proj pulls in. conda-forge SPLITS it: `libzlib` is the
+      # DLL that everything depends on transitively, `zlib` is the headers plus zlib.pc. proj.pc
+      # declares `Requires.private: sqlite3, libtiff-4, libcurl`, and pkg-config resolves
+      # Requires.private for --cflags, so the probe walks proj -> libcurl -> libssh2 -> zlib and
+      # dies if only libzlib is present. That is what killed the previous attempt, NOT the
+      # PKG_CONFIG_PATH problem below - fixing only the path would still have failed here.
+      - name: Install PROJ and friends from conda-forge
+        shell: bash -el {0}
+        run: conda install -y -c conda-forge proj pkg-config sqlite zlib libtiff
+
+      # conda-forge's Windows .pc files don't consistently match the import-library filenames
+      # they actually ship. proj.pc declares `Libs: ... -lproj_9` (a Linux-SONAME-style name
+      # carrying the major version) for an import library that installs unversioned: `proj.lib`.
+      # Requires.private pulls in curl/ssh2/openssl the same way, and THEIR .pc files ask for the
+      # bare form (`-lcurl`, `-lssh2`, `-lcrypto`) while conda-forge ships the lib-prefixed
+      # filename (`libcurl.lib`, `libssh2.lib`, `libcrypto.lib`). MSVC's linker is fatal on the
+      # FIRST unresolved input and never reports the rest, so these surfaced one at a time across
+      # separate CI rounds (`proj_9.lib`, then `curl.lib`, ...) instead of all at once. Reconcile
+      # generically instead of chasing names individually: alias proj's version-suffixed name by
+      # hand (the one case that ADDS a suffix rather than strips a prefix), then for every
+      # lib-prefixed import library present, also expose the unprefixed name if nothing already
+      # claims it. Same content either way, just reachable under both names.
+      - name: Reconcile pkg-config's expected import-library names with what conda-forge installed
+        shell: bash -el {0}
+        run: |
+          LIBDIR="$CONDA_PREFIX/Library/lib"
+          cp -n "$LIBDIR/proj.lib" "$LIBDIR/proj_9.lib"
+          for f in "$LIBDIR"/lib*.lib; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            target="$LIBDIR/${base#lib}"
+            [ -e "$target" ] || cp "$f" "$target"
+            echo "aliased $base -> $(basename "$target")"
+          done
+
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "17.0"
+          directory: ${{ runner.temp }}/llvm
+
+      # ⚠ `bin`, not `lib`: on Windows clang-sys wants libclang.DLL, and DLLs live in bin/.
+      # Pointing at lib/ finds nothing and clang-sys silently falls back to whatever libclang is
+      # on PATH - the "unsupported version" error the reporter of #9 hit.
+      - name: Point bindgen at that LLVM
+        shell: bash
+        run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/bin" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+
+      # TWO INDEPENDENT ROUTES TO GREEN, because the previous four attempts each fixed one layer
+      # and discovered the next. Either the pkg-config probe succeeds, or the source-build
+      # fallback does; both are set up here so one run tests both.
+      #
+      # ⚠ PKG_CONFIG_PATH IS EXPORTED INSIDE THIS BLOCK, not via `env:` or $GITHUB_ENV. Both of
+      # those lose: `bash -el` is a LOGIN shell, and Git-for-Windows' /etc/profile unconditionally
+      # reassigns PKG_CONFIG_PATH to the MINGW64 defaults. That is precisely why the previous run
+      # showed `C:\Program Files\Git\mingw64\lib\pkgconfig` instead of the conda prefix.
+      #
+      # ROUTE A - make the probe work:
+      #   PKG_CONFIG        pin WHICH pkg-config runs (the crate honours it), removing PATH-order
+      #                     ambiguity between conda's pkgconf and Git's.
+      #   ..._MAXIMUM_TRAVERSE_DEPTH=1  make success depend on proj.pc ALONE. Requires.private
+      #                     chains reach zstd/openssl/etc; the log can only ever show the FIRST
+      #                     missing one, so bounding the walk beats guessing the rest one CI round
+      #                     at a time.
+      # ROUTE B - make the fallback work, since proj-sys builds PROJ from source whenever the
+      # probe fails, with or without `bundled-proj` (build.rs: `.or_else(|| build_from_source())`):
+      #   CMAKE_POLICY_VERSION_MINIMUM  CMake 4 removed compatibility with PROJ's pre-3.5 minimum.
+      #                     This was in attempt 2, worked, and I dropped it in attempt 4's rewrite.
+      #   CMAKE_PREFIX_PATH lets PROJ's CMake find conda's SQLite (sqlite3.exe is on PATH already).
+      #   LIB               essential: build.rs emits `cargo:rustc-link-lib=dylib=sqlite3` with NO
+      #                     link-search path, so without this the fallback fails at LINK time even
+      #                     after CMake succeeds.
+      - name: Build
+        shell: bash -el {0}
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          export PKG_CONFIG_PATH="$CONDA_PREFIX/Library/lib/pkgconfig"
+          export PKG_CONFIG="$CONDA_PREFIX/Library/bin/pkg-config.exe"
+          export PKG_CONFIG_MAXIMUM_TRAVERSE_DEPTH=1
+          export CMAKE_PREFIX_PATH="$CONDA_PREFIX/Library"
+          export LIB="$(cygpath -w "$CONDA_PREFIX/Library/lib");$LIB"
+          echo "probe: $($PKG_CONFIG --modversion proj || echo 'FAILED - falling back to source build')"
+          cargo build --release
+
+      # Prove it RUNS, not just links: `--help` exercises clap and the whole startup path
+      # without needing fixtures, a database, or a network.
+      # `bash -el {0}` so the conda environment is active: the binary links PROJ's DLLs from
+      # $CONDA_PREFIX/Library/bin, and without that on PATH it fails to start with a missing-DLL
+      # error that looks nothing like the real cause.
+      - name: Smoke
+        shell: bash -el {0}
+        run: |
+          ./target/release/terraserve.exe --help
+          ./target/release/terraserve.exe render --help
+
+      # Publish the executable so a Windows user can take a build from CI. This is a
+      # convenience, NOT a supported package (issue #9: no plans to package, but it must
+      # compile), hence the short retention.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraserve-windows-x86_64
+          path: target/release/terraserve.exe
+          retention-days: 14
+
   smoke:
     # Serves a committed fixture over real HTTP and checks what a CLIENT actually receives.
     # Every assertion here corresponds to a bug that reached production.
