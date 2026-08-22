@@ -114,6 +114,18 @@ jobs:
         shell: bash -el {0}
         run: conda install -y -c conda-forge proj pkg-config sqlite zlib libtiff
 
+      # conda-forge's Windows `proj.pc` declares `Libs: ... -lproj_9` (a Linux-SONAME-style name,
+      # carrying the major version), but the import library it actually installs is unversioned:
+      # `proj.lib`. proj-sys's own build.rs additionally hardcodes `cargo:rustc-link-lib=proj`
+      # (see its build.rs), so BOTH `-lproj_9` and `-lproj` end up on the link line - `-lproj`
+      # resolves, `-lproj_9` does not, and MSVC's linker fails on the one unresolved input
+      # regardless of the other: `LINK1181: cannot open input file 'proj_9.lib'`. A same-content
+      # copy under the name pkg-config actually asked for is the whole fix - it is still the same
+      # import library, just reachable under both names.
+      - name: Work around conda-forge's proj.pc claiming a proj_9.lib that isn't installed
+        shell: bash -el {0}
+        run: cp "$CONDA_PREFIX/Library/lib/proj.lib" "$CONDA_PREFIX/Library/lib/proj_9.lib"
+
       - uses: KyleMayes/install-llvm-action@v2
         with:
           version: "17.0"
