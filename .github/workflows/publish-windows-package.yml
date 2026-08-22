@@ -1,0 +1,135 @@
+# Build a self-contained Windows package (exe + DLLs, nothing else required) and attach it to
+# the GitHub release.
+#
+# terraops-org/TerraServe#9 asked for a Windows package, not just a build that compiles. The
+# Windows job in ci.yml (added to answer that issue) proves the binary compiles, links, and runs
+# -- but only INSIDE the conda shell that built it, since PROJ/curl/sqlite/etc come from
+# conda-forge as DYNAMIC libraries. A user with no conda installed can't run that exe at all:
+# Windows would fail to start it with a "missing DLL" error, the exact failure class #9 already
+# hit once for an unrelated reason (a bad LIBCLANG_PATH).
+#
+# Windows resolves DLL imports from the executable's OWN folder before anywhere else, so copying
+# every conda-forge DLL the build actually links against into the same folder as terraserve.exe
+# makes that folder fully self-contained: unzip anywhere, run the exe, no install step. This
+# workflow does exactly that, then PROVES it by running the packaged exe from a plain `pwsh` step
+# (not `bash -el` -- conda is never on PATH there) as the acid test for "no conda required".
+#
+# Deliberately whole-directory, not a hand-picked DLL list: enumerating exactly which DLLs are
+# needed (proj vs proj_9-named, curl vs libcurl-named, ICU's version-numbered filenames, ...) is
+# exactly the kind of one-at-a-time guessing that cost several CI rounds in ci.yml's Windows job.
+# A missing DLL is a broken package for an end user with no way to self-diagnose it; a few extra
+# megabytes from bundling conda tools we don't strictly need is not.
+
+name: Publish Windows package
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:      # lets you build and sanity-check the zip without cutting a tag
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Same conda-forge route as ci.yml's build-windows job -- see that job's comments for why
+      # (SQLite3/TIFF/curl are a yak-shave to build PROJ from source, and this is the path a
+      # Windows user actually takes: `pixi`/conda prebuilt binaries).
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniconda-version: latest
+          activate-environment: ts
+          auto-activate-base: false
+
+      - name: Install PROJ and friends from conda-forge
+        shell: bash -el {0}
+        run: conda install -y -c conda-forge proj pkg-config sqlite zlib libtiff
+
+      # Same import-library name reconciliation as ci.yml's build-windows job -- see that job's
+      # comments for the proj_9.lib / curl.lib / etc. filename-mismatch explanation.
+      - name: Reconcile pkg-config's expected import-library names with what conda-forge installed
+        shell: bash -el {0}
+        run: |
+          LIBDIR="$CONDA_PREFIX/Library/lib"
+          cp -n "$LIBDIR/proj.lib" "$LIBDIR/proj_9.lib"
+          for f in "$LIBDIR"/lib*.lib; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            target="$LIBDIR/${base#lib}"
+            [ -e "$target" ] || cp "$f" "$target"
+          done
+
+      - uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "17.0"
+          directory: ${{ runner.temp }}/llvm
+
+      - name: Point bindgen at that LLVM
+        shell: bash
+        run: echo "LIBCLANG_PATH=${{ runner.temp }}/llvm/bin" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-release
+
+      - name: Build
+        shell: bash -el {0}
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        run: |
+          export PKG_CONFIG_PATH="$CONDA_PREFIX/Library/lib/pkgconfig"
+          export PKG_CONFIG="$CONDA_PREFIX/Library/bin/pkg-config.exe"
+          export PKG_CONFIG_MAXIMUM_TRAVERSE_DEPTH=1
+          export CMAKE_PREFIX_PATH="$CONDA_PREFIX/Library"
+          export LIB="$(cygpath -w "$CONDA_PREFIX/Library/lib");$LIB"
+          cargo build --release
+
+      # The package: the exe plus every DLL conda-forge installed for it. Windows checks the
+      # exe's own folder for DLL imports before System32 or PATH, so this folder alone is enough
+      # to run on a machine with nothing else installed.
+      - name: Stage the exe with its DLLs
+        shell: bash -el {0}
+        run: |
+          mkdir -p dist/terraserve-windows-x86_64
+          cp target/release/terraserve.exe dist/terraserve-windows-x86_64/
+          cp "$CONDA_PREFIX"/Library/bin/*.dll dist/terraserve-windows-x86_64/
+          ls -la dist/terraserve-windows-x86_64/
+
+      # The acid test: plain `pwsh`, not `bash -el`, so conda is NOT on PATH here -- this is what
+      # actually proves the folder is self-contained rather than just asserting it.
+      - name: Verify it runs with no conda on PATH
+        shell: pwsh
+        run: |
+          .\dist\terraserve-windows-x86_64\terraserve.exe --help
+          .\dist\terraserve-windows-x86_64\terraserve.exe render --help
+
+      - name: Zip it
+        shell: pwsh
+        run: Compress-Archive -Path dist/terraserve-windows-x86_64 -DestinationPath terraserve-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terraserve-windows-x86_64
+          path: terraserve-windows-x86_64.zip
+          retention-days: 14
+
+  release:
+    name: attach package to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write     # create the release and upload assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: terraserve-windows-x86_64
+          path: dist
+      - name: Attach the Windows package to the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
