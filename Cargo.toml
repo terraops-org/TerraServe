@@ -43,10 +43,13 @@ bundled-proj = ["proj/bundled_proj"]
 # `cargo build --release` on Windows therefore could not succeed AT ALL. Reported from the wild in
 # terraops-org/TerraServe#9 by someone simply trying to build the project.
 #
-# Under this target table the crate is not in the dependency graph on MSVC, the `jemalloc` feature
-# resolves to nothing there, and `main.rs`'s `#[cfg(feature = "jemalloc")]` global allocator is
-# compiled out — so Windows silently gets the system allocator and builds. Every other platform is
-# unchanged and keeps jemalloc on by default (it is worth ~23x lower idle RSS; see
+# Under this target table the crate is not in the dependency graph on MSVC — but that ALONE is not
+# enough: `jemalloc` is a default feature, and Cargo resolves features independently of per-target
+# dependency tables, so `cfg(feature = "jemalloc")` stays true on MSVC even with no crate to satisfy
+# it. `main.rs` gates its global-allocator item on
+# `cfg(all(feature = "jemalloc", not(target_env = "msvc")))`, not the feature alone — that second
+# half is what actually compiles the allocator out on Windows. Every other platform is unchanged and
+# keeps jemalloc on by default (it is worth ~23x lower idle RSS; see
 # `project-serving-architecture-pmtiles`).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 # Unprefixed so it provides the standard malloc/free symbols + reads MALLOC_CONF. A memory

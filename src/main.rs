@@ -13,11 +13,20 @@ use clap::{Parser, Subcommand};
 // (RSS = high-water mark), so a single whole-extent request leaves the pod inflated; jemalloc hands
 // dirty pages back to the OS. `malloc_conf` enables the background purge thread + ~1s decay so RSS
 // falls back within a second or two of a spike subsiding. No-op in the default (glibc) build.
-#[cfg(feature = "jemalloc")]
+//
+// The `not(target_env = "msvc")` half matters just as much as the feature check: Cargo.toml puts
+// `tikv-jemallocator` under a target-scoped `[target.'cfg(not(target_env = "msvc"))'.dependencies]`
+// table, but that ONLY removes the crate from MSVC's dependency graph — it does not turn off
+// `cfg(feature = "jemalloc")`, which stays true on every platform because `jemalloc` is a default
+// feature and Cargo resolves features independently of per-target dependency tables. Gating on the
+// feature alone left `tikv_jemallocator::Jemalloc` referenced here with nothing to link against on
+// MSVC ("cannot find crate `tikv_jemallocator`") — the actual root cause behind
+// terraops-org/TerraServe#9, found only once Windows CI got far enough to hit it.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(feature = "jemalloc")]
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
