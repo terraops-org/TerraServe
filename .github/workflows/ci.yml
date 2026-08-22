@@ -114,17 +114,30 @@ jobs:
         shell: bash -el {0}
         run: conda install -y -c conda-forge proj pkg-config sqlite zlib libtiff
 
-      # conda-forge's Windows `proj.pc` declares `Libs: ... -lproj_9` (a Linux-SONAME-style name,
-      # carrying the major version), but the import library it actually installs is unversioned:
-      # `proj.lib`. proj-sys's own build.rs additionally hardcodes `cargo:rustc-link-lib=proj`
-      # (see its build.rs), so BOTH `-lproj_9` and `-lproj` end up on the link line - `-lproj`
-      # resolves, `-lproj_9` does not, and MSVC's linker fails on the one unresolved input
-      # regardless of the other: `LINK1181: cannot open input file 'proj_9.lib'`. A same-content
-      # copy under the name pkg-config actually asked for is the whole fix - it is still the same
-      # import library, just reachable under both names.
-      - name: Work around conda-forge's proj.pc claiming a proj_9.lib that isn't installed
+      # conda-forge's Windows .pc files don't consistently match the import-library filenames
+      # they actually ship. proj.pc declares `Libs: ... -lproj_9` (a Linux-SONAME-style name
+      # carrying the major version) for an import library that installs unversioned: `proj.lib`.
+      # Requires.private pulls in curl/ssh2/openssl the same way, and THEIR .pc files ask for the
+      # bare form (`-lcurl`, `-lssh2`, `-lcrypto`) while conda-forge ships the lib-prefixed
+      # filename (`libcurl.lib`, `libssh2.lib`, `libcrypto.lib`). MSVC's linker is fatal on the
+      # FIRST unresolved input and never reports the rest, so these surfaced one at a time across
+      # separate CI rounds (`proj_9.lib`, then `curl.lib`, ...) instead of all at once. Reconcile
+      # generically instead of chasing names individually: alias proj's version-suffixed name by
+      # hand (the one case that ADDS a suffix rather than strips a prefix), then for every
+      # lib-prefixed import library present, also expose the unprefixed name if nothing already
+      # claims it. Same content either way, just reachable under both names.
+      - name: Reconcile pkg-config's expected import-library names with what conda-forge installed
         shell: bash -el {0}
-        run: cp "$CONDA_PREFIX/Library/lib/proj.lib" "$CONDA_PREFIX/Library/lib/proj_9.lib"
+        run: |
+          LIBDIR="$CONDA_PREFIX/Library/lib"
+          cp -n "$LIBDIR/proj.lib" "$LIBDIR/proj_9.lib"
+          for f in "$LIBDIR"/lib*.lib; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            target="$LIBDIR/${base#lib}"
+            [ -e "$target" ] || cp "$f" "$target"
+            echo "aliased $base -> $(basename "$target")"
+          done
 
       - uses: KyleMayes/install-llvm-action@v2
         with:
