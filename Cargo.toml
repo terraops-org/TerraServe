@@ -1,6 +1,6 @@
 [package]
 name = "terraserve"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "Clean-room raster + vector tile engine in Rust (COG / GeoPackage / FlatGeoBuf → WMS / WMTS / TMS / MVT), no GDAL / MapServer / GeoServer."
@@ -57,7 +57,7 @@ tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_support
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 png = "0.17"
-proj = "0.27"
+proj = "0.30"
 # Direct FFI to a handful of libproj C functions (proj_create/proj_as_proj_string) not
 # exposed by the `proj` crate's safe wrapper — needed to export an arbitrary CRS as a
 # PROJ.4 string for the viewer's proj4js registration (see reproj::crs_to_proj4). Pinned to
@@ -65,7 +65,7 @@ proj = "0.27"
 # unifies it into the same build — no second libproj, no second `links = "proj"` conflict.
 # Its own `bundled_proj` feature is NOT enabled here; `proj/bundled_proj` (below) remains
 # the sole switch, so the Python wheel's vendored-PROJ build is untouched.
-proj-sys = "=0.23.2"
+proj-sys = "=0.26.0"
 weezl = "0.1"   # LZW codec (TIFF variant) — a codec crate like flate2/zune-jpeg, not a TIFF reader
 zune-jpeg = "0.4"
 zstd = "0.13"   # ZSTD codec (libzstd binding) — a codec crate like flate2/zune-jpeg, not a TIFF reader
