@@ -269,7 +269,20 @@ pub fn features_for_tile<'a>(
     // mosaic exists to fill). The pushdown must skip for the same reason and by the same test, or
     // the rows would be gone before the vote ever sees them.
     let gated = !(is_mosaic_active(opts, z) || is_dissolve_active(opts, z));
-    let min_area_src = if gated {
+    // Deliberately NOT `min_area_src_for_grid`'s unconditional cell-area floor here: that floor
+    // exists to stop DEGENERATE (post-rounding) geometry from polluting `encode_tile_opt`'s
+    // in-memory candidate pool, where checking it costs one struct-field comparison against an
+    // already-fetched `Feature.area`. Pushing it into a PostGIS pushdown is a different trade --
+    // `size_gate_sql` compiles to `ST_Area(geom) < threshold`, and `ST_Area` is NOT index-assisted
+    // (Postgres evaluates it per bbox-matched row; see `postgis.rs`'s own doc comment on
+    // `size_gate_sql`). A real, operator-configured `--mvt-min-feature-px` is a deliberate
+    // performance/cartographic trade the operator opted into (same as `--raster-min-feature-px`
+    // elsewhere in this codebase) and is worth pushing down. The tiny structural floor is not: on
+    // a wide low-zoom bbox over a huge ungated table (EU5 `buildings`, 107.9M rows) it turns an
+    // already-expensive-but-tractable full-bbox fetch into a per-row `ST_Area` scan that exceeds
+    // even a generous statement_timeout for no selectivity benefit worth the cost -- confirmed
+    // live, 2026-08-28: z1 timed out at 300_000ms with the floor pushed down, twice, deterministically.
+    let min_area_src = if gated && opts.min_feature_px > 0.0 {
         min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px)
     } else {
         0.0
@@ -1381,5 +1394,108 @@ mod grid_aware_gate_tests {
         let gated = min_area_src_for_grid(&g, 10, "EPSG:3035", 2.116, 2.0);
         let res = 17_578.125 / 2f64.powi(10);
         assert!((gated - 2.0 * res * res).abs() < 1e-6, "got {gated}");
+    }
+}
+
+/// `features_for_tile`'s PostGIS pushdown must NOT inherit the always-on cell floor. Discovered
+/// live, 2026-08-28: pushing it turned `size_gate_sql`'s `ST_Area(geom) < threshold` (NOT
+/// index-assisted -- Postgres evaluates it per bbox-matched row) into a per-row cost across EU5
+/// `buildings`'s 107.9M rows at z0/z1, timing out at 300_000ms twice in a row on the real
+/// production database before this test existed. The floor still applies -- for free -- in
+/// `encode_tile_opt`'s in-memory candidate loop, which tests it against an already-fetched
+/// `Feature.area` struct field, not a live database function call.
+#[cfg(test)]
+mod pushdown_floor_tests {
+    use super::*;
+    use crate::vector::feature::{Feature, Props};
+    use crate::vector::source::{VectorSource, WindowedSource};
+    use std::sync::Mutex;
+
+    /// Records the `min_area_src` it was last called with, then answers with one feature so the
+    /// caller can also confirm the read succeeded. Mirrors the trait's own documented contract
+    /// ("`min_area_src <= 0.0` means the gate is off and MUST behave exactly like `query`") by
+    /// answering identically regardless of the threshold -- this test cares only about WHAT
+    /// `features_for_tile` asked for, not about a source actually applying it.
+    struct RecordingSource {
+        last_min_area_src: Mutex<Option<f64>>,
+    }
+
+    impl WindowedSource for RecordingSource {
+        fn query(&self, bbox: [f64; 4]) -> Result<Vec<Feature>, String> {
+            self.query_gated(bbox, 0.0)
+        }
+        fn query_gated(&self, _bbox: [f64; 4], min_area_src: f64) -> Result<Vec<Feature>, String> {
+            *self.last_min_area_src.lock().unwrap() = Some(min_area_src);
+            Ok(vec![Feature::new(Geometry::Point([0.0, 0.0]), Props::new(), 1)])
+        }
+        fn full_extent(&self) -> [f64; 4] {
+            [-100_000.0, -100_000.0, 100_000.0, 100_000.0]
+        }
+        fn crs(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    fn laea() -> TileMatrixSet {
+        crate::tms::from_ogc_json(
+            &std::fs::read_to_string("fixtures/grids/EuropeanETRS89_LAEAQuad.json").unwrap(),
+        )
+        .expect("LAEA grid")
+    }
+
+    /// The bug: `min_feature_px` unset ("gate off", EU5 `buildings`'s real configuration) must
+    /// push `0.0` -- no SQL filter at all -- even though the in-memory floor this same zoom would
+    /// apply to `encode_tile_opt` is nonzero (asserted here too, or this test would prove nothing).
+    #[test]
+    fn gate_off_pushes_zero_not_the_structural_floor() {
+        let src = std::sync::Arc::new(RecordingSource {
+            last_min_area_src: Mutex::new(None),
+        });
+        let vs = VectorSource::Windowed(src.clone());
+        let g = laea();
+        let opts = MvtOptimizations {
+            min_feature_px: 0.0,
+            area_scale: 2.116,
+            ..MvtOptimizations::defaults()
+        };
+        let floored_value =
+            min_area_src_for_grid(&g, 3, "EPSG:3035", opts.area_scale, opts.min_feature_px);
+        assert!(
+            floored_value > 0.0,
+            "sanity: the in-memory floor for this zoom/config must be nonzero, or this test \
+             proves nothing"
+        );
+
+        let batch = features_for_tile(&vs, &g, 3, 3, 4, "EPSG:3035", &opts).expect("query ok");
+        assert_eq!(batch.len(), 1, "the recording source's read must still happen");
+        let got = src.last_min_area_src.lock().unwrap().expect("query_gated was called");
+        assert_eq!(
+            got, 0.0,
+            "gate off must push NOTHING into the SQL WHERE, not the cell floor \
+             ({floored_value} would have made a 107.9M-row ST_Area scan the operator never asked for)"
+        );
+    }
+
+    /// A real, operator-configured gate is still worth pushing down (the operator opted into the
+    /// cost) -- confirms this fix did not turn the pushdown off entirely.
+    #[test]
+    fn a_real_configured_gate_still_pushes_down() {
+        let src = std::sync::Arc::new(RecordingSource {
+            last_min_area_src: Mutex::new(None),
+        });
+        let vs = VectorSource::Windowed(src.clone());
+        let g = laea();
+        let opts = MvtOptimizations {
+            min_feature_px: 2.0,
+            area_scale: 2.116,
+            ..MvtOptimizations::defaults()
+        };
+        features_for_tile(&vs, &g, 3, 3, 4, "EPSG:3035", &opts).expect("query ok");
+        let got = src.last_min_area_src.lock().unwrap().expect("query_gated was called");
+        let expected = min_area_src_for_grid(&g, 3, "EPSG:3035", opts.area_scale, opts.min_feature_px);
+        assert!(
+            (got - expected).abs() < expected * 1e-9,
+            "got {got}, expected {expected}"
+        );
     }
 }
