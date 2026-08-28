@@ -146,11 +146,19 @@ pub fn min_area_src_for_grid(
     // knob OFF (EU5 `buildings`: no `--mvt-min-feature-px` value survives from z0, where a pixel is
     // ~309 km², to any zoom a real building clears -- see `deploy/vps/eu5.yaml`) that was ~98% of a
     // tile's 20,000-feature budget spent on features that render nothing, and WHICH ~2% survived
-    // varied tile to tile -- a visible density seam at every tile boundary. The extent packs
-    // `EXTENT / DISPLAY_TILE_PX` (16) grid cells per display pixel on a side, so one cell's area is
-    // `one_px_area_src / 256`. A per-zoom constant like the configured gate, so still seam-free by
-    // the same argument as the rest of this function.
-    let cell_floor_src = one_px_area_src / (EXTENT as f64 / DISPLAY_TILE_PX).powi(2);
+    // varied tile to tile -- a visible density seam at every tile boundary.
+    //
+    // `one_px_area_src` above is already the area of one REAL served pixel (`lvl.resolution` is
+    // grid-aware -- see this function's own doc comment on why that matters for a 512-px grid).
+    // The 4096-unit MVT extent packs `EXTENT / tms.tile_w` grid cells across that same real pixel
+    // -- NOT a hardcoded 256/`DISPLAY_TILE_PX`, which is `min_feature_px`'s OWN calibration basis
+    // (a display-pixel convention independent of what this grid's tiles actually serve at). Using
+    // `DISPLAY_TILE_PX` here was wrong for any non-256-px grid (this project ships
+    // `WebMercatorQuad_512`): it would divide by 256 (16²) when the true divisor on a 512-px tile
+    // is 64 (8²), making the floor 4x too lenient there. A per-zoom constant like the configured
+    // gate either way, so still seam-free by the same argument as the rest of this function.
+    let cells_per_px = EXTENT as f64 / tms.tile_w as f64;
+    let cell_floor_src = one_px_area_src / cells_per_px.powi(2);
 
     if min_feature_px <= 0.0 {
         return cell_floor_src;
@@ -548,13 +556,24 @@ pub fn encode_tile_opt(
             if clipped_groups.is_empty() {
                 continue;
             }
+            // As in `encode_feature_geometry` (the normal path below): `clipped_groups` being
+            // non-empty only means clipping survived BEFORE rounding. A dissolved patch smaller
+            // than one MVT grid cell still rounds every ring down to <3 distinct points, and
+            // `encode_multipolygon`/`emit_ring` correctly emit nothing for that -- an empty
+            // command stream must not become a wire feature here either (same defect Fable-5's
+            // review of the size-gate fix found: this branch builds its `Encoded` directly
+            // instead of going through `encode_feature_geometry`, so it needs its own check).
+            let commands = mvtgeom::encode_multipolygon(&clipped_groups);
+            if commands.is_empty() {
+                continue;
+            }
             let ki = intern_key(&mut enc.key_list, &mut enc.key_idx, field);
             let vi = intern_val(&mut enc.val_list, &mut enc.val_idx, value);
             enc.out_features.push(Encoded {
                 fid: CELL_FID_BASE + fi as u64,
                 tags: vec![ki, vi],
                 geom_type: mvtgeom::GEOM_POLYGON,
-                commands: mvtgeom::encode_multipolygon(&clipped_groups),
+                commands,
             });
         }
         // Points/lines survivors: polygons with the class field were replaced above; encode the rest.
@@ -1379,10 +1398,31 @@ mod grid_aware_gate_tests {
         let got = min_area_src_for_grid(&g, 3, "EPSG:3035", 2.116, 0.0);
         assert!(got > 0.0, "the off knob must not disable the cell floor");
         let res = 17_578.125 / 2f64.powi(3);
-        let expected_cell = (res * res) / 256.0; // EXTENT/DISPLAY_TILE_PX = 16, squared = 256
+        // LAEA's fixture ships 256-px tiles, so EXTENT/tile_w = 4096/256 = 16, squared = 256.
+        let expected_cell = (res * res) / 256.0;
         assert!(
             (got - expected_cell).abs() < expected_cell * 1e-9,
             "got {got}, expected one grid cell {expected_cell}"
+        );
+    }
+
+    /// A real bug this project already shipped once (the doc comment above this function walks
+    /// through it for `min_feature_px`): a 512-px grid packs `4096/512 = 8` MVT cells per real
+    /// pixel, not the 256-px grid's 16 -- so "one cell" there is `resolution² / 64`, not `/ 256`.
+    /// The floor must use the SAME grid-aware basis `min_feature_px` already does
+    /// (`tms.tile_w`), not a hardcoded 256/`DISPLAY_TILE_PX`, or it is 4x too lenient on this grid.
+    #[test]
+    fn the_cell_floor_is_grid_aware_not_hardcoded_256px() {
+        let g512 = tms::preset("WebMercatorQuad", 512).expect("preset");
+        let got = min_area_src_for_grid(&g512, 11, "EPSG:3035", 2.116, 0.0);
+        assert!(got > 0.0, "the off knob must not disable the cell floor");
+        let px_m = merc_m_per_px(11) / 2.0; // half `merc_m_per_px`'s 256-px assumption, per
+        // `a_512px_mercator_grid_was_four_times_too_aggressive` above
+        let one_px_area_src = (px_m * px_m) / 2.116;
+        let expected_cell = one_px_area_src / 64.0; // 4096/512 = 8, squared = 64
+        assert!(
+            (got - expected_cell).abs() < expected_cell * 1e-6,
+            "got {got}, expected one 512-px grid cell {expected_cell}"
         );
     }
 
