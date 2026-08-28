@@ -138,7 +138,12 @@ fn read_through_hits_archive_and_falls_back_live() {
     let mut found_archive_hit = false;
     'outer: for x in c0..=c1 {
         for y in r0..=r1 {
-            if let Some(archived) = reader.get(2, x, y).unwrap() {
+            // Every tile in the built range is archived now (even featureless ones get a real,
+            // deduplicated empty entry -- see `generate.rs`), so `reader.get` returning `Some` no
+            // longer implies "has geometry". An empty archived tile has no `Layer` message at all
+            // (0 bytes on the wire), so it carries no embedded name to distinguish it from a live
+            // "countries" encode of the same empty ground -- skip to a tile that actually has data.
+            if let Some(archived) = reader.get(2, x, y).unwrap().filter(|b| !b.is_empty()) {
                 let served = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 2, x, y).unwrap();
                 let live_countries =
                     render_mvt_tile(&st_no_archive, LAYER, "WebMercatorQuad", 2, x, y).unwrap();

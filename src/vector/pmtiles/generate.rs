@@ -3,7 +3,9 @@
 
 //! Offline PMTiles v3 pyramid generator: drive `encode_tile_opt` over a WebMercatorQuad grid in
 //! Hilbert-TileID order per zoom, gzip each tile, and feed the dedup + RLE-collapsing streaming
-//! writer (Task 5). Empty (fully-clipped / featureless) tiles are omitted entirely.
+//! writer (Task 5). Empty (fully-clipped / featureless) tiles WITHIN the baked range get a real
+//! (deduplicated, near-zero-cost) entry too -- see the note on the `mvt.is_empty()` check below for
+//! why omitting them is a production outage, not a size optimization.
 
 use super::write::{Counts, HeaderFields, PmtilesWriter};
 use super::{codec::gzip, zxy_to_tileid, PmResult};
@@ -109,9 +111,19 @@ pub fn build_pmtiles(
                 .collect();
             for (id, mvt) in rendered {
                 let mvt = mvt?;
-                if mvt.is_empty() {
-                    continue; // omit empty tiles entirely (no address, no blob)
-                }
+                // Write an entry EVEN when `mvt` is empty. `(x,y)` only reaches this loop because
+                // `grid.tile_limits` already put it inside the layer's real bbox -- omitting the
+                // entry does not shrink the archive's claimed coverage, it just makes this one tile
+                // MISSING inside a range the archive otherwise promises to cover. A missing tile and
+                // an ARCHIVED-EMPTY tile read identically fast from `PmtilesReader::get`
+                // (`Some(vec![])` vs `Some(mvt)`, same code path) but a missing one instead falls
+                // through to a live query at serve time -- for `buildings`-shaped layers (small
+                // features, gate near-zero at low zoom) that live query is a whole-layer scan that
+                // trips the statement timeout and 500s, the exact bug this project has now hit THREE
+                // times at three different zoom bands (z0/z1 twice, see `deploy/vps/eu5.yaml`). Cost
+                // of writing them all: `PmtilesWriter::add` dedups by content hash, so every empty
+                // tile at a zoom collapses to ONE stored (tiny, gzip-of-nothing) blob, and RLE
+                // collapses their directory entries into one run when they're id-adjacent.
                 w.add(id, gzip(&mvt))?;
             }
         }

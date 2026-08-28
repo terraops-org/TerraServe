@@ -1,8 +1,11 @@
 //! End-to-end: generate a tiny `.pmtiles` from a fixture, then read every tile back and assert it is
-//! byte-identical to a live `encode_tile_opt` render — and that tiles the generator omitted (empty
-//! MVT) are genuinely absent from the archive. The Layer + `MvtOptimizations` are built INLINE the
-//! same way `tests/mvt_http.rs`'s `vector_layer()`/`state()` do, so the pyramid uses the exact
-//! (Layer, opts) pair the live serve routes use.
+//! byte-identical to a live `encode_tile_opt` render -- including tiles that live-encode empty, which
+//! must still come back `Some(&[])` (archived-but-empty), never `None` (absent): an absent entry
+//! inside the baked range falls through to a live render at serve time, which is the z0/z1
+//! "archive covers everything except the one range that matters" bug (see `deploy/vps/eu5.yaml`),
+//! not a size optimization. The Layer + `MvtOptimizations` are built INLINE the same way
+//! `tests/mvt_http.rs`'s `vector_layer()`/`state()` do, so the pyramid uses the exact (Layer, opts)
+//! pair the live serve routes use.
 
 use std::sync::Arc;
 
@@ -106,7 +109,11 @@ fn generated_pmtiles_reads_back_identical_tiles() {
                     );
                     let got = r.get(z, x, y).unwrap();
                     if live.is_empty() {
-                        assert_eq!(got, None, "empty tile absent from archive: {z}/{x}/{y}");
+                        assert_eq!(
+                            got.as_deref(),
+                            Some(&b""[..]),
+                            "empty tile still ARCHIVED (present, zero bytes), not absent: {z}/{x}/{y}"
+                        );
                     } else {
                         assert_eq!(
                             got.as_deref(),

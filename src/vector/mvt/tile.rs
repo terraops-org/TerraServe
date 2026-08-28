@@ -122,24 +122,40 @@ pub fn min_area_src_for_grid(
     area_scale: f64,
     min_feature_px: f64,
 ) -> f64 {
-    if min_feature_px <= 0.0 {
-        return 0.0;
-    }
     let Some(lvl) = tms.level(z) else {
         return 0.0; // out of the grid: gate off rather than guess
     };
     if !(lvl.resolution > 0.0) || !lvl.resolution.is_finite() {
         return 0.0;
     }
-    if tms.crs.eq_ignore_ascii_case(src_crs) {
+    let one_px_area_src = if tms.crs.eq_ignore_ascii_case(src_crs) {
         // Same CRS — the pixel footprint is already in source units.
-        return min_feature_px * lvl.resolution * lvl.resolution;
+        lvl.resolution * lvl.resolution
+    } else if area_scale > 0.0 {
+        let px_m = lvl.resolution * crate::tms::meters_per_unit(&tms.crs);
+        px_m * px_m / area_scale
+    } else {
+        return 0.0; // fail OPEN, as this function always has
+    };
+
+    // ALWAYS-ON floor, independent of `min_feature_px` (including `0.0`, "gate off"). A ring
+    // smaller than one MVT grid cell rounds every vertex to the same integer point in
+    // `to_i32_ring`; `emit_ring`/`encode_line` then correctly refuse to emit the resulting <3-point
+    // ring / <2-point line part, but nothing upstream of that knew the feature was doomed, so it
+    // still occupied one slot of `sampled_positions`'s uniform sample. On a layer baked with the
+    // knob OFF (EU5 `buildings`: no `--mvt-min-feature-px` value survives from z0, where a pixel is
+    // ~309 km², to any zoom a real building clears -- see `deploy/vps/eu5.yaml`) that was ~98% of a
+    // tile's 20,000-feature budget spent on features that render nothing, and WHICH ~2% survived
+    // varied tile to tile -- a visible density seam at every tile boundary. The extent packs
+    // `EXTENT / DISPLAY_TILE_PX` (16) grid cells per display pixel on a side, so one cell's area is
+    // `one_px_area_src / 256`. A per-zoom constant like the configured gate, so still seam-free by
+    // the same argument as the rest of this function.
+    let cell_floor_src = one_px_area_src / (EXTENT as f64 / DISPLAY_TILE_PX).powi(2);
+
+    if min_feature_px <= 0.0 {
+        return cell_floor_src;
     }
-    if !(area_scale > 0.0) {
-        return 0.0; // fail OPEN, as `min_area_src_for_zoom` always has
-    }
-    let px_m = lvl.resolution * crate::tms::meters_per_unit(&tms.crs);
-    min_feature_px * px_m * px_m / area_scale
+    (min_feature_px * one_px_area_src).max(cell_floor_src)
 }
 
 /// The WebMercatorQuad zoom whose display resolution matches an OGC scale denominator — the
@@ -653,7 +669,16 @@ fn encode_feature_geometry(
     rect: [f64; 4],
     dedup: bool,
 ) -> Option<(u32, Vec<u32>)> {
-    match geom {
+    // Every branch below decides "does this feature survive" from its PRE-rounding clipped rings/
+    // parts, then rounds to the integer MVT grid afterwards via `to_i32_ring`. At low zoom a ring
+    // smaller than one grid cell rounds every vertex to the same point; `emit_ring`/`encode_line`
+    // then correctly refuse to emit a <3-point ring or <2-point line part, but the branch has
+    // already committed to `Some(...)`, so the result is a "feature" whose command stream is empty
+    // -- present on the wire, invisible, and (worse) a wasted slot in `sampled_positions`'s uniform
+    // sample, since that sampling runs on the PRE-rounding candidate count. Filtering here, once,
+    // for every geometry type turns those into a `None` like any other feature clipped away to
+    // nothing, so `encode_survivors`'s existing `continue` on `None` drops them for free.
+    let result = match geom {
         Geometry::Point(p) => {
             let [px, py] = to_pixel(proj, *p)?;
             if px < rect[0] || px > rect[2] || py < rect[1] || py > rect[3] {
@@ -727,7 +752,8 @@ fn encode_feature_geometry(
                 mvtgeom::encode_multipolygon(&poly_groups),
             ))
         }
-    }
+    };
+    result.filter(|(_, commands)| !commands.is_empty())
 }
 
 fn to_pixel(proj: &Projector, p: [f64; 2]) -> Option<[f64; 2]> {
@@ -1319,13 +1345,41 @@ mod grid_aware_gate_tests {
         }
     }
 
-    /// Fail OPEN, as the gate always has: off knob, out-of-grid zoom, uncomputable calibration.
+    /// Fail OPEN, as the gate always has: out-of-grid zoom, uncomputable calibration. The `0.0`
+    /// ("off") knob is NOT in this list any more -- see `the_cell_floor_survives_an_off_knob` below.
     #[test]
     fn degenerate_inputs_disable_the_gate() {
         let g = laea();
-        assert_eq!(min_area_src_for_grid(&g, 10, "EPSG:3035", 2.116, 0.0), 0.0);
         assert_eq!(min_area_src_for_grid(&g, 99, "EPSG:3035", 2.116, 2.0), 0.0);
         // different CRS + no calibration -> off, not a wild guess
         assert_eq!(min_area_src_for_grid(&g, 10, "EPSG:4326", 0.0, 2.0), 0.0);
+    }
+
+    /// The bug this module exists to prevent: EU5 `buildings` bakes with `--mvt-min-feature-px`
+    /// UNSET (0.0) because any cartographic value big enough to matter at z3 also wipes z0 (see
+    /// `deploy/vps/eu5.yaml`). `0.0` must still floor at one MVT grid cell, or every building
+    /// rounds to a degenerate point at low zoom, gets encoded as an empty-geometry feature, and
+    /// wastes almost the entire `--mvt-max-features` budget on invisible slots.
+    #[test]
+    fn the_cell_floor_survives_an_off_knob() {
+        let g = laea();
+        let got = min_area_src_for_grid(&g, 3, "EPSG:3035", 2.116, 0.0);
+        assert!(got > 0.0, "the off knob must not disable the cell floor");
+        let res = 17_578.125 / 2f64.powi(3);
+        let expected_cell = (res * res) / 256.0; // EXTENT/DISPLAY_TILE_PX = 16, squared = 256
+        assert!(
+            (got - expected_cell).abs() < expected_cell * 1e-9,
+            "got {got}, expected one grid cell {expected_cell}"
+        );
+    }
+
+    /// The floor must never OVERRIDE a real configured gate that is already coarser than one cell
+    /// -- it is a backstop for values too small (or absent) to matter, not a replacement.
+    #[test]
+    fn a_real_gate_still_wins_over_the_floor() {
+        let g = laea();
+        let gated = min_area_src_for_grid(&g, 10, "EPSG:3035", 2.116, 2.0);
+        let res = 17_578.125 / 2f64.powi(10);
+        assert!((gated - 2.0 * res * res).abs() < 1e-6, "got {gated}");
     }
 }
