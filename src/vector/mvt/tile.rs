@@ -1112,6 +1112,52 @@ mod tests {
         );
     }
 
+    /// The property the whole design rests on, for LINES specifically: a road that CROSSES a tile
+    /// boundary must be kept in BOTH neighbours or dropped in BOTH, never one and not the other.
+    /// That holds because the gate reads `f.length` -- computed once at load from the feature's
+    /// whole source geometry, before any clipping -- and the per-zoom threshold, and nothing about
+    /// the tile. A per-tile decision (which is what `--mvt-max-features` sampling makes) would cut
+    /// the road at the edge instead.
+    #[test]
+    fn line_selection_is_seam_free_across_adjacent_tiles() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        use crate::vector::feature::{Feature, Geometry, Props};
+        let grid = crate::tms::preset("WebMercatorQuad", 256).unwrap();
+        // A line straddling the shared edge (x = 0) of z6 tiles x=31 and x=32, row y=24.
+        let long = Feature::new(
+            Geometry::LineString(vec![[-100_000.0, 4.7e6], [100_000.0, 4.7e6]]),
+            Props::new(),
+            1,
+        );
+        assert!(
+            (long.length - 200_000.0).abs() < 1.0,
+            "length {}",
+            long.length
+        );
+        let src = VecSource {
+            feats: vec![long],
+            extent: [-100_000.0, 4.6e6, 100_000.0, 4.8e6],
+        };
+        let unit = super::min_len_src_for_grid(&grid, 6, "EPSG:3857", 1.0, 1.0);
+        let enc = |x: u32, len_px: f64| {
+            let opts = MvtOptimizations {
+                max_features: 0,
+                min_feature_len_px: vec![(0, len_px)],
+                area_scale: 1.0,
+                ..MvtOptimizations::defaults()
+            };
+            encode_tile_opt(src.features(), &grid, 6, x, 24, "EPSG:3857", "t", &opts)
+        };
+        // Threshold below the line's length: BOTH neighbours emit it.
+        let below = 100_000.0 / unit;
+        assert!(!enc(31, below).is_empty(), "left tile must keep it");
+        assert!(!enc(32, below).is_empty(), "right tile must keep it");
+        // Threshold above it: BOTH neighbours drop it. Never one and not the other.
+        let above = 400_000.0 / unit;
+        assert!(enc(31, above).is_empty(), "left tile must drop it");
+        assert!(enc(32, above).is_empty(), "right tile must drop it");
+    }
+
     /// The LINE gate at the encoder, and that it partitions cleanly against the polygon gate: a
     /// short line is dropped inside its step and kept below it, while a polygon in the same tile is
     /// untouched by the length gate no matter what.
