@@ -265,6 +265,9 @@ pub struct ServeState {
     /// `serve --mvt-min-feature-px-min-zoom`. MVT paths only -- the raster gate
     /// (`raster_min_feature_px`) derives its threshold from a request's own scale, not a zoom band.
     pub mvt_min_feature_min_zoom: u32,
+    /// Per-zoom min feature LENGTH steps for LINE geometry, display-px, ascending
+    /// `(from_zoom, value)`. From `serve --mvt-min-feature-len-px`; empty = off.
+    pub mvt_min_feature_len_px: Vec<(u32, f64)>,
     /// Disable the default-on MVT geometry optimizations (grid-snap dedup) — raw rounded rings. From
     /// `serve --no-optimizations`. Opt-in thinning flags stay independent. Default `false`.
     pub mvt_no_optimizations: bool,
@@ -360,6 +363,7 @@ impl ServeState {
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
             mvt_min_feature_min_zoom: 0,
+            mvt_min_feature_len_px: Vec::new(),
             mvt_no_optimizations: false,
             mvt_no_safety_limit: false,
             mvt_cell_px: 0.0,

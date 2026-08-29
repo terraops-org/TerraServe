@@ -166,6 +166,49 @@ pub fn min_area_src_for_grid(
     (min_feature_px * one_px_area_src).max(cell_floor_src)
 }
 
+/// The per-zoom min-feature-LENGTH threshold in SOURCE-CRS units, for line geometry -- the exact
+/// mirror of [`min_area_src_for_grid`], one dimension down.
+///
+/// `len_px` is a length in display pixels, so the threshold is `len_px * resolution` where
+/// `resolution` is the grid level's CRS-units-per-pixel (grid-aware, for the same reasons spelled
+/// out on `min_area_src_for_grid`: a 512-px tile and a non-mercator CRS both make a hardcoded
+/// mercator formula wrong). Cross-CRS falls back to `sqrt(area_scale)`, which is mercator metres
+/// per source unit -- the linear analogue of the area path's `area_scale`.
+///
+/// Carries the same ALWAYS-ON floor, at one MVT grid cell of length: a line shorter than one cell
+/// has every vertex round to the same integer point in `to_i32_ring`, `encode_line` correctly
+/// refuses to emit the resulting <2-point part, and nothing upstream knew the feature was doomed --
+/// so it still consumed one slot of `sampled_positions`'s uniform sample. That is exactly the bug
+/// b9eb993 fixed for polygons; `f.area > 0.0` exempted lines from that fix, and this closes it.
+/// Measured on the live EU5 roads archive, degenerate lines were 45% of a z3 tile's 20,000-feature
+/// budget. Per-zoom constant, so seam-free by the same argument as everything else here.
+pub fn min_len_src_for_grid(
+    tms: &TileMatrixSet,
+    z: u32,
+    src_crs: &str,
+    area_scale: f64,
+    len_px: f64,
+) -> f64 {
+    let Some(lvl) = tms.level(z) else {
+        return 0.0; // out of the grid: gate off rather than guess
+    };
+    if !(lvl.resolution > 0.0) || !lvl.resolution.is_finite() {
+        return 0.0;
+    }
+    let one_px_len_src = if tms.crs.eq_ignore_ascii_case(src_crs) {
+        lvl.resolution
+    } else if area_scale > 0.0 {
+        lvl.resolution * crate::tms::meters_per_unit(&tms.crs) / area_scale.sqrt()
+    } else {
+        return 0.0; // fail OPEN, as the area path does
+    };
+    let cell_floor_src = one_px_len_src / (EXTENT as f64 / tms.tile_w as f64);
+    if len_px <= 0.0 {
+        return cell_floor_src;
+    }
+    (len_px * one_px_len_src).max(cell_floor_src)
+}
+
 /// The WebMercatorQuad zoom whose display resolution matches an OGC scale denominator — the
 /// inverse of [`merc_m_per_px`]. `scale · 0.00028` is ground metres per pixel (the OGC 0.28 mm/px
 /// rule that `render::request_scale_denominator` encodes), so this inverts
@@ -426,6 +469,13 @@ pub fn encode_tile_opt(
     // `min_area_src_for_grid` returns its always-on cell floor, exactly as an unset gate does.
     let min_area_src =
         min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px_at(z));
+    let min_len_src = min_len_src_for_grid(
+        tms,
+        z,
+        src_crs,
+        opts.area_scale,
+        opts.min_feature_len_px_at(z),
+    );
     let Some(bbox) = tms.tile_bounds(z, x, y) else {
         return Vec::new();
     };
@@ -472,6 +522,16 @@ pub fn encode_tile_opt(
             && min_area_src > 0.0
             && f.area > 0.0
             && f.area < min_area_src
+        {
+            continue;
+        }
+        // The same selection for LINE geometry, against `min_len_src`. `f.length` is 0 for points
+        // and polygons exactly as `f.area` is 0 for lines, so the two gates partition the geometry
+        // types between them and neither can touch a Point. Per-zoom constant, so seam-free.
+        if !(mosaic_active || dissolve_active)
+            && min_len_src > 0.0
+            && f.length > 0.0
+            && f.length < min_len_src
         {
             continue;
         }
@@ -1049,6 +1109,69 @@ mod tests {
         assert!(
             encode_tile_opt(src.features(), &grid, 6, 32, 24, "EPSG:3857", "t", &opts).is_empty(),
             "z6 is inside the band: the configured gate applies and this feature is under it"
+        );
+    }
+
+    /// The LINE gate at the encoder, and that it partitions cleanly against the polygon gate: a
+    /// short line is dropped inside its step and kept below it, while a polygon in the same tile is
+    /// untouched by the length gate no matter what.
+    #[test]
+    fn the_length_gate_drops_short_lines_per_zoom_and_never_polygons() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        use crate::vector::feature::{Feature, Geometry, Props};
+        let grid = crate::tms::preset("WebMercatorQuad", 256).unwrap();
+        // Source units per display pixel at each zoom, from the encoder's own function.
+        let px6 = super::min_len_src_for_grid(&grid, 6, "EPSG:3857", 1.0, 1.0);
+        let px5 = super::min_len_src_for_grid(&grid, 5, "EPSG:3857", 1.0, 1.0);
+        // Steps: 2 px from z0, 0.3 px from z6. Pick a line whose length falls between the z6 threshold (0.3·px6)
+        // and the z5 one (2·px5 = 4·px6), so z5 drops it and z6 keeps it -- the ROADS shape, where
+        // the gate relaxes as you zoom in.
+        let len = (0.3 * px6 + 2.0 * px5) / 2.0;
+        assert!(
+            len > 0.3 * px6 && len < 2.0 * px5,
+            "fixture must straddle the two steps"
+        );
+        let (x0, y0) = (100_000.0, 4.6e6);
+        let line = Feature::new(
+            Geometry::LineString(vec![[x0, y0], [x0 + len, y0]]),
+            Props::new(),
+            1,
+        );
+        assert!(
+            (line.length - len).abs() < 1.0,
+            "length {} vs {len}",
+            line.length
+        );
+        // A polygon of the same span: zero LENGTH, so the length gate must never see it.
+        let poly = rect_feature(x0, y0, x0 + len, y0 + len, 2);
+        assert_eq!(
+            poly.length, 0.0,
+            "a polygon has no length, mirroring a line having no area"
+        );
+        let src = VecSource {
+            feats: vec![line, poly],
+            extent: [x0, y0, x0 + len, y0 + len],
+        };
+        let opts = MvtOptimizations {
+            max_features: 0,
+            min_feature_len_px: vec![(0, 2.0), (6, 0.3)],
+            area_scale: 1.0,
+            ..MvtOptimizations::defaults()
+        };
+        // z5: step is 2 px, the line is shorter than that -> dropped. The polygon still encodes,
+        // so a non-empty tile here proves the length gate did not touch it.
+        let t5 = encode_tile_opt(src.features(), &grid, 5, 16, 12, "EPSG:3857", "t", &opts);
+        assert!(
+            !t5.is_empty(),
+            "the polygon must survive the length gate at every zoom"
+        );
+        // z6: step relaxes to 0.3 px, so the line comes back and the tile grows.
+        let t6 = encode_tile_opt(src.features(), &grid, 6, 32, 24, "EPSG:3857", "t", &opts);
+        assert!(
+            t6.len() > t5.len(),
+            "z6 must carry the line the z5 step dropped ({} vs {} bytes)",
+            t6.len(),
+            t5.len()
         );
     }
 

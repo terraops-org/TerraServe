@@ -80,6 +80,10 @@ pub struct BuildPmtilesArgs {
     /// archived neighbours.
     #[arg(long = "mvt-min-feature-px-min-zoom", default_value_t = 0)]
     pub mvt_min_feature_min_zoom: u32,
+    /// See `serve --mvt-min-feature-len-px`. A bake and the live server MUST agree on this, or an
+    /// archive miss renders differently from its archived neighbours.
+    #[arg(long = "mvt-min-feature-len-px", default_value = "")]
+    pub mvt_min_feature_len_px: String,
     /// See `serve --raster-min-feature-px`. Overrides the value above for a `--tile-format png`
     /// bake only. ⚠ Low-zoom raster tiles of a dense layer are MADE of sub-pixel features -- their
     /// map IS the aggregate texture -- so a low-zoom pyramid usually wants this at `0`, even when
@@ -200,6 +204,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         mvt_max_features: args.mvt_max_features,
         mvt_min_feature_px: args.mvt_min_feature_px,
         mvt_min_feature_min_zoom: args.mvt_min_feature_min_zoom,
+        mvt_min_feature_len_px: args.mvt_min_feature_len_px.clone(),
         raster_min_feature_px: args.raster_min_feature_px,
         mvt_no_optimizations: args.mvt_no_optimizations,
         mvt_no_safety_limit: args.mvt_no_safety_limit,
@@ -270,6 +275,8 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     state.mvt_max_features = serve_args.mvt_max_features;
     state.mvt_min_feature_px = serve_args.mvt_min_feature_px;
     state.mvt_min_feature_min_zoom = serve_args.mvt_min_feature_min_zoom;
+    state.mvt_min_feature_len_px =
+        crate::vector::mvt::parse_len_px_spec(&serve_args.mvt_min_feature_len_px)?;
     state.mvt_no_optimizations = serve_args.mvt_no_optimizations;
     state.mvt_no_safety_limit = serve_args.mvt_no_safety_limit;
     crate::vector::mvt::validate_cell_flags(serve_args.mvt_cell_px, &serve_args.mvt_cell_field)?;
@@ -338,6 +345,10 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
             (
                 "--mvt-min-feature-px-min-zoom",
                 args.mvt_min_feature_min_zoom != 0,
+            ),
+            (
+                "--mvt-min-feature-len-px",
+                !args.mvt_min_feature_len_px.trim().is_empty(),
             ),
             ("--no-safety-limit", args.mvt_no_safety_limit),
             ("--no-optimizations", args.mvt_no_optimizations),

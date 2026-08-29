@@ -191,6 +191,29 @@ pub struct ServeArgs {
     /// scale rather than a zoom.
     #[arg(long = "mvt-min-feature-px-min-zoom", default_value_t = 0)]
     pub mvt_min_feature_min_zoom: u32,
+    /// Minimum on-screen LENGTH (display pixels) for a LINE feature to be drawn at a given zoom --
+    /// the mirror of `--mvt-min-feature-px`, which gates POLYGONS by area. Points are untouched by
+    /// both. Empty (the default) = off.
+    ///
+    /// Takes either one number (the gate at every zoom) or a comma list of `zoom:value` STEPS, e.g.
+    /// `0:2.0,7:0.3` = 2 px from z0 and 0.3 px from z7 up. A step list rather than a single value
+    /// because a road network wants the opposite shape to a building layer -- AGGRESSIVE at
+    /// overview zoom and GENTLE deep in. Measured on 44M OSM highway lines over the EU: one z2 tile
+    /// holds 24.2M candidate lines and one z10 tile holds 39,924, so no single threshold both keeps
+    /// a z2 tile drawable and keeps a z10 street map complete. A step's value may be `0`, meaning
+    /// "gate off from this zoom up".
+    ///
+    /// This exists because `--mvt-max-features` is the only other lever on a line layer, and it is
+    /// NOT seam-free: when the cap binds, the surviving rate is cap/candidates, a PER-TILE number,
+    /// so every tile draws the same feature count regardless of what is under it and the density
+    /// steps at every tile edge. A per-zoom length threshold is a per-ZOOM CONSTANT -- every tile
+    /// at a zoom makes the identical keep/drop decision -- so sizing this until the cap stops
+    /// binding is what actually removes the seam.
+    ///
+    /// In-memory only: unlike `--mvt-min-feature-px` there is no SQL pushdown yet, so a PostGIS
+    /// layer still fetches the rows and discards them in the encoder.
+    #[arg(long = "mvt-min-feature-len-px", default_value = "")]
+    pub mvt_min_feature_len_px: String,
     /// Override `--mvt-min-feature-px` for the RASTER paths only (WMS GetMap, WMTS/TMS PNG tiles,
     /// `build-pmtiles --tile-format png`). Unset = the raster paths use `--mvt-min-feature-px`.
     ///
@@ -526,6 +549,8 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
     state.mvt_max_features = args.mvt_max_features;
     state.mvt_min_feature_px = args.mvt_min_feature_px;
     state.mvt_min_feature_min_zoom = args.mvt_min_feature_min_zoom;
+    state.mvt_min_feature_len_px =
+        crate::vector::mvt::parse_len_px_spec(&args.mvt_min_feature_len_px)?;
     state.mvt_no_optimizations = args.mvt_no_optimizations;
     if args.mvt_no_optimizations {
         println!(
@@ -621,6 +646,17 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
             args.mvt_min_feature_px
         );
     }
+    if !state.mvt_min_feature_len_px.is_empty() {
+        let steps: Vec<String> = state
+            .mvt_min_feature_len_px
+            .iter()
+            .map(|(z, v)| format!("z≥{z}:{v}"))
+            .collect();
+        println!(
+            "MVT min feature length (lines): {} px (per-zoom seam-free selection)",
+            steps.join(" ")
+        );
+    }
     if let Some(path) = &args.mvt_style {
         let text =
             assets::read_config_string(path, &s3_env).map_err(|e| format!("--mvt-style {e}"))?;
@@ -703,6 +739,21 @@ mod cli_name_tests {
         // Absent = 0 = every zoom, the pre-band behaviour.
         let d = Wrap::try_parse_from(["serve", "--cog", "x.tif"]).expect("defaults parse");
         assert_eq!(d.inner.mvt_min_feature_min_zoom, 0);
+        assert_eq!(
+            d.inner.mvt_min_feature_len_px, "",
+            "no length gate by default"
+        );
+
+        // The LINE gate's step-list spelling, same pinning reason as above.
+        let l = Wrap::try_parse_from([
+            "serve",
+            "--cog",
+            "x.tif",
+            "--mvt-min-feature-len-px",
+            "0:2.0,7:0.3",
+        ])
+        .expect("--mvt-min-feature-len-px must parse");
+        assert_eq!(l.inner.mvt_min_feature_len_px, "0:2.0,7:0.3");
 
         // Cheap structural check that the flags are well-formed while we are here.
         let _ = <ServeArgs as Args>::augment_args(clap::Command::new("serve"));

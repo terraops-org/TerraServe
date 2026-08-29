@@ -15,9 +15,9 @@ pub mod simplify;
 pub mod tile;
 pub mod wire;
 
-pub use opts::{cell_units, validate_cell_flags, MvtOptimizations};
+pub use opts::{cell_units, parse_len_px_spec, validate_cell_flags, MvtOptimizations};
 pub use tile::{
     encode_tile, encode_tile_opt, features_for_tile, layer_area_scale, min_area_src_for_grid,
-    min_area_src_for_scale, min_area_src_for_zoom, zoom_for_scale_denominator,
-    DEFAULT_MAX_FEATURES_PER_TILE,
+    min_area_src_for_scale, min_area_src_for_zoom, min_len_src_for_grid,
+    zoom_for_scale_denominator, DEFAULT_MAX_FEATURES_PER_TILE,
 };

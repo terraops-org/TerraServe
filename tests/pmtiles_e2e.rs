@@ -156,6 +156,7 @@ fn build_pmtiles_uses_the_given_layer_name() {
         mvt_max_features: terraserve::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
         mvt_min_feature_px: 0.0,
         mvt_min_feature_min_zoom: 0,
+        mvt_min_feature_len_px: String::new(),
         raster_min_feature_px: None,
         mvt_no_optimizations: false,
         mvt_no_safety_limit: false,

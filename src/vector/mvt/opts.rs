@@ -22,6 +22,12 @@ pub struct MvtOptimizations {
     pub dedup: bool,
     /// Per-zoom seam-free min feature size, display-px² (0 = off). Opt-in `--mvt-min-feature-px`.
     pub min_feature_px: f64,
+    /// Per-zoom min feature LENGTH steps for line geometry, display-px, as ascending
+    /// `(from_zoom, value)` pairs; empty = off. The mirror of `min_feature_px` for lines, and a
+    /// STEP LIST rather than a value-plus-band because a road network needs the opposite shape to a
+    /// building layer: strong at overview zoom, weak deep in. See
+    /// [`MvtOptimizations::min_feature_len_px_at`]. Opt-in `--mvt-min-feature-len-px`.
+    pub min_feature_len_px: Vec<(u32, f64)>,
     /// `min_feature_px` applies only at `z >= min_feature_min_zoom` (per-ZOOM constant, so seam-safe,
     /// the same argument as `cell_max_zoom`). `0` = every zoom, which is what every config without
     /// `--mvt-min-feature-px-min-zoom` resolves to. See [`MvtOptimizations::min_feature_px_at`].
@@ -72,6 +78,25 @@ impl MvtOptimizations {
         }
     }
 
+    /// The configured `--mvt-min-feature-len-px` AS IT APPLIES AT ZOOM `z`: the value of the last
+    /// step at or below `z`, or `0.0` ("gate off", the reading every consumer already gives a
+    /// non-positive threshold) when no step covers it.
+    ///
+    /// A step LIST, where the area gate got a value plus a one-sided band, because line layers want
+    /// the opposite shape. Measured on the EU5 roads table over the Paris column: a road network
+    /// has 24.2M candidate lines in one z2 tile and 39,924 in one z10 tile, so the gate has to be
+    /// AGGRESSIVE at overview zoom (2 px keeps 950 at z2) and GENTLE deep in (0.3 px keeps 29,583
+    /// at z10). One value cannot do both, and a `min_zoom` band can only turn one value on or off.
+    ///
+    /// Per-ZOOM constant like every other gate here, so still seam-free by construction.
+    pub fn min_feature_len_px_at(&self, z: u32) -> f64 {
+        self.min_feature_len_px
+            .iter()
+            .rev()
+            .find(|(from, _)| z >= *from)
+            .map_or(0.0, |(_, v)| *v)
+    }
+
     /// The default set: dedup on, no size/cell generalization, the default feature budget. Produces
     /// byte-identical output to today's `encode_tile` default path.
     pub fn defaults() -> Self {
@@ -79,6 +104,7 @@ impl MvtOptimizations {
             max_features: super::DEFAULT_MAX_FEATURES_PER_TILE,
             dedup: true,
             min_feature_px: 0.0,
+            min_feature_len_px: Vec::new(),
             min_feature_min_zoom: 0,
             area_scale: 0.0,
             cell_units: 0,
@@ -98,6 +124,7 @@ impl MvtOptimizations {
             state.mvt_no_safety_limit,
             state.mvt_no_optimizations,
             state.mvt_min_feature_px,
+            state.mvt_min_feature_len_px.clone(),
             state.mvt_min_feature_min_zoom,
             layer.area_scale,
             cell_units(state.mvt_cell_px),
@@ -118,6 +145,7 @@ impl MvtOptimizations {
         no_safety_limit: bool,
         no_optimizations: bool,
         min_feature_px: f64,
+        min_feature_len_px: Vec<(u32, f64)>,
         min_feature_min_zoom: u32,
         area_scale: f64,
         cell_units: u32,
@@ -136,6 +164,7 @@ impl MvtOptimizations {
             max_features: if no_safety_limit { 0 } else { max_features },
             dedup: !no_optimizations,
             min_feature_px,
+            min_feature_len_px,
             min_feature_min_zoom,
             area_scale,
             cell_units,
@@ -145,6 +174,61 @@ impl MvtOptimizations {
             dissolve_max_zoom,
         }
     }
+}
+
+/// Parse `--mvt-min-feature-len-px` into ascending `(from_zoom, value)` steps.
+///
+/// Two accepted forms, because most layers want one number and a road network wants two:
+/// * a bare number -- `"2"` means `[(0, 2.0)]`, the gate at every zoom;
+/// * a comma list of `zoom:value` -- `"0:2.0,7:0.3"` means 2 px from z0 and 0.3 px from z7 up.
+///
+/// An empty string is the off switch (no steps). A step's value may be `0`, which reads as "gate
+/// off from this zoom up" -- the only way to express a gate that stops applying deep in.
+///
+/// Rejects anything ambiguous rather than guessing: a malformed pair, a duplicate zoom, a negative
+/// or non-finite value. A silently-misparsed gate would bake a wrong pyramid for hours.
+pub fn parse_len_px_spec(spec: &str) -> Result<Vec<(u32, f64)>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !spec.contains(':') {
+        let v: f64 = spec
+            .parse()
+            .map_err(|_| format!("--mvt-min-feature-len-px: {spec:?} is not a number"))?;
+        if !v.is_finite() || v < 0.0 {
+            return Err(format!(
+                "--mvt-min-feature-len-px: {v} must be finite and >= 0"
+            ));
+        }
+        return Ok(vec![(0, v)]);
+    }
+    let mut out: Vec<(u32, f64)> = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        let (z, v) = part
+            .split_once(':')
+            .ok_or_else(|| format!("--mvt-min-feature-len-px: {part:?} is not `zoom:value`"))?;
+        let z: u32 = z
+            .trim()
+            .parse()
+            .map_err(|_| format!("--mvt-min-feature-len-px: {z:?} is not a zoom"))?;
+        let v: f64 = v
+            .trim()
+            .parse()
+            .map_err(|_| format!("--mvt-min-feature-len-px: {v:?} is not a number"))?;
+        if !v.is_finite() || v < 0.0 {
+            return Err(format!(
+                "--mvt-min-feature-len-px: {v} must be finite and >= 0"
+            ));
+        }
+        if out.iter().any(|(zz, _)| *zz == z) {
+            return Err(format!("--mvt-min-feature-len-px: zoom {z} listed twice"));
+        }
+        out.push((z, v));
+    }
+    out.sort_by_key(|(z, _)| *z);
+    Ok(out)
 }
 
 /// The mosaic cell size in tile-4096 units for `--mvt-cell-px N`: `0` (mosaic off) when `cell_px`
@@ -199,10 +283,58 @@ mod tests {
         assert_eq!(d.max_features, super::super::DEFAULT_MAX_FEATURES_PER_TILE);
         assert_eq!(d.min_feature_px, 0.0);
         assert_eq!(d.min_feature_min_zoom, 0, "no band = every zoom");
+        assert!(d.min_feature_len_px.is_empty(), "no length steps = off");
         assert_eq!(d.area_scale, 0.0);
         assert_eq!(d.cell_units, 0);
         assert!(d.cell_field.is_none());
         assert_eq!(d.cell_max_zoom, 0);
+    }
+
+    /// The per-zoom STEP LIST for `--mvt-min-feature-len-px`. Roads need the opposite shape to
+    /// buildings -- a STRONG gate at overview zoom and a weak one deep in -- so a single value plus
+    /// a one-sided band cannot express it. A step list can express either.
+    #[test]
+    fn min_feature_len_px_at_walks_the_zoom_steps() {
+        let o = MvtOptimizations {
+            min_feature_len_px: vec![(0, 2.0), (7, 0.3)],
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(o.min_feature_len_px_at(0), 2.0);
+        assert_eq!(
+            o.min_feature_len_px_at(6),
+            2.0,
+            "last step at or below 6 is z0"
+        );
+        assert_eq!(o.min_feature_len_px_at(7), 0.3, "z7 is its own step");
+        assert_eq!(o.min_feature_len_px_at(10), 0.3);
+
+        // A list that does not start at 0 leaves the lower zooms with NO configured gate.
+        let late = MvtOptimizations {
+            min_feature_len_px: vec![(5, 1.0)],
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(late.min_feature_len_px_at(4), 0.0);
+        assert_eq!(late.min_feature_len_px_at(5), 1.0);
+
+        // Default = empty = off at every zoom.
+        assert_eq!(MvtOptimizations::defaults().min_feature_len_px_at(0), 0.0);
+    }
+
+    /// The CLI spec parser: a bare number means every zoom; a comma list is `zoom:value` steps.
+    #[test]
+    fn parse_len_px_spec_accepts_a_bare_number_and_a_step_list() {
+        use super::parse_len_px_spec as p;
+        assert_eq!(p("").unwrap(), vec![]);
+        assert_eq!(p("2").unwrap(), vec![(0, 2.0)]);
+        assert_eq!(p("2.0").unwrap(), vec![(0, 2.0)]);
+        assert_eq!(p("0:2.0,7:0.3").unwrap(), vec![(0, 2.0), (7, 0.3)]);
+        // Out of order is sorted, whitespace tolerated.
+        assert_eq!(p(" 7:0.3 , 0:2 ").unwrap(), vec![(0, 2.0), (7, 0.3)]);
+        // A zero value is a legitimate step: "gate OFF from here up".
+        assert_eq!(p("0:2,8:0").unwrap(), vec![(0, 2.0), (8, 0.0)]);
+        for bad in ["x", "0:", ":2", "0:2,0:3", "-1:2", "0:-2", "0:nan", "1:2:3"] {
+            assert!(p(bad).is_err(), "{bad:?} must be rejected");
+        }
     }
 
     /// The zoom BAND for `--mvt-min-feature-px`. EU5 buildings needs the gate at z6-z10 (where a
@@ -255,6 +387,7 @@ mod tests {
             false,
             false,
             2.0,
+            Vec::new(),
             0,
             1.5,
             128,
@@ -275,7 +408,20 @@ mod tests {
     #[test]
     fn resolve_no_optimizations_clears_dedup_only() {
         // `--no-optimizations` clears dedup but leaves an opt-in min_feature_px in force.
-        let o = MvtOptimizations::resolve(5000, false, true, 2.0, 0, 1.5, 0, None, 0, None, 0);
+        let o = MvtOptimizations::resolve(
+            5000,
+            false,
+            true,
+            2.0,
+            Vec::new(),
+            0,
+            1.5,
+            0,
+            None,
+            0,
+            None,
+            0,
+        );
         assert!(!o.dedup, "no_optimizations must clear dedup");
         assert_eq!(o.min_feature_px, 2.0, "opt-in selection stays independent");
         assert_eq!(
@@ -287,9 +433,35 @@ mod tests {
     #[test]
     fn resolve_no_safety_limit_forces_unlimited() {
         // `--no-safety-limit` forces the cap to 0 (unlimited) even over a finite configured cap.
-        let o = MvtOptimizations::resolve(5000, true, false, 0.0, 0, 0.0, 0, None, 0, None, 0);
+        let o = MvtOptimizations::resolve(
+            5000,
+            true,
+            false,
+            0.0,
+            Vec::new(),
+            0,
+            0.0,
+            0,
+            None,
+            0,
+            None,
+            0,
+        );
         assert_eq!(o.max_features, 0, "no_safety_limit forces unlimited");
-        let on = MvtOptimizations::resolve(5000, false, false, 0.0, 0, 0.0, 0, None, 0, None, 0);
+        let on = MvtOptimizations::resolve(
+            5000,
+            false,
+            false,
+            0.0,
+            Vec::new(),
+            0,
+            0.0,
+            0,
+            None,
+            0,
+            None,
+            0,
+        );
         assert_eq!(on.max_features, 5000, "off = the configured cap");
     }
 
@@ -301,6 +473,7 @@ mod tests {
             false,
             false,
             0.0,
+            Vec::new(),
             0,
             0.0,
             128,

@@ -928,6 +928,7 @@ pub(crate) fn build_vector_layer(
                             fid: f.fid,
                             bbox: f.bbox,
                             area: f.area,
+                            length: f.length,
                         }
                     })
                     .collect();
@@ -1174,6 +1175,7 @@ mod windowed_gpkg_dispatch_tests {
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
             mvt_min_feature_min_zoom: 0,
+            mvt_min_feature_len_px: String::new(),
             raster_min_feature_px: None,
             mvt_no_optimizations: false,
             mvt_no_safety_limit: false,

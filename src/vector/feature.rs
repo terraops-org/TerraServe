@@ -159,6 +159,28 @@ impl Geometry {
             Geometry::MultiPolygon(polys) => polys.iter().map(|p| poly_area(p)).sum(),
         }
     }
+
+    /// Planar length in **source-CRS units** (summed segment lengths). `LineString` sums its
+    /// segments, `MultiLineString` sums its parts; `Point`/`Polygon`/`MultiPolygon` have zero
+    /// length -- deliberately the exact mirror of [`Geometry::area`], and of PostGIS, where
+    /// `ST_Length` returns 0 for an areal geometry just as `ST_Area` returns 0 for a linear one.
+    /// That symmetry is what lets the length gate exempt polygons by the same `> 0.0` test the
+    /// area gate uses to exempt lines. Cheap -- no projection.
+    pub fn length(&self) -> f64 {
+        fn line_len(pts: &[[f64; 2]]) -> f64 {
+            pts.windows(2)
+                .map(|w| {
+                    let (dx, dy) = (w[1][0] - w[0][0], w[1][1] - w[0][1]);
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .sum()
+        }
+        match self {
+            Geometry::Point(_) | Geometry::Polygon(_) | Geometry::MultiPolygon(_) => 0.0,
+            Geometry::LineString(pts) => line_len(pts),
+            Geometry::MultiLineString(parts) => parts.iter().map(|p| line_len(p)).sum(),
+        }
+    }
 }
 
 /// One vector feature. `fid` is a **stable** identifier (from an attribute like `ne_id`), the
@@ -176,6 +198,10 @@ pub struct Feature {
     /// makes overview-tile thinning seam-free (a per-feature, tile-independent keep/drop). See
     /// `Geometry::area`.
     pub area: f64,
+    /// Planar length in source-CRS units (0 for points/polygons), precomputed once at load -- the
+    /// per-feature rank for the per-zoom min-feature-LENGTH selection (`--mvt-min-feature-len-px`),
+    /// the line-geometry mirror of `area`.
+    pub length: f64,
 }
 
 impl Feature {
@@ -189,12 +215,14 @@ impl Feature {
             f64::NEG_INFINITY,
         ]);
         let area = geom.area();
+        let length = geom.length();
         Feature {
             geom,
             props,
             fid,
             bbox,
             area,
+            length,
         }
     }
 }
