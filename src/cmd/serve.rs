@@ -172,6 +172,25 @@ pub struct ServeArgs {
     /// selection alone bounds the tile. Applies to every vector layer.
     #[arg(long, default_value_t = 0.0)]
     pub mvt_min_feature_px: f64,
+    /// Apply `--mvt-min-feature-px` only from this zoom UP (`0` = every zoom, the default and the
+    /// pre-band behaviour). Below it the encoder falls back to its always-on one-MVT-cell floor.
+    ///
+    /// Why a band is needed at all: the threshold is denominated in display-px², so its ground
+    /// footprint QUARTERS with every zoom in -- but feature sizes do not. On the EU5 LAEA pyramid
+    /// `--mvt-min-feature-px 0.03` means 141 m² at z10 (keeps every real building) and 144,839 m²
+    /// at z3 (larger than any building on Earth -- a blank overview). Measured on the Paris column:
+    /// at 0.03 the worst z8 tile holds 125,156 candidates and the worst z3 tile fewer than 100,
+    /// while UNGATED those same tiles hold 469,931 and 7,400. So the deep zooms need the gate to
+    /// stay under `--mvt-max-features` (or the cap samples, and a per-TILE sampling rate is what
+    /// makes a density seam) and the shallow ones must not have it. `--mvt-min-feature-px 0.03
+    /// --mvt-min-feature-px-min-zoom 6` is the EU5 buildings answer.
+    ///
+    /// Still a per-ZOOM CONSTANT, so the seam-free property of the gate is untouched: every tile at
+    /// a given zoom makes the identical keep/drop decision. Applies to every vector layer, and to
+    /// the MVT paths only -- `--raster-min-feature-px` derives its own threshold from a request's
+    /// scale rather than a zoom.
+    #[arg(long, default_value_t = 0)]
+    pub mvt_min_feature_min_zoom: u32,
     /// Override `--mvt-min-feature-px` for the RASTER paths only (WMS GetMap, WMTS/TMS PNG tiles,
     /// `build-pmtiles --tile-format png`). Unset = the raster paths use `--mvt-min-feature-px`.
     ///
@@ -506,6 +525,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
     state.pmtiles_flush_interval = args.pmtiles_flush_interval;
     state.mvt_max_features = args.mvt_max_features;
     state.mvt_min_feature_px = args.mvt_min_feature_px;
+    state.mvt_min_feature_min_zoom = args.mvt_min_feature_min_zoom;
     state.mvt_no_optimizations = args.mvt_no_optimizations;
     if args.mvt_no_optimizations {
         println!(
@@ -591,8 +611,13 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         );
     }
     if args.mvt_min_feature_px > 0.0 {
+        let band = if args.mvt_min_feature_min_zoom == 0 {
+            "every zoom".to_string()
+        } else {
+            format!("z≥{}", args.mvt_min_feature_min_zoom)
+        };
         println!(
-            "MVT min feature size: {} px² (per-zoom seam-free selection)",
+            "MVT min feature size: {} px² on {band} (per-zoom seam-free selection)",
             args.mvt_min_feature_px
         );
     }

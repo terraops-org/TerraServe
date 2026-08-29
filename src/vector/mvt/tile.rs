@@ -290,8 +290,13 @@ pub fn features_for_tile<'a>(
     // already-expensive-but-tractable full-bbox fetch into a per-row `ST_Area` scan that exceeds
     // even a generous statement_timeout for no selectivity benefit worth the cost -- confirmed
     // live, 2026-08-28: z1 timed out at 300_000ms with the floor pushed down, twice, deterministically.
-    let min_area_src = if gated && opts.min_feature_px > 0.0 {
-        min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px)
+    //
+    // `min_feature_px_at(z)` and not `opts.min_feature_px`: a gate banded to `z >= N` is not
+    // configured at all below N, so there is nothing to push down there -- and pushing one down
+    // anyway is precisely the z0-z2 whole-continent `ST_Area` scan the paragraph above describes.
+    let banded_px = opts.min_feature_px_at(z);
+    let min_area_src = if gated && banded_px > 0.0 {
+        min_area_src_for_grid(tms, z, src_crs, opts.area_scale, banded_px)
     } else {
         0.0
     };
@@ -417,7 +422,10 @@ pub fn encode_tile_opt(
     // routes produce identical bytes from a single derivation site. `max_features`/`dedup` come
     // straight off the opts. (Cell-mosaic wiring lands in Task B6.)
     let max_features = opts.max_features;
-    let min_area_src = min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px);
+    // Banded via `min_feature_px_at`: outside the configured zoom band this passes `0.0` and
+    // `min_area_src_for_grid` returns its always-on cell floor, exactly as an unset gate does.
+    let min_area_src =
+        min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px_at(z));
     let Some(bbox) = tms.tile_bounds(z, x, y) else {
         return Vec::new();
     };
@@ -1000,6 +1008,50 @@ mod tests {
         Feature::new(Geometry::Polygon(vec![ring]), Props::new(), fid)
     }
 
+    /// The BAND, at the encoder (the site that actually produces bytes): a feature that clears the
+    /// always-on cell floor at both zooms but not the configured gate must be EMITTED below the
+    /// band and DROPPED inside it. Pins that `encode_tile_opt` derives its threshold from
+    /// `min_feature_px_at(z)` and not from `min_feature_px` -- the whole point of the flag.
+    #[test]
+    fn the_gate_band_leaves_the_shallow_zooms_on_the_cell_floor() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        let grid = crate::tms::preset("WebMercatorQuad", 256).unwrap();
+        // One display pixel's source-area footprint at each zoom, from the encoder's own function.
+        let px6 = super::min_area_src_for_grid(&grid, 6, "EPSG:3857", 1.0, 1.0);
+        let px5 = super::min_area_src_for_grid(&grid, 5, "EPSG:3857", 1.0, 1.0);
+        // The cell floor is `one_px_area / (4096/tile_w)²` = `/256` on this 256-px grid. Pick an
+        // area ABOVE the (larger) z5 floor and BELOW the z6 gate, so the two rules disagree.
+        let z5_floor = px5 / 256.0;
+        let gate_z6 = 0.03 * px6;
+        assert!(
+            z5_floor < gate_z6,
+            "fixture is only meaningful if the floor is looser than the gate ({z5_floor} vs {gate_z6})"
+        );
+        let area = (z5_floor + gate_z6) / 2.0;
+        let side = area.sqrt();
+        // Well inside z6 tile 32/24, which z5 tile 16/12 contains.
+        let (x0, y0) = (100_000.0, 4.6e6);
+        let src = VecSource {
+            feats: vec![rect_feature(x0, y0, x0 + side, y0 + side, 1)],
+            extent: [x0, y0, x0 + side, y0 + side],
+        };
+        let opts = MvtOptimizations {
+            max_features: 0,
+            min_feature_px: 0.03,
+            min_feature_min_zoom: 6,
+            area_scale: 1.0, // unused on the same-CRS path; pinned so it cannot mislead
+            ..MvtOptimizations::defaults()
+        };
+        assert!(
+            !encode_tile_opt(src.features(), &grid, 5, 16, 12, "EPSG:3857", "t", &opts).is_empty(),
+            "z5 is below the band: only the cell floor applies, and this feature clears it"
+        );
+        assert!(
+            encode_tile_opt(src.features(), &grid, 6, 32, 24, "EPSG:3857", "t", &opts).is_empty(),
+            "z6 is inside the band: the configured gate applies and this feature is under it"
+        );
+    }
+
     #[test]
     fn min_area_selection_is_seam_free_across_adjacent_tiles() {
         use super::{encode_tile_opt, MvtOptimizations};
@@ -1417,7 +1469,7 @@ mod grid_aware_gate_tests {
         let got = min_area_src_for_grid(&g512, 11, "EPSG:3035", 2.116, 0.0);
         assert!(got > 0.0, "the off knob must not disable the cell floor");
         let px_m = merc_m_per_px(11) / 2.0; // half `merc_m_per_px`'s 256-px assumption, per
-        // `a_512px_mercator_grid_was_four_times_too_aggressive` above
+                                            // `a_512px_mercator_grid_was_four_times_too_aggressive` above
         let one_px_area_src = (px_m * px_m) / 2.116;
         let expected_cell = one_px_area_src / 64.0; // 4096/512 = 8, squared = 64
         assert!(
@@ -1466,7 +1518,11 @@ mod pushdown_floor_tests {
         }
         fn query_gated(&self, _bbox: [f64; 4], min_area_src: f64) -> Result<Vec<Feature>, String> {
             *self.last_min_area_src.lock().unwrap() = Some(min_area_src);
-            Ok(vec![Feature::new(Geometry::Point([0.0, 0.0]), Props::new(), 1)])
+            Ok(vec![Feature::new(
+                Geometry::Point([0.0, 0.0]),
+                Props::new(),
+                1,
+            )])
         }
         fn full_extent(&self) -> [f64; 4] {
             [-100_000.0, -100_000.0, 100_000.0, 100_000.0]
@@ -1507,12 +1563,82 @@ mod pushdown_floor_tests {
         );
 
         let batch = features_for_tile(&vs, &g, 3, 3, 4, "EPSG:3035", &opts).expect("query ok");
-        assert_eq!(batch.len(), 1, "the recording source's read must still happen");
-        let got = src.last_min_area_src.lock().unwrap().expect("query_gated was called");
+        assert_eq!(
+            batch.len(),
+            1,
+            "the recording source's read must still happen"
+        );
+        let got = src
+            .last_min_area_src
+            .lock()
+            .unwrap()
+            .expect("query_gated was called");
         assert_eq!(
             got, 0.0,
             "gate off must push NOTHING into the SQL WHERE, not the cell floor \
              ({floored_value} would have made a 107.9M-row ST_Area scan the operator never asked for)"
+        );
+    }
+
+    /// A gate banded to `z >= N` is NOT configured below N, so nothing may be pushed down there.
+    /// This is the 61bf261 trap one level up: EU5 buildings bakes with `--mvt-min-feature-px 0.03
+    /// --mvt-min-feature-px-min-zoom 6`, and a z1 pushdown on 107.9M rows exceeds any statement
+    /// timeout. Above the band the same config must push the real threshold.
+    #[test]
+    fn a_banded_gate_pushes_nothing_below_its_first_zoom() {
+        let g = laea();
+        let opts = MvtOptimizations {
+            min_feature_px: 0.03,
+            min_feature_min_zoom: 6,
+            area_scale: 2.116,
+            ..MvtOptimizations::defaults()
+        };
+
+        let below = std::sync::Arc::new(RecordingSource {
+            last_min_area_src: Mutex::new(None),
+        });
+        features_for_tile(
+            &VectorSource::Windowed(below.clone()),
+            &g,
+            3,
+            3,
+            4,
+            "EPSG:3035",
+            &opts,
+        )
+        .expect("query ok");
+        assert_eq!(
+            below
+                .last_min_area_src
+                .lock()
+                .unwrap()
+                .expect("query_gated was called"),
+            0.0,
+            "z3 is below the band: the gate is not configured there, so the SQL WHERE stays empty"
+        );
+
+        let inside = std::sync::Arc::new(RecordingSource {
+            last_min_area_src: Mutex::new(None),
+        });
+        features_for_tile(
+            &VectorSource::Windowed(inside.clone()),
+            &g,
+            6,
+            25,
+            37,
+            "EPSG:3035",
+            &opts,
+        )
+        .expect("query ok");
+        let got = inside
+            .last_min_area_src
+            .lock()
+            .unwrap()
+            .expect("query_gated was called");
+        let expected = min_area_src_for_grid(&g, 6, "EPSG:3035", opts.area_scale, 0.03);
+        assert!(
+            (got - expected).abs() < expected * 1e-9,
+            "z6 is inside the band: expected {expected}, got {got}"
         );
     }
 
@@ -1531,8 +1657,13 @@ mod pushdown_floor_tests {
             ..MvtOptimizations::defaults()
         };
         features_for_tile(&vs, &g, 3, 3, 4, "EPSG:3035", &opts).expect("query ok");
-        let got = src.last_min_area_src.lock().unwrap().expect("query_gated was called");
-        let expected = min_area_src_for_grid(&g, 3, "EPSG:3035", opts.area_scale, opts.min_feature_px);
+        let got = src
+            .last_min_area_src
+            .lock()
+            .unwrap()
+            .expect("query_gated was called");
+        let expected =
+            min_area_src_for_grid(&g, 3, "EPSG:3035", opts.area_scale, opts.min_feature_px);
         assert!(
             (got - expected).abs() < expected * 1e-9,
             "got {got}, expected {expected}"

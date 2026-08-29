@@ -75,6 +75,11 @@ pub struct BuildPmtilesArgs {
     /// (which renders through the same `VectorLayer::render_tile` the live server uses).
     #[arg(long, default_value_t = 0.0)]
     pub mvt_min_feature_px: f64,
+    /// See `serve --mvt-min-feature-px-min-zoom`. A bake and the live server MUST agree on this
+    /// (as on `--mvt-min-feature-px` itself), or an archive miss renders differently from its
+    /// archived neighbours.
+    #[arg(long, default_value_t = 0)]
+    pub mvt_min_feature_min_zoom: u32,
     /// See `serve --raster-min-feature-px`. Overrides the value above for a `--tile-format png`
     /// bake only. ⚠ Low-zoom raster tiles of a dense layer are MADE of sub-pixel features -- their
     /// map IS the aggregate texture -- so a low-zoom pyramid usually wants this at `0`, even when
@@ -194,6 +199,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         max_inflight: 0,
         mvt_max_features: args.mvt_max_features,
         mvt_min_feature_px: args.mvt_min_feature_px,
+        mvt_min_feature_min_zoom: args.mvt_min_feature_min_zoom,
         raster_min_feature_px: args.raster_min_feature_px,
         mvt_no_optimizations: args.mvt_no_optimizations,
         mvt_no_safety_limit: args.mvt_no_safety_limit,
@@ -263,6 +269,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     let mut state = server::ServeState::new(vec![], String::new(), 1);
     state.mvt_max_features = serve_args.mvt_max_features;
     state.mvt_min_feature_px = serve_args.mvt_min_feature_px;
+    state.mvt_min_feature_min_zoom = serve_args.mvt_min_feature_min_zoom;
     state.mvt_no_optimizations = serve_args.mvt_no_optimizations;
     state.mvt_no_safety_limit = serve_args.mvt_no_safety_limit;
     crate::vector::mvt::validate_cell_flags(serve_args.mvt_cell_px, &serve_args.mvt_cell_field)?;
@@ -323,6 +330,14 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
             (
                 "--mvt-max-features",
                 args.mvt_max_features != crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
+            ),
+            // The BAND is MVT-only even though the value it bands is not: the raster gate derives
+            // its threshold from a request's scale denominator (`min_area_src_for_scale`), which
+            // has no zoom to compare against. So a PNG bake honours --mvt-min-feature-px and
+            // silently ignores this, which is worth saying out loud.
+            (
+                "--mvt-min-feature-px-min-zoom",
+                args.mvt_min_feature_min_zoom != 0,
             ),
             ("--no-safety-limit", args.mvt_no_safety_limit),
             ("--no-optimizations", args.mvt_no_optimizations),

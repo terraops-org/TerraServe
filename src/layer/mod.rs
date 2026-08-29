@@ -1173,6 +1173,7 @@ mod windowed_gpkg_dispatch_tests {
             max_inflight: 0,
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
+            mvt_min_feature_min_zoom: 0,
             raster_min_feature_px: None,
             mvt_no_optimizations: false,
             mvt_no_safety_limit: false,

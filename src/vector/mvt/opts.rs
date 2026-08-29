@@ -22,6 +22,10 @@ pub struct MvtOptimizations {
     pub dedup: bool,
     /// Per-zoom seam-free min feature size, display-px² (0 = off). Opt-in `--mvt-min-feature-px`.
     pub min_feature_px: f64,
+    /// `min_feature_px` applies only at `z >= min_feature_min_zoom` (per-ZOOM constant, so seam-safe,
+    /// the same argument as `cell_max_zoom`). `0` = every zoom, which is what every config without
+    /// `--mvt-min-feature-px-min-zoom` resolves to. See [`MvtOptimizations::min_feature_px_at`].
+    pub min_feature_min_zoom: u32,
     /// Mercator-m² per source-unit² for this layer (precomputed on the layer). Used by the
     /// min-feature-size pass ONLY to turn `min_feature_px` into a source-CRS area threshold at a
     /// given `z`. `0.0` = not computable → that pass disables (fail-OPEN). The cell mosaic works in
@@ -42,6 +46,32 @@ pub struct MvtOptimizations {
 }
 
 impl MvtOptimizations {
+    /// The configured `--mvt-min-feature-px` AS IT APPLIES AT ZOOM `z`: the value itself inside the
+    /// band, `0.0` (read as "gate off" by every consumer) below it.
+    ///
+    /// The band exists because `min_feature_px` is denominated in display-px² and a pixel's ground
+    /// footprint QUARTERS with every zoom in, while building sizes do not. One global value
+    /// therefore cannot serve both ends of a z0-z10 pyramid: measured on EU5 buildings over the
+    /// Paris column, `0.03` leaves 125,156 candidates on the worst z8 tile (under any sane feature
+    /// cap, so the cap never samples and no density seam forms) but fewer than 100 on z3, where its
+    /// threshold is 144,839 m² -- larger than any building on Earth. Banding it to `z >= 6` keeps
+    /// the deep-zoom fix and leaves z0-z5 on the always-on cell floor, which already bounds those
+    /// tiles at 7k-48k candidates.
+    ///
+    /// Returning `0.0` rather than a separate `Option` is deliberate: `min_area_src_for_grid`,
+    /// `features_for_tile`'s pushdown test and `size_gate_sql` all already treat a non-positive
+    /// threshold as "off", so the band needs no new off-switch anywhere downstream.
+    ///
+    /// Per-ZOOM constant, so every tile at a given zoom makes the identical keep/drop decision --
+    /// the seam-free property this whole gate is built on is preserved.
+    pub fn min_feature_px_at(&self, z: u32) -> f64 {
+        if z >= self.min_feature_min_zoom {
+            self.min_feature_px
+        } else {
+            0.0
+        }
+    }
+
     /// The default set: dedup on, no size/cell generalization, the default feature budget. Produces
     /// byte-identical output to today's `encode_tile` default path.
     pub fn defaults() -> Self {
@@ -49,6 +79,7 @@ impl MvtOptimizations {
             max_features: super::DEFAULT_MAX_FEATURES_PER_TILE,
             dedup: true,
             min_feature_px: 0.0,
+            min_feature_min_zoom: 0,
             area_scale: 0.0,
             cell_units: 0,
             cell_field: None,
@@ -67,6 +98,7 @@ impl MvtOptimizations {
             state.mvt_no_safety_limit,
             state.mvt_no_optimizations,
             state.mvt_min_feature_px,
+            state.mvt_min_feature_min_zoom,
             layer.area_scale,
             cell_units(state.mvt_cell_px),
             resolve_cell_field(&state.mvt_cell_field, &layer.fields),
@@ -86,6 +118,7 @@ impl MvtOptimizations {
         no_safety_limit: bool,
         no_optimizations: bool,
         min_feature_px: f64,
+        min_feature_min_zoom: u32,
         area_scale: f64,
         cell_units: u32,
         cell_field: Option<String>,
@@ -103,6 +136,7 @@ impl MvtOptimizations {
             max_features: if no_safety_limit { 0 } else { max_features },
             dedup: !no_optimizations,
             min_feature_px,
+            min_feature_min_zoom,
             area_scale,
             cell_units,
             cell_field,
@@ -164,10 +198,53 @@ mod tests {
         assert!(d.dedup, "dedup must default ON");
         assert_eq!(d.max_features, super::super::DEFAULT_MAX_FEATURES_PER_TILE);
         assert_eq!(d.min_feature_px, 0.0);
+        assert_eq!(d.min_feature_min_zoom, 0, "no band = every zoom");
         assert_eq!(d.area_scale, 0.0);
         assert_eq!(d.cell_units, 0);
         assert!(d.cell_field.is_none());
         assert_eq!(d.cell_max_zoom, 0);
+    }
+
+    /// The zoom BAND for `--mvt-min-feature-px`. EU5 buildings needs the gate at z6-z10 (where a
+    /// dense metro tile has 470k candidates and the feature cap would otherwise sample, seaming) and
+    /// NOT at z0-z5 (where a px2-denominated threshold quarters per zoom until it exceeds any
+    /// building on Earth and blanks the overview). Below the first banded zoom the configured value
+    /// must read as "off" so `min_area_src_for_grid` falls back to its always-on cell floor.
+    #[test]
+    fn min_feature_px_at_respects_the_zoom_band() {
+        let banded = MvtOptimizations {
+            min_feature_px: 0.03,
+            min_feature_min_zoom: 6,
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(banded.min_feature_px_at(5), 0.0, "z5 is below the band");
+        assert_eq!(
+            banded.min_feature_px_at(6),
+            0.03,
+            "z6 is the first banded zoom"
+        );
+        assert_eq!(
+            banded.min_feature_px_at(10),
+            0.03,
+            "and it stays on above it"
+        );
+
+        // 0 = every zoom, which is what every pre-band config resolves to.
+        let unbanded = MvtOptimizations {
+            min_feature_px: 0.03,
+            min_feature_min_zoom: 0,
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(unbanded.min_feature_px_at(0), 0.03);
+        assert_eq!(unbanded.min_feature_px_at(10), 0.03);
+
+        // A band without a gate value stays off -- the band selects zooms, it never turns a gate on.
+        let no_gate = MvtOptimizations {
+            min_feature_px: 0.0,
+            min_feature_min_zoom: 6,
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(no_gate.min_feature_px_at(10), 0.0);
     }
 
     #[test]
@@ -178,6 +255,7 @@ mod tests {
             false,
             false,
             2.0,
+            0,
             1.5,
             128,
             Some("c".into()),
@@ -197,7 +275,7 @@ mod tests {
     #[test]
     fn resolve_no_optimizations_clears_dedup_only() {
         // `--no-optimizations` clears dedup but leaves an opt-in min_feature_px in force.
-        let o = MvtOptimizations::resolve(5000, false, true, 2.0, 1.5, 0, None, 0, None, 0);
+        let o = MvtOptimizations::resolve(5000, false, true, 2.0, 0, 1.5, 0, None, 0, None, 0);
         assert!(!o.dedup, "no_optimizations must clear dedup");
         assert_eq!(o.min_feature_px, 2.0, "opt-in selection stays independent");
         assert_eq!(
@@ -209,9 +287,9 @@ mod tests {
     #[test]
     fn resolve_no_safety_limit_forces_unlimited() {
         // `--no-safety-limit` forces the cap to 0 (unlimited) even over a finite configured cap.
-        let o = MvtOptimizations::resolve(5000, true, false, 0.0, 0.0, 0, None, 0, None, 0);
+        let o = MvtOptimizations::resolve(5000, true, false, 0.0, 0, 0.0, 0, None, 0, None, 0);
         assert_eq!(o.max_features, 0, "no_safety_limit forces unlimited");
-        let on = MvtOptimizations::resolve(5000, false, false, 0.0, 0.0, 0, None, 0, None, 0);
+        let on = MvtOptimizations::resolve(5000, false, false, 0.0, 0, 0.0, 0, None, 0, None, 0);
         assert_eq!(on.max_features, 5000, "off = the configured cap");
     }
 
@@ -223,6 +301,7 @@ mod tests {
             false,
             false,
             0.0,
+            0,
             0.0,
             128,
             Some("c".into()),

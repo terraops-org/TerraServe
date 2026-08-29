@@ -261,6 +261,10 @@ pub struct ServeState {
     /// `mvt_max_features` sampling causes on a complete coverage. `0.0` = off (default). Set from
     /// `serve --mvt-min-feature-px`.
     pub mvt_min_feature_px: f64,
+    /// `mvt_min_feature_px` applies only at `z >= this`; `0` = every zoom. From
+    /// `serve --mvt-min-feature-px-min-zoom`. MVT paths only -- the raster gate
+    /// (`raster_min_feature_px`) derives its threshold from a request's own scale, not a zoom band.
+    pub mvt_min_feature_min_zoom: u32,
     /// Disable the default-on MVT geometry optimizations (grid-snap dedup) — raw rounded rings. From
     /// `serve --no-optimizations`. Opt-in thinning flags stay independent. Default `false`.
     pub mvt_no_optimizations: bool,
@@ -355,6 +359,7 @@ impl ServeState {
             render_limiter: Arc::new(tokio::sync::Semaphore::new(max_inflight.max(1))),
             mvt_max_features: crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
             mvt_min_feature_px: 0.0,
+            mvt_min_feature_min_zoom: 0,
             mvt_no_optimizations: false,
             mvt_no_safety_limit: false,
             mvt_cell_px: 0.0,
