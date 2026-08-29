@@ -78,7 +78,7 @@ pub struct BuildPmtilesArgs {
     /// See `serve --mvt-min-feature-px-min-zoom`. A bake and the live server MUST agree on this
     /// (as on `--mvt-min-feature-px` itself), or an archive miss renders differently from its
     /// archived neighbours.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "mvt-min-feature-px-min-zoom", default_value_t = 0)]
     pub mvt_min_feature_min_zoom: u32,
     /// See `serve --raster-min-feature-px`. Overrides the value above for a `--tile-format png`
     /// bake only. ⚠ Low-zoom raster tiles of a dense layer are MADE of sub-pixel features -- their

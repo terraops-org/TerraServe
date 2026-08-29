@@ -189,7 +189,7 @@ pub struct ServeArgs {
     /// a given zoom makes the identical keep/drop decision. Applies to every vector layer, and to
     /// the MVT paths only -- `--raster-min-feature-px` derives its own threshold from a request's
     /// scale rather than a zoom.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long = "mvt-min-feature-px-min-zoom", default_value_t = 0)]
     pub mvt_min_feature_min_zoom: u32,
     /// Override `--mvt-min-feature-px` for the RASTER paths only (WMS GetMap, WMTS/TMS PNG tiles,
     /// `build-pmtiles --tile-format png`). Unset = the raster paths use `--mvt-min-feature-px`.
@@ -659,4 +659,54 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         println!("MVT per-tile feature budget: {cap}");
     }
     server::run(state, &args.host, args.port)
+}
+
+#[cfg(test)]
+mod cli_name_tests {
+    use super::ServeArgs;
+    use clap::{Args, CommandFactory, FromArgMatches, Parser};
+
+    /// A wrapper so the `Args` group can be parsed on its own, without the whole `Cmd` enum.
+    #[derive(Parser, Debug)]
+    struct Wrap {
+        #[command(flatten)]
+        inner: ServeArgs,
+    }
+
+    /// The gate's zoom band is spelled `--mvt-min-feature-px-min-zoom` in this file's own doc
+    /// comments, in `build-pmtiles`, and in the eu5 bake scripts -- but clap derives a flag name
+    /// from the FIELD, which is `mvt_min_feature_min_zoom` (no `px`). Without the explicit
+    /// `long = ...` the two silently disagreed and a four-layer production bake died on
+    /// "unexpected argument" one second after launch, 2026-08-29. Pin the name.
+    #[test]
+    fn the_gate_band_flag_is_spelled_with_px() {
+        let w = Wrap::try_parse_from([
+            "serve",
+            "--cog",
+            "x.tif",
+            "--mvt-min-feature-px",
+            "0.03",
+            "--mvt-min-feature-px-min-zoom",
+            "6",
+        ])
+        .expect("--mvt-min-feature-px-min-zoom must parse");
+        assert_eq!(w.inner.mvt_min_feature_px, 0.03);
+        assert_eq!(w.inner.mvt_min_feature_min_zoom, 6);
+
+        // And the field-derived spelling must NOT also work, or the docs stay ambiguous.
+        assert!(
+            Wrap::try_parse_from(["serve", "--cog", "x.tif", "--mvt-min-feature-min-zoom", "6"])
+                .is_err(),
+            "only the documented spelling may be accepted"
+        );
+
+        // Absent = 0 = every zoom, the pre-band behaviour.
+        let d = Wrap::try_parse_from(["serve", "--cog", "x.tif"]).expect("defaults parse");
+        assert_eq!(d.inner.mvt_min_feature_min_zoom, 0);
+
+        // Cheap structural check that the flags are well-formed while we are here.
+        let _ = <ServeArgs as Args>::augment_args(clap::Command::new("serve"));
+        let _ = Wrap::command().debug_assert();
+        let _ = <ServeArgs as FromArgMatches>::from_arg_matches;
+    }
 }
