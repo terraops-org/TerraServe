@@ -233,17 +233,20 @@ pub fn parse_len_px_spec(spec: &str) -> Result<Vec<(u32, f64)>, String> {
 
 /// The mosaic cell size in tile-4096 units for `--mvt-cell-px N`: `0` (mosaic off) when `cell_px`
 /// is not positive, else `16·N` for `N` = `cell_px` rounded to the nearest power of two in
-/// `{4..=256}`. The power-of-two constraint makes `16·N` divide 4096, so cells align to tile edges
-/// (seam-safe); the floor of 4 caps a tile at `(256/4)² = 4096` cells + inverse-projections, the
-/// ceiling of 256 keeps at least one cell per tile.
+/// `{1..=256}`. The power-of-two constraint makes `16·N` divide 4096, so cells align to tile edges
+/// (seam-safe); the ceiling of 256 keeps at least one cell per tile. The floor was 4 (4,096 cells
+/// per tile) until 2026-09-04; at 1 a tile is `256² = 65,536` cells, one per display pixel, which
+/// is what an overview coverage needs to read as real geometry rather than blocks (eu5 landuse
+/// z0-3). Rows run-length-merge, so bytes grow far slower than the cell count.
 pub fn cell_units(cell_px: f64) -> u32 {
     if !(cell_px > 0.0) {
         return 0;
     }
-    // Round to the nearest power of two via log2, then clamp to [4, 256]. `INFINITY as u32`
-    // saturates to u32::MAX in Rust, which the clamp pins to 256 — so huge inputs are safe.
+    // Round to the nearest power of two via log2, then clamp to [1, 256]. `INFINITY as u32`
+    // saturates to u32::MAX in Rust, which the clamp pins to 256 — so huge inputs are safe; a
+    // sub-pixel request (`0.3`) rounds to 2^-2 = 0.25, truncates to 0 and is pinned to 1.
     let n = 2f64.powi(cell_px.log2().round() as i32);
-    let n = (n as u32).clamp(4, 256);
+    let n = (n as u32).clamp(1, 256);
     16 * n
 }
 
@@ -508,8 +511,22 @@ mod tests {
 
     #[test]
     fn cell_units_floors_at_4_and_caps_at_256() {
-        assert_eq!(super::cell_units(1.0), 64, "floor N=4 → 16·4");
-        assert_eq!(super::cell_units(3.0), 64, "rounds toward the floor of 4");
+        assert_eq!(
+            super::cell_units(1.0),
+            16,
+            "N=1 is the floor: one cell per display pixel"
+        );
+        assert_eq!(super::cell_units(2.0), 32, "N=2 → 16·2");
+        assert_eq!(
+            super::cell_units(3.0),
+            64,
+            "3 rounds to the nearest power of two, 4"
+        );
+        assert_eq!(
+            super::cell_units(0.3),
+            16,
+            "sub-pixel requests pin to the floor of 1"
+        );
         assert_eq!(super::cell_units(1000.0), 4096, "cap N=256 → 16·256");
     }
 

@@ -12,6 +12,7 @@
 //! these flags and `main.rs` names the types at the crate root, so every one of them is
 //! re-exported unchanged from `lib.rs`. Move them; do not rename or reshape them.
 
+pub mod extract;
 pub mod pmtiles;
 pub mod render;
 pub mod serve;

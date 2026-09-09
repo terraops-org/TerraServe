@@ -248,7 +248,7 @@ pub struct ServeArgs {
     pub mvt_no_safety_limit: bool,
     /// Overview CELL MOSAIC: fill the black holes a size filter leaves on a wall-to-wall coverage by
     /// replacing polygons with a dominant-class grid of N display-pixel cells (rounded to a power of
-    /// 2 in {4..256}). Seam-free and hard-caps tile weight; blocky at EVERY zoom (an overview tool —
+    /// 2 in {1..256}; 1 = one cell per display pixel). Seam-free and hard-caps tile weight; blocky at EVERY zoom above 1 px (an overview tool —
     /// band it with `--mvt-cell-max-zoom`). REQUIRES `--mvt-cell-field`. `0` = off. Applies to the
     /// polygons of every vector layer that carries the field; points/lines pass through.
     #[arg(long, default_value_t = 0.0)]
@@ -284,6 +284,13 @@ pub struct ServeArgs {
     /// (e.g. the X-ray raster underlay); revisited tiles become instant. Byte-weighted → RSS bounded.
     #[arg(long, default_value_t = 256)]
     pub wms_cache: u64,
+    /// `Cache-Control: public, max-age=N` seconds on every tile response (TMS, WMTS, `/mvt`).
+    /// `0` = no Cache-Control header; tiles still carry an `ETag` and answer `If-None-Match` with
+    /// a `304`, so a revisit costs a ~200-byte round trip instead of the tile. With a max-age the
+    /// revisit costs no request at all, at the price that a rebake + restart inside the window
+    /// stays invisible to returning visitors until it expires.
+    #[arg(long = "tile-max-age", default_value_t = 0)]
+    pub tile_max_age: u32,
     /// Path to a MapLibre GL style for `/mvt/{layer}/style.json` — a JSON object
     /// `{ "layers": [...], "metadata": { "legend": [...] } }` (or a bare `[...]` layer array). The
     /// server injects `version`/`sources`/source-binding. Without it, a generic X-ray style is served.
@@ -434,7 +441,8 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
                 .with_pmtiles(lc.pmtiles.clone())
                 .with_raster_pmtiles(lc.raster_pmtiles.clone())
                 .with_extent(lc.extent)
-                .with_columns(lc.columns.clone());
+                .with_columns(lc.columns.clone())
+                .with_zoom_sources(lc.zoom_sources.clone());
                 layer::build_vector_layer(&spec, &s3)?
             } else {
                 let cog = lc.cog.as_deref().ok_or_else(|| {
@@ -546,6 +554,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
     // and prefer the declared one over the request's Host header. See `ServeState.public_url`.
     state.public_url = args.public_url.clone();
     state.pmtiles_flush_interval = args.pmtiles_flush_interval;
+    state.tile_max_age = args.tile_max_age;
     state.mvt_max_features = args.mvt_max_features;
     state.mvt_min_feature_px = args.mvt_min_feature_px;
     state.mvt_min_feature_min_zoom = args.mvt_min_feature_min_zoom;
@@ -671,9 +680,11 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         // client draws the entire map in its fallback colour, 200 OK throughout. Warn per layer,
         // matching the standard `--mvt-cell-field` / `--mvt-dissolve` already set above, and name
         // the escape hatch.
-        for field in mvt_http::mvt_style_fields(&val) {
-            for lyr in &state.layers {
-                let Some(v) = &lyr.vector else { continue };
+        // Per served layer: a style layer tagged `source-layer: roads` reads fields of `roads`
+        // only, so a five-layer style file must not tell `water` it lacks `highway`.
+        for lyr in &state.layers {
+            let Some(v) = &lyr.vector else { continue };
+            for field in mvt_http::mvt_style_fields_for_layer(&val, &lyr.name) {
                 if !v.fields.contains_key(&field) {
                     eprintln!(
                         "⚠ --mvt-style reads field '{field}', which layer '{}' does not carry — \

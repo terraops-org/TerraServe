@@ -223,6 +223,12 @@ pub(crate) struct VectorLayerSpec {
     /// (`vector::postgis::pool_sizing_warning`). Every other vector path ignores it, same shape as
     /// the `cache_lru` gap noted above.
     pub max_inflight: usize,
+
+    // ---- per-zoom subsets (per layer) ----
+    /// Declared bands from `zoom_sources:`. Loaded by `build_vector_layer` through the SAME
+    /// builder that loads the layer itself, so a subset is never opened by a second, parallel
+    /// reader that could disagree with the first.
+    pub zoom_sources: Vec<config::ZoomSourceConfig>,
 }
 
 /// `--max-inflight`'s effective value: `0` means "use the built-in default" (2x logical cores).
@@ -273,6 +279,7 @@ impl VectorLayerSpec {
             topology_simplify: args.topology_simplify,
             topology_dissolve: args.topology_dissolve.clone(),
             topology_dissolve_rollup: args.topology_dissolve_rollup,
+            zoom_sources: Vec::new(),
         }
     }
 
@@ -313,9 +320,189 @@ impl VectorLayerSpec {
         self.columns = columns;
         self
     }
+
+    /// Populated from `LayerConfig.zoom_sources` on the `--config` path, and from
+    /// `build-pmtiles --zoom-source` on the bake path. Empty everywhere else.
+    pub(crate) fn with_zoom_sources(mut self, zoom_sources: Vec<config::ZoomSourceConfig>) -> Self {
+        self.zoom_sources = zoom_sources;
+        self
+    }
 }
 
+/// Build a vector layer, then attach whatever `zoom_sources:` bands it declares.
+///
+/// The bands are opened by recursing into this same builder with the band's path substituted, so a
+/// subset is loaded by EXACTLY the code that loads a layer -- windowed `.gpkg`, windowed `.fgb`,
+/// load-all GeoJSON, the field-schema derivation, the CRS precedence rule. A second, parallel
+/// loader here is how a subset comes to disagree with the layer it was cut from.
+///
+/// What the recursion deliberately strips from the band's spec, and why:
+/// * `zoom_sources` -- a band cannot itself have bands; also what stops this recursing forever.
+/// * `pmtiles_paths` / `raster_pmtiles_paths` -- archives belong to the LAYER, and opening them
+///   once per band would trip the one-archive-per-grid check on the second band.
+/// * `grid_ids` -- likewise; only the layer publishes grids.
+/// * the topology knobs -- a band is already generalized, and simplifying it again at load would
+///   silently apply a second, different generalization to the shallow zooms only.
 pub(crate) fn build_vector_layer(
+    spec: &VectorLayerSpec,
+    s3: &s3::S3Config,
+) -> Result<server::Layer, Error> {
+    let mut layer = build_vector_layer_base(spec, s3)?;
+    if spec.zoom_sources.is_empty() {
+        return Ok(layer);
+    }
+    let name = &spec.name;
+    // Topology LOD builds its per-zoom pools from `source` at startup and `source_for_zoom` checks
+    // bands FIRST, so a layer with both would silently serve bands and quietly waste the whole LOD
+    // build. Refuse rather than pick: both were configured deliberately.
+    if layer.vector.as_ref().is_some_and(|v| v.lod.is_some()) {
+        return Err(Box::<dyn std::error::Error>::from(format!(
+            "layer '{name}': `zoom_sources:` and topology LOD (--topology-simplify/--topology-dissolve) \
+             cannot both be set — LOD pools are built from the layer's own source, so the bands would \
+             be built and then never read"
+        )));
+    }
+
+    // Overlap check BEFORE opening anything: two bands claiming the same zoom means the operator
+    // believes something about serving order that is not true (the first match wins), and it is
+    // cheaper to say so than to open two large subsets and then complain.
+    let mut sorted: Vec<&config::ZoomSourceConfig> = spec.zoom_sources.iter().collect();
+    sorted.sort_by_key(|b| b.min_zoom);
+    for w in sorted.windows(2) {
+        if w[1].min_zoom <= w[0].max_zoom {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "layer '{name}': zoom_sources bands overlap — z{}-{} ({}) and z{}-{} ({}) both claim z{}",
+                w[0].min_zoom, w[0].max_zoom, w[0].vector,
+                w[1].min_zoom, w[1].max_zoom, w[1].vector,
+                w[1].min_zoom
+            )));
+        }
+    }
+    for b in &spec.zoom_sources {
+        if b.min_zoom > b.max_zoom {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "layer '{name}': zoom_sources band '{}' has min_zoom {} above max_zoom {}",
+                b.vector, b.min_zoom, b.max_zoom
+            )));
+        }
+    }
+
+    let layer_crs = layer.src_crs.clone();
+    let mut bands = Vec::with_capacity(spec.zoom_sources.len());
+    for b in &spec.zoom_sources {
+        let mut band_spec = VectorLayerSpec {
+            vector_path: b.vector.clone(),
+            zoom_sources: Vec::new(),
+            pmtiles_paths: Vec::new(),
+            raster_pmtiles_paths: Vec::new(),
+            grid_ids: Vec::new(),
+            topology_simplify: None,
+            topology_dissolve: None,
+            topology_dissolve_rollup: None,
+            ..clone_spec(spec)
+        };
+        band_spec.name = format!("{name} z{}-{}", b.min_zoom, b.max_zoom);
+        let built = build_vector_layer_base(&band_spec, s3)
+            .map_err(|e| format!("layer '{name}': zoom_sources band '{}': {e}", b.vector))?;
+        // A subset carries the CRS it was cut from, so a mismatch is the wrong file, not a default
+        // to adopt. Adopting it would reproject nothing and put the band's geometry somewhere else
+        // on the map at exactly the zooms the band covers.
+        if built.src_crs != layer_crs {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "layer '{name}': zoom_sources band '{}' is {} but the layer is {layer_crs}",
+                b.vector, built.src_crs
+            )));
+        }
+        // What the file says it is, against what the config claims. A band served DEEPER than it
+        // was cut for is the silent failure this check exists for: the features a deeper threshold
+        // would have kept are simply not in the file, and the encoder cannot tell. Shallower is
+        // refused too -- it depends on the thresholds being monotone in z, which `extract` itself
+        // only warns about. An unstamped file (hand-cut, or written before the stamp existed) is
+        // allowed through with a warning: there is nothing to check it against.
+        match vector::gpkg::gpkg_zoom_band(&b.vector) {
+            Some((lo, hi)) if b.min_zoom < lo || b.max_zoom > hi => {
+                return Err(Box::<dyn std::error::Error>::from(format!(
+                    "layer '{name}': zoom_sources declares z{}-{} for '{}', but that file was cut \
+                     for z{lo}-{hi} — serving it outside the band it was cut for drops features \
+                     silently",
+                    b.min_zoom, b.max_zoom, b.vector
+                )));
+            }
+            Some(_) => {}
+            None => eprintln!(
+                "warning: layer '{name}': zoom_sources band '{}' carries no `terraserve extract` \
+                 zoom stamp, so its declared z{}-{} cannot be verified",
+                b.vector, b.min_zoom, b.max_zoom
+            ),
+        }
+        let source = built
+            .vector
+            .ok_or_else(|| {
+                format!(
+                    "layer '{name}': zoom_sources band '{}' is not a vector source",
+                    b.vector
+                )
+            })?
+            .source;
+        eprintln!(
+            "layer '{name}': zoom band z{}-{} <- {}",
+            b.min_zoom, b.max_zoom, b.vector
+        );
+        bands.push(server::ZoomBand {
+            min_zoom: b.min_zoom,
+            max_zoom: b.max_zoom,
+            source,
+        });
+    }
+
+    // The uncovered shallow end is worth a warning, not an error: a layer may legitimately be
+    // extracted only in part. But it is exactly the hole this feature exists to close — a zoom
+    // below the shallowest band still falls through to a full-source query, which on a continental
+    // dataset is the whole-continent read that turns an archive miss into a 500.
+    let shallowest = bands.iter().map(|b| b.min_zoom).min().unwrap_or(0);
+    if shallowest > 0 {
+        eprintln!(
+            "warning: layer '{name}': zoom_sources start at z{shallowest}; z0-z{} still read the \
+             full source, so an archive miss there costs a whole-dataset query",
+            shallowest - 1
+        );
+    }
+
+    if let Some(v) = layer.vector.as_mut() {
+        v.zoom_sources = bands;
+    }
+    Ok(layer)
+}
+
+/// Field-by-field clone of a spec. `VectorLayerSpec` is deliberately not `Clone` (it is built once
+/// per layer through the builders), and derived `Clone` on it would invite copying it around; this
+/// exists solely so the band recursion above can start from the layer's own tuning.
+fn clone_spec(s: &VectorLayerSpec) -> VectorLayerSpec {
+    VectorLayerSpec {
+        name: s.name.clone(),
+        vector_path: s.vector_path.clone(),
+        vec_style_path: s.vec_style_path.clone(),
+        font_path: s.font_path.clone(),
+        declared_crs: s.declared_crs.clone(),
+        extent: s.extent,
+        columns: s.columns.clone(),
+        grid_ids: s.grid_ids.clone(),
+        tile_px: s.tile_px,
+        custom_grids: s.custom_grids.clone(),
+        pmtiles_paths: s.pmtiles_paths.clone(),
+        raster_pmtiles_paths: s.raster_pmtiles_paths.clone(),
+        keep_fields: s.keep_fields.clone(),
+        min_feature_px: s.min_feature_px,
+        snap_tolerance: s.snap_tolerance,
+        topology_simplify: s.topology_simplify,
+        topology_dissolve: s.topology_dissolve.clone(),
+        topology_dissolve_rollup: s.topology_dissolve_rollup,
+        max_inflight: s.max_inflight,
+        zoom_sources: s.zoom_sources.clone(),
+    }
+}
+
+fn build_vector_layer_base(
     spec: &VectorLayerSpec,
     s3: &s3::S3Config,
 ) -> Result<server::Layer, Error> {
@@ -669,6 +856,7 @@ pub(crate) fn build_vector_layer(
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: pmtiles.clone(),
             raster_pmtiles: raster_pmtiles.clone(),
@@ -780,6 +968,7 @@ pub(crate) fn build_vector_layer(
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: pmtiles.clone(),
             raster_pmtiles: raster_pmtiles.clone(),
@@ -864,6 +1053,7 @@ pub(crate) fn build_vector_layer(
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: pmtiles.clone(),
             raster_pmtiles: raster_pmtiles.clone(),
@@ -1113,6 +1303,10 @@ pub(crate) fn build_vector_layer(
             style,
             shaper,
             lod,
+            // Filled in by `build_vector_layer`'s wrapper below, which opens each declared band
+            // through this same function so a band is loaded by exactly the code that loads a
+            // layer -- never a second, parallel reader.
+            zoom_sources: Vec::new(),
         }),
         pmtiles,
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -1186,6 +1380,7 @@ mod windowed_gpkg_dispatch_tests {
             mvt_dissolve_max_zoom: 0,
             mvt_cache: 256,
             wms_cache: 256,
+            tile_max_age: 0,
             mvt_style: None,
         }
     }
@@ -1534,6 +1729,124 @@ mod raster_pmtiles_registration_tests {
             err.contains("does not publish"),
             "must say the grid is not published: {err}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod zoom_source_tests {
+    use super::*;
+
+    /// The minimum spec that builds: the committed GeoJSON fixture, its style, the pinned font.
+    fn spec(zoom_sources: Vec<config::ZoomSourceConfig>) -> VectorLayerSpec {
+        VectorLayerSpec {
+            name: "banded".into(),
+            vector_path: "fixtures/vector/mini_mvt.geojson".into(),
+            vec_style_path: "fixtures/styles/airports.vec.json".into(),
+            font_path: "fixtures/fonts/DejaVuSans.ttf".into(),
+            declared_crs: Some("EPSG:4326".into()),
+            extent: None,
+            columns: Vec::new(),
+            grid_ids: Vec::new(),
+            tile_px: 512,
+            custom_grids: std::collections::BTreeMap::new(),
+            pmtiles_paths: Vec::new(),
+            raster_pmtiles_paths: Vec::new(),
+            keep_fields: None,
+            min_feature_px: 0.0,
+            snap_tolerance: 0.0,
+            topology_simplify: None,
+            topology_dissolve: None,
+            topology_dissolve_rollup: None,
+            max_inflight: 8,
+            zoom_sources,
+        }
+    }
+
+    fn band(min_zoom: u32, max_zoom: u32, vector: &str) -> config::ZoomSourceConfig {
+        config::ZoomSourceConfig {
+            min_zoom,
+            max_zoom,
+            vector: vector.into(),
+        }
+    }
+
+    /// Overlapping bands mean the operator believes something about ordering that is not true --
+    /// `band_for_zoom` takes the first match. Refusing is cheaper than opening two large subsets
+    /// and is the only way the operator finds out.
+    #[test]
+    fn overlapping_bands_are_refused_at_startup() {
+        let s = spec(vec![
+            band(0, 4, "fixtures/vector/mini_mvt.geojson"),
+            band(4, 8, "fixtures/vector/mini_mvt.geojson"),
+        ]);
+        let err = build_vector_layer(&s, &s3::S3Config::default())
+            .err()
+            .expect("overlapping bands must not build")
+            .to_string();
+        assert!(err.contains("overlap"), "{err}");
+        assert!(
+            err.contains("z4"),
+            "the message must name the contested zoom: {err}"
+        );
+    }
+
+    #[test]
+    fn an_inverted_band_is_refused() {
+        let s = spec(vec![band(8, 4, "fixtures/vector/mini_mvt.geojson")]);
+        let err = build_vector_layer(&s, &s3::S3Config::default())
+            .err()
+            .expect("min_zoom above max_zoom must not build")
+            .to_string();
+        assert!(err.contains("above max_zoom"), "{err}");
+    }
+
+    /// The check that makes the declaration verifiable rather than trusted: a GeoPackage written
+    /// by `terraserve extract` carries the band it was cut for, and serving it outside that band
+    /// drops features with nothing to notice.
+    #[test]
+    fn a_band_declared_deeper_than_the_file_was_cut_for_is_refused() {
+        use crate::vector::feature::{Feature, Geometry};
+        let dir = std::env::temp_dir().join(format!("ts_band_stamp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("subset.gpkg");
+        let mut w = crate::vector::gpkg_write::GpkgWriter::create(
+            &path,
+            "subset",
+            Some("EPSG:4326"),
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap()
+        .with_zoom_band(Some((6, 8)));
+        w.add(&Feature::new(
+            Geometry::Point([1.0, 1.0]),
+            Default::default(),
+            1,
+        ))
+        .unwrap();
+        w.finish().unwrap();
+
+        let p = path.to_string_lossy().to_string();
+        assert_eq!(
+            crate::vector::gpkg::gpkg_zoom_band(&p),
+            Some((6, 8)),
+            "the stamp must round-trip through the file"
+        );
+
+        // z9 is deeper than the file was cut for.
+        let err = build_vector_layer(&spec(vec![band(6, 9, &p)]), &s3::S3Config::default())
+            .err()
+            .expect("a band declared beyond its stamp must not build")
+            .to_string();
+        assert!(err.contains("cut for z6-8"), "{err}");
+
+        // The band it actually was cut for builds fine.
+        let ok = match build_vector_layer(&spec(vec![band(6, 8, &p)]), &s3::S3Config::default()) {
+            Ok(l) => l,
+            Err(e) => panic!("the stamped band itself must build: {e}"),
+        };
+        assert_eq!(ok.vector.as_ref().unwrap().zoom_sources.len(), 1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

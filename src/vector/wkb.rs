@@ -95,6 +95,121 @@ pub fn decode_wkb(wkb: &[u8]) -> Result<Option<Geometry>, String> {
     read_geom(&mut r)
 }
 
+/// ISO WKB type codes for the five variants `Geometry` models. `MultiPoint` (4) and
+/// `GeometryCollection` (7) are absent because the model has no variant for them -- the decoder
+/// reads them as `Ok(None)`, and there is nothing here that could produce one.
+const WKB_POINT: u32 = 1;
+const WKB_LINESTRING: u32 = 2;
+const WKB_POLYGON: u32 = 3;
+const WKB_MULTILINESTRING: u32 = 5;
+const WKB_MULTIPOLYGON: u32 = 6;
+
+/// Encode a `Geometry` as a GeoPackage `geom` BLOB: the 8-byte GeoPackageBinary header followed
+/// by little-endian ISO WKB. The exact inverse of `decode_gpkg_geometry`.
+///
+/// **No envelope is written** (envelope indicator 0), deliberately. The GeoPackage envelope's
+/// field order is `minx, maxx, miny, maxy` -- not the `minx, miny, maxx, maxy` almost everyone
+/// assumes -- and our own decoder skips the envelope entirely, so a wrongly-ordered one would
+/// round-trip through this codebase undetected and only corrupt somebody else's reader. The
+/// spatial index carries the bounding box instead, which is what queries actually use.
+///
+/// A geometry with no vertices sets the header's empty flag, which `decode_gpkg_geometry` reads
+/// back as `Ok(None)`.
+pub fn encode_gpkg_geometry(g: &Geometry, srs_id: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"GP");
+    out.push(0); // version 0
+                 // bit 0: header integers are little-endian. bits 1-3: envelope indicator (0 = none).
+                 // bit 4: empty-geometry flag.
+    let flags = 0x01u8 | if is_empty(g) { 1 << 4 } else { 0 };
+    out.push(flags);
+    out.extend_from_slice(&srs_id.to_le_bytes());
+    if !is_empty(g) {
+        write_geom(g, &mut out);
+    }
+    out
+}
+
+/// Encode a `Geometry` as bare little-endian ISO WKB, with no GeoPackage header -- the form
+/// `ST_GeomFromWKB` and `decode_wkb` consume.
+pub fn encode_wkb(g: &Geometry) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_geom(g, &mut out);
+    out
+}
+
+/// Has this geometry no vertices at all? Such a thing covers nothing and draws nothing, so it is
+/// written with the empty flag rather than as a zero-length ring the reader would have to guess
+/// about.
+fn is_empty(g: &Geometry) -> bool {
+    match g {
+        Geometry::Point(_) => false,
+        Geometry::LineString(pts) => pts.is_empty(),
+        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
+            rings.iter().all(|r| r.is_empty())
+        }
+        Geometry::MultiPolygon(polys) => polys.iter().flatten().all(|r| r.is_empty()),
+    }
+}
+
+fn write_hdr(out: &mut Vec<u8>, type_code: u32) {
+    out.push(1); // little-endian
+    out.extend_from_slice(&type_code.to_le_bytes());
+}
+
+fn write_pt(out: &mut Vec<u8>, p: &[f64; 2]) {
+    out.extend_from_slice(&p[0].to_le_bytes());
+    out.extend_from_slice(&p[1].to_le_bytes());
+}
+
+fn write_ring(out: &mut Vec<u8>, pts: &[[f64; 2]]) {
+    out.extend_from_slice(&(pts.len() as u32).to_le_bytes());
+    for p in pts {
+        write_pt(out, p);
+    }
+}
+
+/// Write one geometry, header included. Multi-geometries repeat the per-part byte-order marker
+/// and type code, exactly as the spec requires (and as `read_geom` expects to find them).
+fn write_geom(g: &Geometry, out: &mut Vec<u8>) {
+    match g {
+        Geometry::Point(p) => {
+            write_hdr(out, WKB_POINT);
+            write_pt(out, p);
+        }
+        Geometry::LineString(pts) => {
+            write_hdr(out, WKB_LINESTRING);
+            write_ring(out, pts);
+        }
+        Geometry::Polygon(rings) => {
+            write_hdr(out, WKB_POLYGON);
+            out.extend_from_slice(&(rings.len() as u32).to_le_bytes());
+            for r in rings {
+                write_ring(out, r);
+            }
+        }
+        Geometry::MultiLineString(parts) => {
+            write_hdr(out, WKB_MULTILINESTRING);
+            out.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+            for part in parts {
+                write_hdr(out, WKB_LINESTRING);
+                write_ring(out, part);
+            }
+        }
+        Geometry::MultiPolygon(polys) => {
+            write_hdr(out, WKB_MULTIPOLYGON);
+            out.extend_from_slice(&(polys.len() as u32).to_le_bytes());
+            for poly in polys {
+                write_hdr(out, WKB_POLYGON);
+                out.extend_from_slice(&(poly.len() as u32).to_le_bytes());
+                for r in poly {
+                    write_ring(out, r);
+                }
+            }
+        }
+    }
+}
+
 /// A bounds-checked byte cursor over a WKB slice. Every read validates the range against
 /// `b.len()` first and returns `Err` on overrun — no `panic!`, no unchecked indexing.
 struct Rdr<'a> {
@@ -617,5 +732,140 @@ mod tests {
     #[test]
     fn decode_wkb_rejects_empty_input() {
         assert!(decode_wkb(&[]).is_err());
+    }
+    // ---- encoder (the inverse of everything above) ----
+
+    /// Every variant we model must survive `encode -> decode` unchanged. The decoder is the
+    /// oracle: it is already trusted (it reads real GeoPackages), so a round-trip is a real
+    /// check rather than the encoder grading its own homework.
+    #[test]
+    fn every_geometry_round_trips_through_gpkg_binary() {
+        let cases = vec![
+            ("point", Geometry::Point([1.5, -2.25])),
+            (
+                "linestring",
+                Geometry::LineString(vec![[0.0, 0.0], [1.0, 2.0], [3.5, -4.5]]),
+            ),
+            (
+                "polygon with a hole",
+                Geometry::Polygon(vec![
+                    vec![
+                        [0.0, 0.0],
+                        [10.0, 0.0],
+                        [10.0, 10.0],
+                        [0.0, 10.0],
+                        [0.0, 0.0],
+                    ],
+                    vec![[2.0, 2.0], [4.0, 2.0], [4.0, 4.0], [2.0, 4.0], [2.0, 2.0]],
+                ]),
+            ),
+            (
+                "multilinestring",
+                Geometry::MultiLineString(vec![
+                    vec![[0.0, 0.0], [1.0, 1.0]],
+                    vec![[5.0, 5.0], [6.0, 7.0], [8.0, 9.0]],
+                ]),
+            ),
+            (
+                "multipolygon",
+                Geometry::MultiPolygon(vec![
+                    vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                    vec![
+                        vec![[10.0, 10.0], [12.0, 10.0], [12.0, 12.0], [10.0, 10.0]],
+                        vec![[10.5, 10.5], [11.0, 10.5], [11.0, 11.0], [10.5, 10.5]],
+                    ],
+                ]),
+            ),
+        ];
+        for (name, g) in cases {
+            let blob = encode_gpkg_geometry(&g, 4326);
+            let back = decode_gpkg_geometry(&blob)
+                .unwrap_or_else(|e| panic!("{name}: decode failed: {e}"))
+                .unwrap_or_else(|| panic!("{name}: decoded to None"));
+            assert_eq!(back, g, "{name} did not survive the round trip");
+        }
+    }
+
+    /// The header the decoder actually inspects: magic, version, and the flag byte. Envelope
+    /// indicator MUST be 0 -- we write no envelope, because the GeoPackage envelope field order
+    /// is (minx, maxx, miny, maxy) rather than the (minx, miny, maxx, maxy) everyone assumes,
+    /// and our own decoder SKIPS the envelope, so a wrong one would round-trip cleanly here and
+    /// only be caught by another reader. The rtree carries the bbox instead.
+    #[test]
+    fn the_gpkg_header_declares_no_envelope_and_the_right_srs() {
+        let blob = encode_gpkg_geometry(&Geometry::Point([1.0, 2.0]), 3035);
+        assert_eq!(&blob[0..2], b"GP", "magic");
+        assert_eq!(blob[2], 0, "version 0");
+        let flags = blob[3];
+        assert_eq!(
+            (flags >> 1) & 0x07,
+            0,
+            "envelope indicator must be 0 (none)"
+        );
+        assert_eq!((flags >> 4) & 1, 0, "not the empty-geometry flag");
+        assert_eq!(flags & 1, 1, "header integers are little-endian");
+        assert_eq!(
+            i32::from_le_bytes(blob[4..8].try_into().unwrap()),
+            3035,
+            "srs_id must be written, and in the declared byte order"
+        );
+        // Body starts immediately after the 8-byte header when there is no envelope.
+        assert_eq!(blob[8], 1, "WKB byte-order byte: little-endian");
+        assert_eq!(
+            u32::from_le_bytes(blob[9..13].try_into().unwrap()),
+            1,
+            "WKB type code 1 = Point"
+        );
+    }
+
+    /// The bare-WKB entry point must produce exactly what `decode_wkb` reads -- this is the form
+    /// PostGIS hands us via `ST_AsBinary`, with no GeoPackage header.
+    #[test]
+    fn bare_wkb_round_trips_and_uses_the_iso_type_codes() {
+        let cases = [
+            (Geometry::Point([0.0, 0.0]), 1u32),
+            (Geometry::LineString(vec![[0.0, 0.0], [1.0, 1.0]]), 2),
+            (
+                Geometry::Polygon(vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]),
+                3,
+            ),
+            (
+                Geometry::MultiLineString(vec![vec![[0.0, 0.0], [1.0, 1.0]]]),
+                5,
+            ),
+            (
+                Geometry::MultiPolygon(vec![vec![vec![
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, 1.0],
+                    [0.0, 0.0],
+                ]]]),
+                6,
+            ),
+        ];
+        for (g, code) in cases {
+            let wkb = encode_wkb(&g);
+            assert_eq!(wkb[0], 1, "little-endian byte-order marker");
+            assert_eq!(
+                u32::from_le_bytes(wkb[1..5].try_into().unwrap()),
+                code,
+                "wrong ISO type code for {g:?}"
+            );
+            assert_eq!(decode_wkb(&wkb).unwrap().unwrap(), g);
+        }
+    }
+
+    /// A geometry with no vertices has nothing to draw. It must still produce a blob a reader can
+    /// consume rather than a truncated one -- the decoder returns Ok(None) for the empty flag, so
+    /// that is the shape to emit.
+    #[test]
+    fn an_empty_geometry_sets_the_empty_flag_rather_than_writing_a_stub() {
+        let blob = encode_gpkg_geometry(&Geometry::LineString(vec![]), 4326);
+        assert_eq!((blob[3] >> 4) & 1, 1, "empty flag must be set");
+        assert_eq!(
+            decode_gpkg_geometry(&blob).unwrap(),
+            None,
+            "an empty geometry decodes to None, not an error"
+        );
     }
 }

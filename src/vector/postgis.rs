@@ -131,6 +131,31 @@ fn statement_timeout_ms() -> u64 {
         .unwrap_or(30_000)
 }
 
+/// The client-side safety net over a whole fetch, or `None` for "wait as long as it takes".
+///
+/// It has to sit strictly ABOVE the server-side `statement_timeout`, or it pre-empts a query the
+/// database was still legitimately working on -- hence the sum plus a margin rather than a knob of
+/// its own.
+///
+/// `statement_timeout = 0` means "no server-side limit", which the derived sum got exactly
+/// backwards: it made the CLIENT bound 20s, the shortest it can ever be, so asking for an
+/// unlimited query produced the tightest deadline in the system. Found running the first eu5
+/// `extract`, where a whole-table read is expected to outlast any fixed budget. With no
+/// server-side limit there is nothing for a derived bound to sit above, so there is no honest
+/// value to pick and the net comes off. The other timeouts still cover their own phases: connect
+/// and pool-wait both bound getting AS FAR AS a query, so a black-holed host still fails there
+/// rather than hanging. What is given up is only the stalled-mid-answer case, which is the
+/// deliberate trade for "0 means unlimited".
+fn query_budget() -> Option<std::time::Duration> {
+    let st = statement_timeout_ms();
+    if st == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_millis(
+        connect_timeout_ms() + pool_wait_timeout_ms() + st + 5_000,
+    ))
+}
+
 /// How long to wait for a TCP connect + authentication handshake.
 ///
 /// `statement_timeout` bounds EXECUTION only; it does nothing while a connection is being
@@ -619,16 +644,17 @@ impl WindowedSource for PostgisSource {
         // Deliberately derived rather than another env var, and deliberately the SUM plus a
         // margin, so it always sits strictly above the server-side limit and can never pre-empt a
         // legitimately slow query that `statement_timeout` is already governing.
-        let budget = std::time::Duration::from_millis(
-            connect_timeout_ms() + pool_wait_timeout_ms() + statement_timeout_ms() + 5_000,
-        );
+        let budget = query_budget();
         let fut = async {
-            match tokio::time::timeout(budget, self.fetch(&sql, env)).await {
-                Ok(r) => r,
-                Err(_) => Err(format!(
-                    "postgis: no response within {budget:?} (the database accepted the connection \
-                     and then stopped answering)"
-                )),
+            match budget {
+                None => self.fetch(&sql, env).await,
+                Some(b) => match tokio::time::timeout(b, self.fetch(&sql, env)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "postgis: no response within {b:?} (the database accepted the connection \
+                         and then stopped answering)"
+                    )),
+                },
             }
         };
         // A failed query must not look like an empty region -- so it is REPORTED, not logged and
@@ -1093,6 +1119,36 @@ fn column_value(row: &tokio_postgres::Row, i: usize) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// `statement_timeout = 0` means "no server-side limit". The derived client-side net used to
+    /// read that as a zero CONTRIBUTION and produce the tightest deadline in the system (20s), so
+    /// asking for an unlimited query got the shortest one. A whole-table `extract` read hit it on
+    /// the first real run.
+    #[test]
+    fn a_zero_statement_timeout_removes_the_client_side_net_instead_of_shortening_it() {
+        // These read process env, so the two cases are asserted through one serialized block
+        // rather than as two tests that could interleave.
+        let restore = std::env::var("TERRASERVE_PG_STATEMENT_TIMEOUT_MS").ok();
+
+        std::env::set_var("TERRASERVE_PG_STATEMENT_TIMEOUT_MS", "0");
+        assert_eq!(
+            super::query_budget(),
+            None,
+            "0 = unlimited, so there is nothing for a derived bound to sit above"
+        );
+
+        std::env::set_var("TERRASERVE_PG_STATEMENT_TIMEOUT_MS", "90000");
+        let b = super::query_budget().expect("a finite statement_timeout keeps the net");
+        assert!(
+            b > std::time::Duration::from_millis(90_000),
+            "the net must sit strictly above the server-side limit, got {b:?}"
+        );
+
+        match restore {
+            Some(v) => std::env::set_var("TERRASERVE_PG_STATEMENT_TIMEOUT_MS", v),
+            None => std::env::remove_var("TERRASERVE_PG_STATEMENT_TIMEOUT_MS"),
+        }
+    }
+
     use super::*;
 
     #[test]

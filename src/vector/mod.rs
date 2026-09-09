@@ -16,6 +16,7 @@ pub mod fgb;
 pub mod geojson;
 pub mod geom;
 pub mod gpkg;
+pub mod gpkg_write;
 pub mod index;
 pub mod mvt;
 pub mod pg_uri;

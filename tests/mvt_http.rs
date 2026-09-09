@@ -49,6 +49,7 @@ fn vector_layer() -> Layer {
             style,
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -83,7 +84,9 @@ fn vector_layer_with_custom_grid() -> Layer {
 #[test]
 fn xyz_tile_webmercator_is_200_and_nonempty() {
     let st = state();
-    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0).unwrap();
+    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0, false)
+        .unwrap()
+        .bytes;
     assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
     // The bytes must be a well-formed MVT tile: layer name + extent round-trip via the bespoke
     // decoder logic used by the mvt_tile.rs tests (a minimal parse here — just walk field 3
@@ -97,21 +100,23 @@ fn xyz_tile_webmercator_is_200_and_nonempty() {
 #[test]
 fn xyz_tile_worldcrs84quad_is_200_and_nonempty() {
     let st = state();
-    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "WorldCRS84Quad", 0, 0, 0).unwrap();
+    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "WorldCRS84Quad", 0, 0, 0, false)
+        .unwrap()
+        .bytes;
     assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
 }
 
 #[test]
 fn xyz_tile_out_of_range_is_404_not_panic() {
     let st = state();
-    let err = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 5, 5).unwrap_err();
+    let err = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 5, 5, false).unwrap_err();
     assert_eq!(err.0, 404);
 }
 
 #[test]
 fn xyz_tile_unknown_tms_is_4xx_not_panic() {
     let st = state();
-    let err = mvt_http::render_mvt_tile(&st, LAYER, "NoSuchGrid", 0, 0, 0).unwrap_err();
+    let err = mvt_http::render_mvt_tile(&st, LAYER, "NoSuchGrid", 0, 0, 0, false).unwrap_err();
     assert!((400..500).contains(&err.0));
 }
 
@@ -124,15 +129,17 @@ fn xyz_tile_custom_grid_is_200_and_nonempty() {
         "http://h/wms".into(),
         16,
     );
-    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0)
-        .expect("custom grid 'testgrid' should resolve, not 404");
+    let bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0, false)
+        .expect("custom grid 'testgrid' should resolve, not 404")
+        .bytes;
     assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
 }
 
 #[test]
 fn xyz_tile_unknown_layer_is_404() {
     let st = state();
-    let err = mvt_http::render_mvt_tile(&st, "nope", "WebMercatorQuad", 0, 0, 0).unwrap_err();
+    let err =
+        mvt_http::render_mvt_tile(&st, "nope", "WebMercatorQuad", 0, 0, 0, false).unwrap_err();
     assert_eq!(err.0, 404);
 }
 
@@ -142,7 +149,7 @@ fn xyz_tile_raster_layer_is_4xx_not_panic() {
     let mut l = vector_layer();
     l.vector = None;
     let st = ServeState::new(vec![l], "http://h/wms".into(), 16);
-    let err = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0).unwrap_err();
+    let err = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0, false).unwrap_err();
     assert!((400..500).contains(&err.0));
 }
 
@@ -320,8 +327,12 @@ fn wmts_gettile_mvt_format_matches_the_xyz_route() {
         other => panic!("expected GetTile, got {other:?}"),
     };
     assert_eq!(format, "application/vnd.mapbox-vector-tile");
-    let wmts_bytes = wmts::get_tile_mvt(&st, &layer, &style, &tms_id, z, row, col).unwrap();
-    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0).unwrap();
+    let wmts_bytes = wmts::get_tile_mvt(&st, &layer, &style, &tms_id, z, row, col, false)
+        .unwrap()
+        .bytes;
+    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0, false)
+        .unwrap()
+        .bytes;
     assert_eq!(
         wmts_bytes, xyz_bytes,
         "WMTS-MVT must match the XYZ route byte-for-byte"
@@ -338,9 +349,12 @@ fn wmts_gettile_mvt_custom_grid_matches_the_xyz_route() {
         "http://h/wms".into(),
         16,
     );
-    let wmts_bytes = wmts::get_tile_mvt(&st, LAYER, "default", "testgrid", 0, 0, 0)
-        .expect("custom grid 'testgrid' should resolve, not 404");
-    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0).unwrap();
+    let wmts_bytes = wmts::get_tile_mvt(&st, LAYER, "default", "testgrid", 0, 0, 0, false)
+        .expect("custom grid 'testgrid' should resolve, not 404")
+        .bytes;
+    let xyz_bytes = mvt_http::render_mvt_tile(&st, LAYER, "testgrid", 0, 0, 0, false)
+        .unwrap()
+        .bytes;
     assert_eq!(
         wmts_bytes, xyz_bytes,
         "WMTS-MVT must match the XYZ route byte-for-byte on a custom grid too"
@@ -419,13 +433,13 @@ fn mvt_cache_computes_once_and_serves_identical() {
     use terraserve::mvt_http::{build_byte_cache, render_mvt_tile};
     let mut st = state();
     st.mvt_cache = Some(build_byte_cache(16));
-    let a = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0).unwrap();
-    let b = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0).unwrap();
+    let a = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0, false).unwrap();
+    let b = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 0, 0, 0, false).unwrap();
     assert_eq!(a, b, "cached tile is byte-identical");
     let cache = st.mvt_cache.as_ref().unwrap();
     cache.run_pending_tasks();
     assert_eq!(cache.entry_count(), 1, "the tile was cached (compute-once)");
     // The cache must not change output vs the uncached path.
-    let uncached = render_mvt_tile(&state(), LAYER, "WebMercatorQuad", 0, 0, 0).unwrap();
+    let uncached = render_mvt_tile(&state(), LAYER, "WebMercatorQuad", 0, 0, 0, false).unwrap();
     assert_eq!(a, uncached, "cache does not alter the encoded bytes");
 }

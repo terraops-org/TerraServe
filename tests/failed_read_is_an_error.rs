@@ -74,6 +74,7 @@ fn state_with_failing_layer() -> ServeState {
             style: style(),
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -104,11 +105,11 @@ fn tms_raster_tile_reports_a_failed_read_instead_of_serving_a_blank_tile() {
 #[test]
 fn mvt_tile_reports_a_failed_read_instead_of_encoding_an_empty_tile() {
     let st = state_with_failing_layer();
-    let out = terraserve::mvt_http::render_mvt_tile(&st, "boom", "WebMercatorQuad", 2, 2, 2);
+    let out = terraserve::mvt_http::render_mvt_tile(&st, "boom", "WebMercatorQuad", 2, 2, 2, false);
     match out {
         Ok(mvt) => panic!(
             "a failed source read was encoded as a {}-byte MVT with success",
-            mvt.len()
+            mvt.bytes.len()
         ),
         Err((code, msg)) => {
             assert_eq!(code, 500);

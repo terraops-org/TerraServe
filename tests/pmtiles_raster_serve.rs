@@ -70,6 +70,7 @@ fn countries_layer() -> Layer {
             style,
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),

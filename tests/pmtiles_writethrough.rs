@@ -45,6 +45,7 @@ fn countries_layer_no_overlay() -> Layer {
             style,
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -72,8 +73,10 @@ fn miss_is_live_encoded_then_served_from_overlay() {
     let ov = layer.overlay.get("WebMercatorQuad").unwrap().clone();
     let st = ServeState::new(vec![layer], "http://h/wms".into(), 16);
     // First request: overlay empty + base None -> live encode; must also populate the overlay.
-    let first = terraserve::mvt_http::render_mvt_tile(&st, "countries", "WebMercatorQuad", 2, 1, 1)
-        .unwrap();
+    let first =
+        terraserve::mvt_http::render_mvt_tile(&st, "countries", "WebMercatorQuad", 2, 1, 1, false)
+            .unwrap()
+            .bytes;
     if !first.is_empty() {
         let id = terraserve::vector::pmtiles::zxy_to_tileid(2, 1, 1);
         assert!(
@@ -81,9 +84,17 @@ fn miss_is_live_encoded_then_served_from_overlay() {
             "miss must be persisted to the overlay"
         );
         // Second identical request returns the SAME bytes (now served from the overlay).
-        let second =
-            terraserve::mvt_http::render_mvt_tile(&st, "countries", "WebMercatorQuad", 2, 1, 1)
-                .unwrap();
+        let second = terraserve::mvt_http::render_mvt_tile(
+            &st,
+            "countries",
+            "WebMercatorQuad",
+            2,
+            1,
+            1,
+            false,
+        )
+        .unwrap()
+        .bytes;
         assert_eq!(
             first, second,
             "overlay-served bytes must match the live encode"
@@ -216,7 +227,9 @@ fn per_grid_overlays_isolate_puts_by_grid() {
         "grid B's overlay must start empty"
     );
 
-    let first_a = terraserve::mvt_http::render_mvt_tile(&st, "countries", &gid_a, 2, 1, 1).unwrap();
+    let first_a = terraserve::mvt_http::render_mvt_tile(&st, "countries", &gid_a, 2, 1, 1, false)
+        .unwrap()
+        .bytes;
     if !first_a.is_empty() {
         assert!(
             ov_a.get_by_id(id2).unwrap().is_some(),
@@ -230,7 +243,9 @@ fn per_grid_overlays_isolate_puts_by_grid() {
 
         // A later request for the SAME grid A tile hits A's overlay and returns identical bytes.
         let second_a =
-            terraserve::mvt_http::render_mvt_tile(&st, "countries", &gid_a, 2, 1, 1).unwrap();
+            terraserve::mvt_http::render_mvt_tile(&st, "countries", &gid_a, 2, 1, 1, false)
+                .unwrap()
+                .bytes;
         assert_eq!(
             first_a, second_a,
             "a later grid-A request must be served from A's overlay"

@@ -115,6 +115,29 @@ pub struct LayerConfig {
     /// checked against the table at startup, so a typo fails loudly instead of blanking the map.
     #[serde(default)]
     pub columns: Vec<String>,
+    /// Per-zoom pre-generalized subsets for this layer, as cut by `terraserve extract`.
+    ///
+    /// Each entry claims an inclusive zoom band and the file to serve it from; a zoom inside a
+    /// band is read from that file, a zoom outside every band from `vector:` itself. Bands must
+    /// not overlap, must share the layer's CRS, and cannot be combined with topology LOD (whose
+    /// pools are built from `vector:` and would silently win). Default empty.
+    #[serde(default)]
+    pub zoom_sources: Vec<ZoomSourceConfig>,
+}
+
+/// One entry of a layer's `zoom_sources:` -- an inclusive zoom band and the extract that serves it.
+///
+/// The band is declared rather than read out of the file because it is a SERVING decision: the
+/// file holds whatever passed the threshold it was cut with, and only the operator knows which
+/// zooms that was meant for. Declaring it wrong is the one mistake this feature can make quietly,
+/// which is why `extract` stamps the band it cut into the GeoPackage and the loader checks it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZoomSourceConfig {
+    pub min_zoom: u32,
+    pub max_zoom: u32,
+    /// The subset file: a local GeoPackage/FlatGeoBuf/GeoJSON path, or `s3://`. Read through the
+    /// same loader the layer's own `vector:` uses.
+    pub vector: String,
 }
 
 /// A config-defined custom TileMatrixSet: explicit CRS + top-left origin + full extent + tile size

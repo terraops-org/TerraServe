@@ -275,6 +275,32 @@ impl TileOverlay {
         }
     }
 
+    /// Like `get`, but hands back the STORED blob plus the compression it is stored under, so the
+    /// HTTP layer can pass a gzip'd tile straight to a client that asked for gzip instead of
+    /// inflating it only to ship the larger bytes.
+    ///
+    /// Returning the compression alongside the bytes is not decoration: the overlay's own log
+    /// always holds gzip (`put` is fed `gzip(&live)`), but the BASE archive it falls through to is
+    /// legally `COMPRESSION_NONE`, so one shared answer for both sources would be wrong for one of
+    /// them. Callers must label the response from this byte, never from an assumption.
+    pub fn get_raw(&self, z: u32, x: u32, y: u32) -> PmResult<Option<(Vec<u8>, u8)>> {
+        let id = zxy_to_tileid(z, x, y);
+        if let Some(b) = self.get_by_id_raw(id)? {
+            return Ok(Some((b, crate::vector::pmtiles::write::COMPRESSION_GZIP)));
+        }
+        let base = {
+            self.inner
+                .lock()
+                .map_err(|_| "overlay lock poisoned")?
+                .base
+                .clone()
+        };
+        match base {
+            Some(r) => Ok(r.get_raw(z, x, y)?.map(|b| (b, r.tile_compression()))),
+            None => Ok(None),
+        }
+    }
+
     /// Every TileID currently superseded in the overlay index.
     pub fn snapshot_ids(&self) -> Vec<u64> {
         self.inner
@@ -842,6 +868,62 @@ mod tests {
 
         std::fs::remove_file(&out).ok();
         std::fs::remove_file(&log).ok();
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+    /// `get_raw` must label each answer with the compression of whichever source produced it.
+    /// The overlay log is always gzip; the base archive is whatever its header says. Getting this
+    /// wrong hands a client bytes it cannot decode behind a `Content-Encoding` that lies.
+    #[test]
+    fn get_raw_reports_the_compression_of_whichever_source_answered() {
+        use crate::vector::pmtiles::codec::gzip;
+        use crate::vector::pmtiles::write::{COMPRESSION_GZIP, COMPRESSION_NONE};
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "ts_ov_raw_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let base_path = tmp_dir.join("base.pmtiles");
+        let log_path = tmp_dir.join("ov.log");
+        std::fs::remove_file(&base_path).ok();
+        std::fs::remove_file(&log_path).ok();
+
+        let hf = HeaderFields {
+            min_zoom: 1,
+            max_zoom: 1,
+            bounds_e7: [0, 0, 0, 0],
+            center: (1, 0, 0),
+        };
+        let id_base = zxy_to_tileid(1, 0, 0);
+        let id_ov = zxy_to_tileid(1, 1, 1);
+        {
+            let mut w = PmtilesWriter::new(&tmp_dir).unwrap(); // default MVT + gzip
+            w.add(id_base, gzip(b"FROM_THE_BASE")).unwrap();
+            w.finish(hf, "{}", &base_path).unwrap();
+        }
+        let base = Arc::new(PmtilesReader::open(&base_path).unwrap());
+        assert_eq!(base.tile_compression(), COMPRESSION_GZIP);
+
+        let ov = TileOverlay::open(&log_path, Some(base)).unwrap();
+        ov.put(id_ov, &gzip(b"FROM_THE_OVERLAY")).unwrap();
+
+        // Overlay hit: the stored blob, labelled gzip, and it really does inflate to the tile.
+        let (bytes, comp) = ov.get_raw(1, 1, 1).unwrap().expect("overlay hit");
+        assert_eq!(comp, COMPRESSION_GZIP);
+        assert_ne!(comp, COMPRESSION_NONE, "an overlay blob is never identity");
+        assert_eq!(gunzip(&bytes).unwrap(), b"FROM_THE_OVERLAY");
+        assert_eq!(ov.get(1, 1, 1).unwrap().unwrap(), b"FROM_THE_OVERLAY");
+
+        // Base fall-through: labelled from the BASE header, not from the overlay's own storage.
+        let (bytes, comp) = ov.get_raw(1, 0, 0).unwrap().expect("base fall-through");
+        assert_eq!(comp, COMPRESSION_GZIP);
+        assert_eq!(gunzip(&bytes).unwrap(), b"FROM_THE_BASE");
+        assert_eq!(ov.get(1, 0, 0).unwrap().unwrap(), b"FROM_THE_BASE");
+
+        // A miss in both is still a miss.
+        assert!(ov.get_raw(1, 0, 1).unwrap().is_none());
+
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
 }

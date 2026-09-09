@@ -67,6 +67,33 @@ pub struct BuildPmtilesArgs {
     /// `"vector"` (matching `serve --vector`'s default layer name).
     #[arg(long)]
     pub name: Option<String>,
+    /// Extra attribute columns to fetch for a `postgis://` source, e.g. `building,name`.
+    ///
+    /// A database query has to NAME its columns, and the derived list sees only the SERVER-side
+    /// style -- so anything only a client-side `--mvt-style` needs is never selected and the
+    /// archive ships without it. That is why the eu5 v3 buildings archive has no `building`
+    /// property and draws every footprint in its style's default colour.
+    ///
+    /// It matters more once `--zoom-source` is in play: a subset cut with `extract --columns`
+    /// carries those attributes, so without the same list here one archive would theme correctly
+    /// at the banded zooms and not above them. Ignored for file sources, which read whatever the
+    /// feature carries.
+    #[arg(long = "columns", value_delimiter = ',')]
+    pub columns: Vec<String>,
+    /// Bake a zoom band from its own pre-generalized subset: `min:max:path`, repeatable.
+    ///
+    /// This is the point of `terraserve extract`. The generator already picks its source with
+    /// `VectorLayer::source_for_zoom`, so declaring bands here makes ONE bake produce ONE archive
+    /// whose every zoom was cut from the subset made for it -- and a zoom's tiles then carry no
+    /// per-tile selection at all, which is the seam-free property. Zooms outside every band fall
+    /// back to `--vector`.
+    ///
+    /// The same rules `serve`'s `zoom_sources:` applies hold here: bands must not overlap, must
+    /// match the layer's CRS, and a band declared outside what `extract` stamped into the file is
+    /// refused. Equivalent to the `zoom_sources:` block on a `--config` layer, which this command
+    /// has no way to read.
+    #[arg(long = "zoom-source")]
+    pub zoom_source: Vec<String>,
     // --- MVT / topology optimization flags copied VERBATIM from ServeArgs (byte-parity with serve) ---
     #[arg(long, default_value_t = crate::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE)]
     pub mvt_max_features: usize,
@@ -140,6 +167,54 @@ pub struct BuildPmtilesArgs {
 /// Build a `.pmtiles` pyramid offline. Constructs the SAME `Layer` + `MvtOptimizations` `run_serve`
 /// builds for a single `--vector` layer (so archived tiles are byte-identical to a live `/mvt`
 /// render), then drives `vector::pmtiles::generate::build_pmtiles` over a WebMercatorQuad grid.
+/// Parse `--zoom-source min:max:path` entries.
+///
+/// Split from the RIGHT twice, so a Windows-style path or an `s3://` URI (both of which contain
+/// `:`) survives: only the first two colons separate the zooms, everything after them is the path.
+fn parse_zoom_sources(
+    raw: &[String],
+) -> Result<Vec<crate::config::ZoomSourceConfig>, crate::Error> {
+    let mut out = Vec::with_capacity(raw.len());
+    for entry in raw {
+        let bad = || -> crate::Error {
+            format!(
+                "--zoom-source '{entry}': expected min:max:path, e.g. 0:6:/data/water-z0-6.gpkg"
+            )
+            .into()
+        };
+        let (lo, rest) = entry.split_once(':').ok_or_else(bad)?;
+        let (hi, path) = rest.split_once(':').ok_or_else(bad)?;
+        let (lo, hi) = match (lo.trim().parse::<u32>(), hi.trim().parse::<u32>()) {
+            (Ok(a), Ok(b)) => (a, b),
+            _ => return Err(bad()),
+        };
+        if path.trim().is_empty() {
+            return Err(bad());
+        }
+        out.push(crate::config::ZoomSourceConfig {
+            min_zoom: lo,
+            max_zoom: hi,
+            vector: path.trim().to_string(),
+        });
+    }
+    Ok(out)
+}
+
+impl BuildPmtilesArgs {
+    /// `--columns`, trimmed, with empties dropped.
+    ///
+    /// A trailing comma would otherwise become a column named "", which Postgres rejects with a
+    /// bare syntax error rather than anything an operator can act on. Exposed as a method rather
+    /// than filtered at the call site so the thing tested is the thing used.
+    pub fn clean_columns(&self) -> Vec<String> {
+        self.columns
+            .iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect()
+    }
+}
+
 pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     // Validate up front — cheap checks before any file I/O.
     if args.out.is_empty() {
@@ -215,6 +290,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         mvt_dissolve_max_zoom: args.mvt_dissolve_max_zoom,
         mvt_cache: 0,
         wms_cache: 0,
+        tile_max_age: 0,
         mvt_style: None,
     };
 
@@ -265,7 +341,11 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         serve_args.tms_tile_px,
         no_custom_grids,
     )
-    .with_pmtiles(serve_args.pmtiles.clone());
+    .with_pmtiles(serve_args.pmtiles.clone())
+    .with_zoom_sources(parse_zoom_sources(&args.zoom_source)?)
+    // Empty entries dropped so a trailing comma cannot become a column named "", which Postgres
+    // rejects with a bare syntax error rather than anything an operator can act on.
+    .with_columns(args.clean_columns());
     let layer = build_vector_layer(&spec, &s3)?;
 
     // Build the optimization set the SAME way `run_serve` does: a minimal ServeState carrying the

@@ -139,56 +139,49 @@ impl PmtilesReader {
         ))
     }
 
-    /// Decoded tile bytes for (z,x,y), or None on a miss. Decompression follows the header's
-    /// `tile_compression`: gzip (2) for MVT, none (1) for the raster archives whose PNG payloads are
-    /// already compressed. Any other value is an error rather than a silently mangled tile.
-    pub fn get(&self, z: u32, x: u32, y: u32) -> PmResult<Option<Vec<u8>>> {
+    /// What compression the archive DECLARES its tiles are stored under (PMTiles header byte 98):
+    /// `2` = gzip (how every MVT archive we write stores them), `1` = none (the raster archives,
+    /// whose PNG payloads are already compressed). The serving path asks this before deciding
+    /// whether a stored blob can be handed to the client untouched.
+    pub fn tile_compression(&self) -> u8 {
+        self.header.tile_compression
+    }
+
+    /// The stored blob for (z,x,y) EXACTLY as the archive holds it -- no decompression -- or None
+    /// on a miss. This is what lets the HTTP layer pass a gzip'd tile straight through to a client
+    /// that sent `Accept-Encoding: gzip`: MVT archives already store gzip, so inflating here only
+    /// to ship the larger bytes costs CPU and roughly 3x the wire for nothing.
+    ///
+    /// The caller MUST consult `tile_compression()` before treating the result as gzip -- an
+    /// archive is legally `COMPRESSION_NONE`, and labelling identity bytes as gzip would hand the
+    /// client something it cannot decode.
+    ///
+    /// Note the shape difference from `get`: an archived-EMPTY tile is `Some(gzip-of-nothing)`
+    /// here (~20 bytes), not `Some(vec![])`. Emptiness is not detectable on this path.
+    pub fn get_raw(&self, z: u32, x: u32, y: u32) -> PmResult<Option<Vec<u8>>> {
         if z > 26 {
             return Ok(None);
         }
-        let target = zxy_to_tileid(z, x, y);
-        let mut dir = self.root.clone();
-        for _ in 0..4 {
-            // largest tile_id <= target
-            let idx = match dir.binary_search_by(|e| e.tile_id.cmp(&target)) {
-                Ok(i) => i,
-                Err(0) => return Ok(None),
-                Err(i) => i - 1,
-            };
-            let e = dir[idx];
-            if e.run_length == 0 {
-                // leaf pointer -> descend
-                let leaf_off = self
-                    .header
-                    .leaf_dirs_offset
-                    .checked_add(e.offset)
-                    .ok_or_else(|| "pmtiles: leaf dir offset overflow".to_string())?;
-                let bytes = read_at(&self.file, self.file_len, leaf_off, e.length)?;
-                dir = deserialize_directory(&bytes)?;
-                continue;
-            }
-            let run_end = e
-                .tile_id
-                .checked_add(e.run_length)
-                .ok_or_else(|| "pmtiles: run_length overflow".to_string())?;
-            if target < run_end {
-                let tile_off = self
-                    .header
-                    .tile_data_offset
-                    .checked_add(e.offset)
-                    .ok_or_else(|| "pmtiles: tile data offset overflow".to_string())?;
-                let blob = read_at(&self.file, self.file_len, tile_off, e.length)?;
-                return match self.header.tile_compression {
-                    super::write::COMPRESSION_GZIP => Ok(Some(gunzip(&blob)?)),
-                    super::write::COMPRESSION_NONE => Ok(Some(blob)),
-                    other => Err(format!(
-                        "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
-                    )),
-                };
-            }
-            return Ok(None); // in a gap within the run's id range
+        self.raw_tile_by_id(zxy_to_tileid(z, x, y))
+    }
+
+    /// Decoded tile bytes for (z,x,y), or None on a miss. Decompression follows the header's
+    /// `tile_compression`: gzip (2) for MVT, none (1) for the raster archives whose PNG payloads are
+    /// already compressed. Any other value is an error rather than a silently mangled tile.
+    ///
+    /// Thin wrapper over `get_raw` so the directory descent exists once: the two used to carry
+    /// byte-identical copies of it, which is exactly the kind of duplication that drifts.
+    pub fn get(&self, z: u32, x: u32, y: u32) -> PmResult<Option<Vec<u8>>> {
+        let Some(blob) = self.get_raw(z, x, y)? else {
+            return Ok(None);
+        };
+        match self.header.tile_compression {
+            super::write::COMPRESSION_GZIP => Ok(Some(gunzip(&blob)?)),
+            super::write::COMPRESSION_NONE => Ok(Some(blob)),
+            other => Err(format!(
+                "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
+            )),
         }
-        Err("pmtiles: leaf descent exceeded 4 levels".into())
     }
 
     /// Every addressed TileID in the archive (run_lengths expanded), ascending. Descends leaf dirs.
@@ -284,6 +277,64 @@ mod tests {
     };
     use crate::vector::pmtiles::{tileid_to_zxy, zxy_to_tileid, Entry, Header};
     use std::io::Write;
+
+    /// `get_raw` hands back the blob EXACTLY as the archive stores it, so the HTTP layer can pass
+    /// a gzip'd tile straight to a client that asked for gzip. The archives have always stored
+    /// gzip; decompressing here only to ship the inflated bytes is waste on both CPU and wire.
+    #[test]
+    fn get_raw_returns_the_stored_blob_and_get_still_inflates_it() {
+        use crate::vector::pmtiles::write::{HeaderFields, PmtilesWriter, COMPRESSION_GZIP};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ts_pmt_raw_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let out = tmp.join("raw.pmtiles");
+
+        // Payload compressible enough that gzip is visibly smaller -- the whole point of the change.
+        let payload = b"mvt-ish bytes, repeated, repeated, repeated, repeated, repeated".repeat(20);
+        let stored = gzip(&payload);
+        let mut w = PmtilesWriter::new(&tmp).unwrap(); // default = MVT + gzip
+        w.add(zxy_to_tileid(3, 2, 1), stored.clone()).unwrap();
+        w.finish(
+            HeaderFields {
+                min_zoom: 3,
+                max_zoom: 3,
+                bounds_e7: [0, 0, 0, 0],
+                center: (3, 2, 1),
+            },
+            r#"{"vector_layers":[]}"#,
+            &out,
+        )
+        .unwrap();
+
+        let r = PmtilesReader::open(&out).unwrap();
+        assert_eq!(r.tile_compression(), COMPRESSION_GZIP);
+
+        let raw = r.get_raw(3, 2, 1).unwrap().expect("archive hit");
+        assert_eq!(raw, stored, "get_raw must not touch the stored bytes");
+        assert!(
+            raw.len() < payload.len(),
+            "the stored blob must be smaller than the tile ({} vs {}) or there is nothing to win",
+            raw.len(),
+            payload.len()
+        );
+
+        // `get` keeps its contract: callers that want plain MVT still get plain MVT.
+        assert_eq!(r.get(3, 2, 1).unwrap().unwrap(), payload);
+        // And the two agree, which is what makes the pass-through safe.
+        assert_eq!(gunzip(&raw).unwrap(), payload);
+
+        // A miss is a miss on both paths.
+        assert!(r.get_raw(3, 0, 0).unwrap().is_none());
+        assert!(r.get(3, 0, 0).unwrap().is_none());
+        // Out-of-range zoom is guarded on the raw path too, not just on `get`.
+        assert!(r.get_raw(27, 0, 0).unwrap().is_none());
+
+        let _ = std::fs::remove_file(&out);
+    }
 
     #[test]
     fn reads_back_a_hand_built_archive() {

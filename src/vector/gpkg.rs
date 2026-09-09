@@ -404,6 +404,30 @@ fn load_range(
 /// no feature read. Any error along the way (missing file, no features layer, no metadata) →
 /// `false`, so the caller falls through to the load-all path, which will surface a precise error
 /// of its own rather than this probe swallowing it silently.
+/// The zoom band a GeoPackage was cut for by `terraserve extract`, if it says.
+///
+/// `extract` stamps `terraserve-extract zoom=<min>-<max>` into `gpkg_contents.description`
+/// (`GpkgWriter::with_zoom_band`). `None` means the file carries no stamp -- an ordinary
+/// GeoPackage, or one written before the stamp existed -- which is not an error: an operator is
+/// allowed to hand-cut a subset. What it does mean is that nothing can check the declaration, so
+/// the caller warns rather than verifies.
+///
+/// Returns `None` on any read failure too: this is a cross-check, and a layer must not fail to
+/// start because a description column could not be read.
+pub fn gpkg_zoom_band(path: &str) -> Option<(u32, u32)> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let desc: String = conn
+        .query_row(
+            "SELECT description FROM gpkg_contents WHERE data_type='features' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let rest = desc.strip_prefix("terraserve-extract zoom=")?;
+    let (lo, hi) = rest.split_once('-')?;
+    Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?))
+}
+
 pub fn gpkg_has_rtree(path: &str, layer: Option<&str>) -> bool {
     let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(c) => c,

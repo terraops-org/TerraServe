@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // Copyright (C) 2026 TerraOps <https://terraops.org>
 
-//! Polygon/line rasterization: a standalone tiny-skia kernel that turns already-projected
+//! Polygon/line rasterization: a standalone vello_cpu kernel that turns already-projected
 //! pixel-space geometry into a straight-alpha RGBA8 layer.
 //!
 //! This module does **no** projection/CRS work — `render.rs` (Task 7) hands it pixel-space
@@ -11,41 +11,65 @@
 //! whether the source data's exterior/hole rings follow the OGC right-hand-rule convention —
 //! GeoJSON/SLD producers are not reliably consistent about this, and even-odd sidesteps needing
 //! to detect/normalize ring orientation.
+//!
+//! **Renderer swapped tiny-skia -> vello_cpu on 2026-09-09.** Measured on four real eu5
+//! production tiles, vello_cpu won 24 of 24 cases by 1.15x-4.39x, with the largest margin on the
+//! layer that dominates the render budget (roads, 197.7 ms -> 72.1 ms). Full method and numbers:
+//! `docs/renderer-benchmark-tinyskia-vs-vellocpu.md`. The public API of this module is unchanged —
+//! no renderer type appears in any signature — so every caller was insulated from the swap.
 
-use tiny_skia::{
-    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Shader, Stroke, Transform,
-};
+use vello_cpu::color::{AlphaColor, Srgb};
+use vello_cpu::kurbo::{BezPath, Cap, Join, Stroke};
+use vello_cpu::peniko::Fill;
+use vello_cpu::{Pixmap, RenderContext, Resources};
 
 use super::style::PolygonSym;
 
-/// An anti-aliased, opaque-or-translucent solid-color `Paint`, built without the
-/// `Default::default()`-then-reassign pattern (a struct literal keeps `Paint` immutable at the
-/// call site — every paint here is used exactly once, for a single fill/stroke call).
-fn solid_paint(color: [u8; 4]) -> Paint<'static> {
+/// An opaque-or-translucent solid colour. Anti-aliasing is vello_cpu's default (an aliasing
+/// threshold of `None`), matching the `anti_alias: true` this module used under tiny-skia.
+fn solid_color(color: [u8; 4]) -> AlphaColor<Srgb> {
     let [r, g, b, a] = color;
-    Paint {
-        shader: Shader::SolidColor(Color::from_rgba8(r, g, b, a)),
-        anti_alias: true,
-        ..Paint::default()
-    }
+    AlphaColor::from_rgba8(r, g, b, a)
 }
 
-/// Accumulates projected geometry into a base RGBA8 (straight-alpha) layer via tiny-skia.
+/// A round-capped, round-joined stroke of `width` px, as every stroke in this module has always
+/// been (both the optional polygon outline and the line-layer stroke).
+fn round_stroke(width: f32) -> Stroke {
+    Stroke::new(width as f64)
+        .with_caps(Cap::Round)
+        .with_join(Join::Round)
+}
+
+/// Accumulates projected geometry into a base RGBA8 (straight-alpha) layer via vello_cpu.
 ///
-/// tiny-skia's `Pixmap` stores **premultiplied** RGBA8 internally (required for correct
-/// source-over blending as shapes are painted on top of each other); `into_straight_rgba`
-/// converts back to straight alpha once, at the end, for the caller (`draw::Canvas` expects
-/// straight alpha, matching PNG's expectation — see `draw.rs`'s own `into_rgba`).
+/// vello_cpu composites into a **premultiplied** RGBA8 pixmap (required for correct source-over
+/// blending as shapes are painted on top of each other); `into_straight_rgba` converts back to
+/// straight alpha once, at the end, for the caller (`draw::Canvas` expects straight alpha,
+/// matching PNG's expectation — see `draw.rs`'s own `into_rgba`).
 pub struct GeomLayer {
-    pixmap: Pixmap,
+    ctx: RenderContext,
+    w: u16,
+    h: u16,
 }
 
 impl GeomLayer {
-    /// A transparent `w`×`h` canvas. Panics if `w` or `h` is 0 — tiny-skia rejects a zero-size
-    /// pixmap and Task 7 never asks for a degenerate viewport.
+    /// A transparent `w`×`h` canvas. Panics if `w` or `h` is 0, or exceeds 65535 — vello_cpu's
+    /// surface dimensions are `u16`, and Task 7 never asks for a degenerate or absurd viewport.
     pub fn new(w: u32, h: u32) -> GeomLayer {
+        assert!(
+            w > 0 && h > 0,
+            "GeomLayer::new: width/height must be non-zero"
+        );
+        let w: u16 = w
+            .try_into()
+            .expect("GeomLayer::new: width must fit in u16 (<= 65535)");
+        let h: u16 = h
+            .try_into()
+            .expect("GeomLayer::new: height must fit in u16 (<= 65535)");
         GeomLayer {
-            pixmap: Pixmap::new(w, h).expect("GeomLayer::new: width/height must be non-zero"),
+            ctx: RenderContext::new(w, h),
+            w,
+            h,
         }
     }
 
@@ -60,60 +84,40 @@ impl GeomLayer {
             return;
         };
 
-        let fill_paint = solid_paint(sym.fill);
-        self.pixmap.fill_path(
-            &path,
-            &fill_paint,
-            FillRule::EvenOdd,
-            Transform::identity(),
-            None,
-        );
+        self.ctx.set_paint(solid_color(sym.fill));
+        self.ctx.set_fill_rule(Fill::EvenOdd);
+        self.ctx.fill_path(&path);
 
         if let Some(stroke_color) = sym.stroke {
-            let stroke_paint = solid_paint(stroke_color);
-            let stroke = Stroke {
-                width: sym.stroke_width,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                ..Default::default()
-            };
-            self.pixmap
-                .stroke_path(&path, &stroke_paint, &stroke, Transform::identity(), None);
+            self.ctx.set_paint(solid_color(stroke_color));
+            self.ctx.set_stroke(round_stroke(sym.stroke_width));
+            self.ctx.stroke_path(&path);
         }
     }
 
     /// `lines`: each a pixel-space `[x, y]` polyline, stroked with `stroke`/`width` (round cap +
-    /// round join). All lines go into one path as separate open contours (no `close()`). Lines
-    /// with fewer than 2 points are degenerate (nothing to stroke) and are skipped.
+    /// round join). All lines go into one path as separate open contours (no `close_path()`).
+    /// Lines with fewer than 2 points are degenerate (nothing to stroke) and are skipped.
     pub fn stroke_lines(&mut self, lines: &[Vec<[f32; 2]>], stroke: [u8; 4], width: f32) {
-        let mut pb = PathBuilder::new();
+        let mut bp = BezPath::new();
         let mut any = false;
         for line in lines {
             if line.len() < 2 {
                 continue;
             }
             any = true;
-            pb.move_to(line[0][0], line[0][1]);
+            bp.move_to((line[0][0] as f64, line[0][1] as f64));
             for p in &line[1..] {
-                pb.line_to(p[0], p[1]);
+                bp.line_to((p[0] as f64, p[1] as f64));
             }
         }
         if !any {
             return;
         }
-        let Some(path) = pb.finish() else {
-            return;
-        };
 
-        let paint = solid_paint(stroke);
-        let s = Stroke {
-            width,
-            line_cap: LineCap::Round,
-            line_join: LineJoin::Round,
-            ..Default::default()
-        };
-        self.pixmap
-            .stroke_path(&path, &paint, &s, Transform::identity(), None);
+        self.ctx.set_paint(solid_color(stroke));
+        self.ctx.set_stroke(round_stroke(width));
+        self.ctx.stroke_path(&bp);
     }
 
     /// Demultiplied straight-alpha RGBA8 (`w*h*4`), ready to seed `draw::Canvas`'s buffer.
@@ -122,40 +126,44 @@ impl GeomLayer {
     /// where Task 7 composites this layer under the markers/labels: a translucent pixel's stored
     /// RGB is `color * alpha`, not `color`, so compositing it again (Canvas's own `blend`, or a
     /// downstream PNG viewer) would double-apply the alpha.
-    pub fn into_straight_rgba(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.pixmap.pixels().len() * 4);
-        for px in self.pixmap.pixels() {
-            let s = px.demultiply();
-            out.push(s.red());
-            out.push(s.green());
-            out.push(s.blue());
-            out.push(s.alpha());
+    pub fn into_straight_rgba(mut self) -> Vec<u8> {
+        self.ctx.flush();
+        let mut pixmap = Pixmap::new(self.w, self.h);
+        let mut resources = Resources::new();
+        self.ctx.render(&mut pixmap, &mut resources);
+
+        let mut out = Vec::with_capacity(self.w as usize * self.h as usize * 4);
+        for px in pixmap.take_unpremultiplied() {
+            out.push(px.r);
+            out.push(px.g);
+            out.push(px.b);
+            out.push(px.a);
         }
         out
     }
 }
 
 /// Build a single path from `rings`: for each ring with >= 3 points, `move_to` the first vertex,
-/// `line_to` the rest, then `close()`. Rings with < 3 points are skipped. `None` if the
+/// `line_to` the rest, then `close_path()`. Rings with < 3 points are skipped. `None` if the
 /// resulting path has no contours at all (every ring skipped, or `rings` empty).
-fn build_rings_path(rings: &[Vec<[f32; 2]>]) -> Option<tiny_skia::Path> {
-    let mut pb = PathBuilder::new();
+fn build_rings_path(rings: &[Vec<[f32; 2]>]) -> Option<BezPath> {
+    let mut bp = BezPath::new();
     let mut any = false;
     for ring in rings {
         if ring.len() < 3 {
             continue;
         }
         any = true;
-        pb.move_to(ring[0][0], ring[0][1]);
+        bp.move_to((ring[0][0] as f64, ring[0][1] as f64));
         for p in &ring[1..] {
-            pb.line_to(p[0], p[1]);
+            bp.line_to((p[0] as f64, p[1] as f64));
         }
-        pb.close();
+        bp.close_path();
     }
     if !any {
         return None;
     }
-    pb.finish()
+    Some(bp)
 }
 
 #[cfg(test)]

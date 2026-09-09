@@ -49,6 +49,7 @@ fn countries_layer() -> Layer {
             style,
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -141,6 +142,8 @@ fn build_pmtiles_uses_the_given_layer_name() {
     let tmpdir = std::env::temp_dir().join(format!("ts_e2e_name_tmp_{}", std::process::id()));
     std::fs::create_dir_all(&tmpdir).expect("create test tmpdir");
     let args = terraserve::BuildPmtilesArgs {
+        zoom_source: Vec::new(),
+        columns: Vec::new(),
         vector: Some("fixtures/vector/countries.geojson".into()),
         out: out.to_string_lossy().into_owned(),
         min_zoom: 0,

@@ -1,6 +1,6 @@
 [package]
 name = "terraserve"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "Clean-room raster + vector tile engine in Rust (COG / GeoPackage / FlatGeoBuf → WMS / WMTS / TMS / MVT), no GDAL / MapServer / GeoServer."
@@ -114,7 +114,9 @@ roxmltree = "0.20"  # generic XML DOM for SLD parsing — the SLD interpretation
 
 # CPU rasterizer for polygon + line rendering. A rendering engine, not a geo reader —
 # the vector rasterization/AA plumbing (like proj/harfrust); raster.rs uses this.
-tiny-skia = "0.11"
+# Vector rasterization. Swapped tiny-skia -> vello_cpu 2026-09-09 on a measured 24-of-24 win
+# (1.15x-4.39x on real eu5 tiles); see docs/renderer-benchmark-tinyskia-vs-vellocpu.md.
+vello_cpu = "0.2"
 
 # FlatBuffers runtime — codec, not a geo-format reader. The FlatGeoBuf container/Header/
 # R-tree/Feature decode (src/vector/fgb/) is hand-written on top of this low-level Table API.

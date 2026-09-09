@@ -301,12 +301,16 @@ pub fn get_tile(
 }
 
 /// Render a WMTS-MVT tile (`FORMAT=application/vnd.mapbox-vector-tile`, Task 5): same `{tms}/{z}/
-/// {row}/{col}` addressing as `get_tile` (no y-flip), but for a **vector** layer, encoded via
-/// `vector::mvt::encode_tile` instead of the raster render path. `{tms}` resolves against the
-/// layer's OWN published grids first (Task 2/3 — `server::Layer::grids` IS populated for vector
-/// layers too), falling back to the MVT preset grid (`crate::tms::preset`, the encoder's fixed
-/// 4096-unit local extent) for the 4 built-ins — same lookup-then-preset order as `get_tile` above
-/// and `mvt_http::resolve_grid`.
+/// {row}/{col}` addressing as `get_tile` (no y-flip), but for a **vector** layer. `{tms}` resolves
+/// against the layer's OWN published grids first (Task 2/3 — `server::Layer::grids` IS populated for
+/// vector layers too), falling back to the MVT preset grid (`crate::tms::preset`, the encoder's
+/// fixed 4096-unit local extent) for the 4 built-ins — same lookup-then-preset order as `get_tile`
+/// above and `mvt_http::resolve_grid`.
+///
+/// WMTS-specific validation (layer, style, grid, tile range) happens here so the OWS exception
+/// keeps its `code` and `locator`; producing the tile is then `mvt_http::render_mvt_tile`, the
+/// same function the `/mvt` route calls. `accept_gzip` says whether the client offered gzip, so an
+/// archive hit can go out in the encoding it is already stored in.
 pub fn get_tile_mvt(
     state: &crate::server::ServeState,
     layer: &str,
@@ -315,7 +319,8 @@ pub fn get_tile_mvt(
     z: u32,
     row: u32,
     col: u32,
-) -> Result<Vec<u8>, WmtsErr> {
+    accept_gzip: bool,
+) -> Result<crate::mvt_http::TileBody, WmtsErr> {
     let ipv = |text: String, loc: &str| WmtsErr {
         http: 400,
         code: "InvalidParameterValue".into(),
@@ -330,7 +335,9 @@ pub fn get_tile_mvt(
     if style != "default" && !style.is_empty() {
         return Err(ipv(format!("no style '{style}'"), "STYLE"));
     }
-    let vector = l.vector.as_ref().ok_or(WmtsErr {
+    // Checked here, not left to the delegate, because "not a vector layer" is an
+    // `OperationNotSupported` in WMTS and a bare 400 on the `/mvt` route.
+    l.vector.as_ref().ok_or(WmtsErr {
         http: 400,
         code: "OperationNotSupported".into(),
         text: "layer is not a vector layer — MVT requires --vector".into(),
@@ -363,45 +370,29 @@ pub fn get_tile_mvt(
             locator: Some("TILEROW".into()),
         });
     }
-    // The optimization set for this layer — built IDENTICALLY to the `/mvt` XYZ route
-    // (mvt_http::render_mvt_tile) via the shared `for_layer` constructor, so the SAME z/x/y is
-    // byte-identical whether fetched via `/mvt` or WMTS GetTile.
-    let opts = crate::vector::mvt::MvtOptimizations::for_layer(state, vector);
-    // Per-zoom LOD: pick the zoom-appropriate pool (matches the /mvt route).
-    let vs = vector.source_for_zoom(z);
-    // Reads through the `VectorSource` seam (windowed-seam refactor): reproject the tile bbox into
-    // the source CRS before reading — a harmless no-op for `LoadAll`, correct once a windowed source
-    // lands. `col`/`row` are x/y (see the comment below).
-    // A failed source read is a 500, not an empty tile — the same rule the `/mvt` route applies.
-    // Encoding whatever a broken query returned would emit a valid, EMPTY vector tile behind a 200.
-    let batch = crate::vector::mvt::features_for_tile(&vs, &grid, z, col, row, &l.src_crs, &opts)
-        .map_err(|e| WmtsErr {
-        http: 500,
-        code: "NoApplicableCode".into(),
-        text: e,
-        locator: None,
-    })?;
-    // Same `layer/tms/z/x/y` key as the `/mvt` route (x=col, y=row) → they share cache entries.
-    Ok(crate::mvt_http::cached_or_encode(
-        state,
-        &l.name,
-        tms,
-        z,
-        col,
-        row,
-        || {
-            crate::vector::mvt::encode_tile_opt(
-                batch.as_slice(),
-                &grid,
-                z,
-                col,
-                row,
-                &l.src_crs,
-                &l.name,
-                &opts,
-            )
+    // Everything past validation is the `/mvt` XYZ route, verbatim: `render_mvt_tile` checks the
+    // write-through overlay, then the PMTiles archive for THIS grid, and only then encodes live.
+    // WMTS used to skip both and always encode live, so a baked archive did nothing for a WMTS
+    // client even though the two routes are contracted to be byte-identical for the same z/x/y
+    // (they already share a cache key). `col`/`row` are x/y.
+    //
+    // The grid lookup above is the same logic as `mvt_http::resolve_grid` (same `l.grids` scan with
+    // the same one-sided `strip_size_suffix`, same `tms::preset(_, 4096)` fallback), and the
+    // range check is the same, so the delegate's own 4xx paths are unreachable from here. They are
+    // still mapped rather than unwrapped: a future divergence must surface as an OWS exception, not
+    // a panic.
+    crate::mvt_http::render_mvt_tile(state, layer, tms, z, col, row, accept_gzip).map_err(
+        |(http, text)| WmtsErr {
+            http,
+            code: if http >= 500 {
+                "NoApplicableCode".into()
+            } else {
+                "InvalidParameterValue".into()
+            },
+            text,
+            locator: None,
         },
-    ))
+    )
 }
 
 /// WMTS GetFeatureInfo: the value at the in-tile pixel `(i,j)` of tile `(z,row,col)`. Reuses the

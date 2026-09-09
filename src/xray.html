@@ -214,10 +214,10 @@
   <h2>View</h2>
   <div id="viewStatus" class="empty">&mdash;</div>
 
-  <label id="wmsRow" title="Stack the server's class-coloured /wms raster UNDER the X-ray vector — crisp, hole-free, browser-light">
-    <input type="checkbox" id="wmsChk" checked> WMS layer below
+  <label id="wmsRow" title="Stack the server's class-coloured raster UNDER the X-ray vector — crisp, hole-free, browser-light, and archive-fast wherever a raster_pmtiles archive covers the tile">
+    <input type="checkbox" id="wmsChk" checked> WMTS layer below
   </label>
-  <div id="wmsHint">Class-coloured raster underlay from <code>/wms</code>. Renders on the fly, so tiles can take a moment at overview zooms.</div>
+  <div id="wmsHint">Class-coloured raster underlay from <code>/wmts</code>. Reads the precomputed archive where one exists (milliseconds); a tile outside it renders live, same as before.</div>
 
   <label id="wmsStyleRow" title="Colour the vector polygons by the layer's WMS/SLD class palette (the same colours as the raster underlay) instead of the cyan X-ray wireframe — derived from the one --vec-style, no separate MapLibre style needed">
     <input type="checkbox" id="wmsStyleChk" disabled checked> Use WMS style
@@ -300,36 +300,89 @@ document.getElementById('applyBtn').addEventListener('click', function () {
 var GLOW = 'rgba(0, 229, 255, 0.16)';
 var BRIGHT = '#00e5ff';
 
-// Thematic styling: when the layer's style.json carries a data-driven fill
-// (a MapLibre `["match", ["get", FIELD], val, colour, ..., default]`), colour polygons by FIELD and
-// show the legend; otherwise keep the cyan wireframe. `theme` is null until style.json resolves.
-var theme = null; // { field, lookup: {value: colour}, def }
-var useWmsStyle = false; // "Use WMS style" tick box: colour polygons by the SLD class palette when ON
+// Thematic styling, PER LAYER: each served layer's style.json is fetched and parsed into a theme
+// { fill, line, circle, radius, glow, field }. `fill`/`line`/`circle` are colour rules — either a
+// MapLibre `["match", ["get", FIELD], val, colour, ..., default]` (class palette) or a plain colour
+// string — read from the first fill / line / circle style layer's paint. A layer is "themed" only if
+// at least one of them is a class match; a style made of plain colours (the generic X-ray default)
+// leaves it null -> cyan wireframe. `radius` is the circle layer's `circle-radius`, a number or a
+// match on the same field, so places can be sized by rank. One --mvt-style file can theme several
+// layers by tagging its style layers with `source-layer`; the server serves each layer only its own.
+var themes = {}; // layer name -> theme (null / missing = cyan wireframe)
+var useWmsStyle = false; // "Use WMS style" tick box: class palette when ON, cyan wireframe when OFF
 
-function parseFillMatch(styleDoc) {
-  if (!styleDoc || !Array.isArray(styleDoc.layers)) return null;
-  var fillLayer = styleDoc.layers.filter(function (l) {
-    return l.type === 'fill' && l.paint && l.paint['fill-color'];
-  })[0];
-  if (!fillLayer) return null;
-  var fc = fillLayer.paint['fill-color'];
-  // Only the data-driven `["match", ["get", FIELD], v, c, ..., default]` shape is themed;
-  // a plain colour string (the generic X-ray style) leaves `theme` null -> cyan wireframe.
-  if (!Array.isArray(fc) || fc[0] !== 'match') return null;
-  var getExpr = fc[1];
+function parseColourRule(expr) {
+  if (typeof expr === 'string') return { field: null, lookup: {}, def: expr, isMatch: false };
+  if (!Array.isArray(expr) || expr[0] !== 'match') return null;
+  var getExpr = expr[1];
   var field = (Array.isArray(getExpr) && getExpr[0] === 'get') ? getExpr[1] : null;
   if (!field) return null;
-  var lookup = {};
-  for (var i = 2; i + 1 < fc.length; i += 2) { lookup[fc[i]] = fc[i + 1]; }
-  var def = (fc.length % 2 === 1) ? fc[fc.length - 1] : '#cccccc';
+  var lookup = {}, groups = [];
+  for (var i = 2; i + 1 < expr.length; i += 2) {
+    // A match key may be a single value or an array of values sharing one colour; the legend
+    // shows one row per colour group, labelled by its first few values.
+    var keys = Array.isArray(expr[i]) ? expr[i] : [expr[i]];
+    for (var k = 0; k < keys.length; k++) lookup[keys[k]] = expr[i + 1];
+    groups.push({ keys: keys.map(String), color: expr[i + 1] });
+  }
+  var def = (expr.length % 2 === 1) ? expr[expr.length - 1] : '#cccccc';
+  return { field: field, lookup: lookup, groups: groups, def: def, isMatch: true };
+}
+
+function ruleValue(rule, feature) {
+  if (!rule) return null;
+  if (!rule.field) return rule.def;
+  var v = rule.lookup[feature.get(rule.field)];
+  return v === undefined ? rule.def : v;
+}
+
+function parseTheme(styleDoc) {
+  if (!styleDoc || !Array.isArray(styleDoc.layers)) return null;
+  var t = { fill: null, line: null, circle: null, radius: null, glow: false, seamless: false, field: null, legend: null, title: null };
+  var anyMatch = false, anyRule = false;
   // `metadata.glow: true` = the layer is made of SMALL, SPARSE features (building footprints,
   // parcels) rather than a wall-to-wall coverage. Such features go sub-pixel at overview zoom, so
   // the default near-black class boundary below is all that survives -> they render BLACK. Glow
   // mode instead strokes each feature in its OWN colour (plus a translucent halo), so a sub-pixel
   // footprint still deposits its colour and a settlement pattern lights up. Leave it off for a
-  // coverage like COS, where the dark boundary usefully separates adjacent classes.
-  var md = styleDoc.metadata || {};
-  return { field: field, lookup: lookup, def: def, glow: md.glow === true };
+  // coverage like COS or landuse, where the dark boundary usefully separates adjacent classes.
+  // Read per style layer (`layers[].metadata.glow`) with the document-level flag as the fallback.
+  var docGlow = !!(styleDoc.metadata && styleDoc.metadata.glow === true);
+  styleDoc.layers.forEach(function (l) {
+    var paint = l.paint || {};
+    var rule = null;
+    if (l.type === 'fill' && !t.fill && paint['fill-color'] !== undefined) rule = t.fill = parseColourRule(paint['fill-color']);
+    else if (l.type === 'line' && !t.line && paint['line-color'] !== undefined) rule = t.line = parseColourRule(paint['line-color']);
+    else if (l.type === 'circle' && !t.circle && paint['circle-color'] !== undefined) {
+      rule = t.circle = parseColourRule(paint['circle-color']);
+      var r = paint['circle-radius'];
+      t.radius = (typeof r === 'number') ? { field: null, def: r } : (parseColourRule(r) || null);
+    }
+    if (rule) anyRule = true;
+    if (rule && rule.isMatch) {
+      anyMatch = true;
+      if (!t.field) t.field = rule.field;
+      if (l.metadata && l.metadata.glow === true) t.glow = true;
+    }
+    // `metadata.seamless: true` on a fill layer = a base coverage cut into arbitrary pieces (the
+    // eu5 `land` layer is OSM land polygons split on a grid): stroke the pieces in their own
+    // colour instead of the dark class boundary, or the cut lines show as hairlines.
+    if (rule && l.type === 'fill' && l.metadata && l.metadata.seamless === true) t.seamless = true;
+  });
+  // A plain-colour style (one fill colour, no class match) is a theme too: the layer draws in
+  // that colour and gets a one-row legend. Only a style with no colour rule at all stays the
+  // cyan wireframe.
+  if (!anyMatch && !anyRule) return null;
+  if (docGlow) t.glow = true;
+  // Operator legend (metadata.legend = [{color,label}], metadata.title), e.g. the DGT COS2018
+  // megaclasses; otherwise the legend is built from the first class match below.
+  if (styleDoc.metadata) { t.legend = styleDoc.metadata.legend || null; t.title = styleDoc.metadata.title || null; }
+  return t;
+}
+
+// The class match a themed layer's legend lists: polygons first, then lines, then points.
+function legendRule(t) {
+  return [t.fill, t.line, t.circle].filter(function (r) { return r && r.isMatch; })[0] || null;
 }
 
 // '#rrggbb' -> 'rgba(r,g,b,a)' for the halo. Non-hex (already rgba) is returned unchanged.
@@ -339,9 +392,39 @@ function withAlpha(col, a) {
   return 'rgba(' + parseInt(m[1], 16) + ',' + parseInt(m[2], 16) + ',' + parseInt(m[3], 16) + ',' + a + ')';
 }
 
-function xrayStyle(feature) {
+// Themed point size vs zoom: the style's `circle-radius` is the size at the grid's z9 and deeper
+// (city detail); an overview zoom shrinks it towards 0.3x and drops the halo, or 1,400 town discs
+// with 10 px halos blanket a continent at z3 (measured on eu5 the first time this shipped).
+var POINT_FULL_SIZE_ZOOM = 9, POINT_MIN_FACTOR = 0.3;
+var xrayMap = null; // set once the map exists (it is built inside the grid fetch below)
+function pointZoomFactor(resolution) {
+  if (!xrayMap || !isFinite(resolution)) return 1;
+  var z = xrayMap.getView().getZoomForResolution(resolution);
+  if (!isFinite(z)) return 1;
+  if (z >= POINT_FULL_SIZE_ZOOM) return 1;
+  return Math.max(POINT_MIN_FACTOR, 1 - (POINT_FULL_SIZE_ZOOM - z) / POINT_FULL_SIZE_ZOOM);
+}
+
+function xrayStyle(feature, theme, resolution) {
   var type = feature.getGeometry().getType();
+  var themed = useWmsStyle && theme;
   if (type === 'Point' || type === 'MultiPoint') {
+    if (themed && (theme.circle || theme.fill)) {
+      // Themed points: colour (and radius) by class — places by rank, POIs by kind — as a soft
+      // same-colour halo under a bright dot with a thin white rim so it reads on any fill.
+      var pcol = ruleValue(theme.circle || theme.fill, feature);
+      var pr = theme.radius ? Number(ruleValue(theme.radius, feature)) : 3;
+      if (!isFinite(pr) || pr <= 0) pr = 3;
+      var zf = pointZoomFactor(resolution);
+      pr = Math.max(0.8, pr * zf);
+      var pt = [];
+      if (zf > 0.6) {
+        pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: pr * 2.4, fill: new ol.style.Fill({ color: withAlpha(pcol, 0.22) }) }) }));
+      }
+      pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: pr, fill: new ol.style.Fill({ color: pcol }),
+        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.75)', width: zf > 0.6 ? 0.8 : 0 }) }) }));
+      return pt;
+    }
     return [
       new ol.style.Style({
         image: new ol.style.Circle({
@@ -359,8 +442,8 @@ function xrayStyle(feature) {
   }
   // Thematic fill (e.g. COS land cover): colour the polygon by the style's data-driven field,
   // with a thin dark class boundary. Falls through to the cyan wireframe when no theme is loaded.
-  if (useWmsStyle && theme && (type === 'Polygon' || type === 'MultiPolygon')) {
-    var col = theme.lookup[feature.get(theme.field)] || theme.def;
+  if (themed && (theme.fill || theme.line) && (type === 'Polygon' || type === 'MultiPolygon')) {
+    var col = ruleValue(theme.fill || theme.line, feature);
     if (theme.glow) {
       // Sparse small features: halo + same-colour stroke so a sub-pixel footprint still paints
       // its own colour instead of the near-black boundary (which is ALL that renders once the
@@ -376,14 +459,17 @@ function xrayStyle(feature) {
     return [
       new ol.style.Style({
         fill: new ol.style.Fill({ color: col }),
-        stroke: new ol.style.Stroke({ color: 'rgba(15, 15, 15, 0.35)', width: 0.4 })
+        stroke: theme.seamless
+          ? new ol.style.Stroke({ color: col, width: 0.6 })
+          : new ol.style.Stroke({ color: 'rgba(15, 15, 15, 0.35)', width: 0.4 })
       })
     ];
   }
-  // Lines, themed: colour the stroke by the same data field as the polygons (roads by class,
-  // rivers, railways), with a soft casing so a line stays visible on top of any fill.
-  if (useWmsStyle && theme && (type === 'LineString' || type === 'MultiLineString')) {
-    var lcol = theme.lookup[feature.get(theme.field)] || theme.def;
+  // Lines, themed: colour the stroke by the line rule (roads by class, rivers, railways), or by
+  // the polygon palette when the style has no line entry, with a soft casing so a line stays
+  // visible on top of any fill.
+  if (themed && (theme.line || theme.fill) && (type === 'LineString' || type === 'MultiLineString')) {
+    var lcol = ruleValue(theme.line || theme.fill, feature);
     return [
       new ol.style.Style({ stroke: new ol.style.Stroke({ color: 'rgba(80, 80, 80, 0.45)', width: 2.6 }) }),
       new ol.style.Style({ stroke: new ol.style.Stroke({ color: lcol, width: 1.3 }) })
@@ -400,6 +486,12 @@ function xrayStyle(feature) {
   styles.push(new ol.style.Style({ stroke: new ol.style.Stroke({ color: GLOW, width: 6 }) }));
   styles.push(new ol.style.Style({ stroke: new ol.style.Stroke({ color: BRIGHT, width: 1.3 }) }));
   return styles;
+}
+
+// One style function per layer, bound to that layer's theme (looked up at call time, so a theme
+// that resolves after the first tiles render is picked up on the next setStyle/redraw).
+function styleFor(name) {
+  return function (feature, resolution) { return xrayStyle(feature, themes[name] || null, resolution); };
 }
 
 // Tile-loading spinner: count in-flight tile requests across every layer's source (OL VectorTile
@@ -547,7 +639,7 @@ function boot(tmsDoc) {
     });
     return new ol.layer.VectorTile({
       source: source,
-      style: xrayStyle,
+      style: styleFor(name),
       properties: { name: name }
     });
   });
@@ -561,6 +653,7 @@ function boot(tmsDoc) {
       zoom: 2
     })
   });
+  xrayMap = map;
 
   // Debug status box: live zoom + view bbox (lon/lat) + the centre tile z/x/y, so tile seams can be
   // pinned to exact coordinates. The centre tile is computed directly from THIS grid's own
@@ -653,60 +746,74 @@ function boot(tmsDoc) {
       .catch(function () {});
   }
 
-  // Fetch the first layer's style.json: if it has a data-driven fill, theme the map + build the
-  // legend; otherwise the map stays the cyan wireframe. Legend metadata (metadata.legend) is a list
-  // of { color, label } entries carried by the style (e.g. the DGT COS2018 megaclasses).
+  // Fetch EVERY layer's style.json: each that carries a class palette themes its own layer and
+  // gets a legend section; a layer without one stays the cyan wireframe. Sections follow draw
+  // order (the ?layer= order, bottom to top). An operator legend (metadata.legend = [{color,label}]
+  // + metadata.title, e.g. the DGT COS2018 megaclasses) is used as-is; otherwise the section is
+  // built from the layer's first class match, so a thematic map always shows its classes.
   var legendEl = document.getElementById('legend');
-  function renderLegend(styleDoc) {
-    var legend = styleDoc && styleDoc.metadata && styleDoc.metadata.legend;
-    var title = styleDoc && styleDoc.metadata && styleDoc.metadata.title;
-    // Fallback: an SLD-derived /style.json carries the class palette (a fill "match") but no
-    // metadata.legend. `theme` already holds the parsed value→colour map — build the legend from it so a
-    // thematic map always shows its classes (code + swatch), even without an operator --mvt-style legend.
-    if ((!Array.isArray(legend) || legend.length === 0) && theme && theme.lookup) {
-      legend = Object.keys(theme.lookup).map(function (code) {
-        return { code: code, color: theme.lookup[code] };
-      });
-      title = title || (theme.field + ' · ' + legend.length + ' classes');
-    }
+  function legendSection(name, t) {
+    var legend = t.legend, title = t.title;
     if (!Array.isArray(legend) || legend.length === 0) {
-      legendEl.innerHTML = '<div class="empty">cyan wireframe (no thematic style)</div>';
-      return;
+      var rule = legendRule(t);
+      if (!rule) {
+        var plain = [t.fill, t.line, t.circle].filter(function (r) { return r && !r.isMatch; })[0];
+        if (!plain) return '';
+        legend = [{ code: name, color: plain.def }];
+        title = title || name;
+        rule = null;
+      }
+      if (rule) legend = rule.groups.map(function (g) {
+        var label = g.keys.slice(0, 3).join(', ') + (g.keys.length > 3 ? ', \u2026' : '');
+        return { code: label, color: g.color };
+      });
+      if (rule) { legend.push({ code: 'other', color: rule.def }); title = title || (name + ' · ' + rule.field); }
     }
     var rows = legend.map(function (e) {
       return '<div class="lg-row"><span class="sw" style="background:' +
         escapeHtml(String(e.color || '#888888')) + '"></span><span class="lg-label">' +
         escapeHtml(String(e.label || e.code || '')) + '</span></div>';
     }).join('');
-    legendEl.innerHTML = (title ? '<div class="lg-title">' + escapeHtml(String(title)) + '</div>' : '') + rows;
+    return (title ? '<div class="lg-title">' + escapeHtml(String(title)) + '</div>' : '') + rows;
+  }
+  function renderLegend() {
+    var html = layerNames.map(function (name) {
+      return themes[name] ? legendSection(name, themes[name]) : '';
+    }).join('');
+    legendEl.innerHTML = html || '<div class="empty">cyan wireframe (no thematic style)</div>';
+  }
+  function restyleAll() {
+    olLayers.forEach(function (l) { l.setStyle(styleFor(l.get('name'))); });
   }
   if (layerNames.length > 0) {
-    fetch('mvt/' + encodeURIComponent(layerNames[0]) + '/style.json')
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (styleDoc) {
-        theme = parseFillMatch(styleDoc);
-        // "Use WMS style" is only meaningful once a class palette resolves (from --mvt-style or the
-        // SLD-derived /style.json); enable the tick box then and let it toggle wireframe <-> class fill.
-        var wmsStyleChk = document.getElementById('wmsStyleChk');
-        wmsStyleChk.disabled = !theme;
-        // `?wms_style=0` forces the cyan X-ray wireframe even when a class palette exists (the tick
-        // box still turns it back on). Companion to `?wms=0` — both toggles are URL-addressable so a
-        // deployment can pick its own defaults per layer without a code change.
-        if (params.get('wms_style') === '0' || params.get('wms_style') === 'false') {
-          wmsStyleChk.checked = false;
-        }
-        wmsStyleChk.addEventListener('change', function () {
-          useWmsStyle = wmsStyleChk.checked;
-          olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
-        });
-        // "Use WMS style" defaults ON: once the class palette resolves, apply it immediately.
-        if (theme && wmsStyleChk.checked) {
-          useWmsStyle = true;
-          olLayers.forEach(function (l) { l.setStyle(xrayStyle); });
-        }
-        renderLegend(styleDoc);
-      })
-      .catch(function () {});
+    Promise.all(layerNames.map(function (name) {
+      return fetch('mvt/' + encodeURIComponent(name) + '/style.json')
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (doc) { themes[name] = parseTheme(doc); })
+        .catch(function () { themes[name] = null; });
+    })).then(function () {
+      var anyTheme = layerNames.some(function (name) { return !!themes[name]; });
+      // "Use WMS style" is only meaningful once a class palette resolves (from --mvt-style or the
+      // SLD-derived /style.json); enable the tick box then and let it toggle wireframe <-> class fill.
+      var wmsStyleChk = document.getElementById('wmsStyleChk');
+      wmsStyleChk.disabled = !anyTheme;
+      // `?wms_style=0` forces the cyan X-ray wireframe even when a class palette exists (the tick
+      // box still turns it back on). Companion to `?wms=0` — both toggles are URL-addressable so a
+      // deployment can pick its own defaults per layer without a code change.
+      if (params.get('wms_style') === '0' || params.get('wms_style') === 'false') {
+        wmsStyleChk.checked = false;
+      }
+      wmsStyleChk.addEventListener('change', function () {
+        useWmsStyle = wmsStyleChk.checked;
+        restyleAll();
+      });
+      // "Use WMS style" defaults ON: once a class palette resolves, apply it immediately.
+      if (anyTheme && wmsStyleChk.checked) {
+        useWmsStyle = true;
+        restyleAll();
+      }
+      renderLegend();
+    });
   }
 
   // Click inspector: forEachFeatureAtPixel -> show properties as a key/value table; empty click clears.
@@ -748,39 +855,53 @@ function boot(tmsDoc) {
     selectionLayers.forEach(function (s) { s.changed(); });
   });
 
-  // --- WMS raster underlay ("Add WMS layer") -------------------------------------------------------
-  // Stack the server's class-coloured `/wms` render UNDERNEATH the X-ray vector. Rasterising a
-  // wall-to-wall coverage has no gaps, so this is a CRISP, HOLE-FREE, browser-light (small PNG per
-  // tile) way to see a dense coverage's overview — the pragmatic alternative to a heavy vector overview.
-  // It renders on the fly (projection-bound), so tiles can take seconds to appear at low zoom; browser
-  // tile-caching makes revisits instant. Uses this same server's `/wms` for the first `?layer=`. OL's
-  // TileWMS source requests in whatever CRS the map VIEW is currently in (it doesn't need to be told
-  // the grid's projection explicitly), so this needs no grid-specific wiring.
+  // --- WMTS raster underlay ("WMTS layer below") ----------------------------------------------------
+  // Stack the server's class-coloured raster UNDERNEATH the X-ray vector. Rasterising a wall-to-wall
+  // coverage has no gaps, so this is a CRISP, HOLE-FREE, browser-light (small PNG per tile) way to
+  // see a dense coverage's overview — the pragmatic alternative to a heavy vector overview.
+  //
+  // Reads `/wmts/1.0.0/{layer}/default/{tms}/{z}/{row}/{col}.png` (RESTful WMTS GetTile) rather than
+  // a live `/wms` GetMap — CHANGED from the original per-viewport `/wms` underlay because that path
+  // NEVER reads a `raster_pmtiles` archive (only `/wmts` and `/tms` do; see `render_through_raster`),
+  // so a dense layer's low-zoom underlay always cost seconds per tile even when an archive existed a
+  // route over. `/wmts` gets the archive for free where one covers the tile — same read-through
+  // contract as the vector `/mvt` tiles above, right down to the fallback: a tile OUTSIDE the archive
+  // renders live, exactly as `/wms` always did, so this is strictly never slower, only sometimes much
+  // faster. Shares this page's own `tileGrid`/`projection`/`gridId` (built above from the SAME
+  // TileMatrixSet document the vector tiles use), so raster and vector tiles are addressed identically
+  // — no separate grid-specific wiring, and no possibility of the two drifting out of registration.
   var wmsLayer = null;
   var wmsChk = document.getElementById('wmsChk');
-  var wmsName = layerNames[0] || 'vector';
-  // `?wms=0` starts with the underlay OFF (the tick box still turns it on). The underlay is a LIVE
-  // rasterize with no precomputed archive — `--pmtiles` only ever serves the MVT path — so on a
-  // layer whose low-zoom GetMap decodes millions of features it costs seconds per tile and stalls
-  // the whole viewport behind `--max-inflight`. Layers that are cheap to rasterize (e.g. one with a
-  // `--topology-simplify` LOD) can leave it on; huge windowed layers should pass `?wms=0`.
+  // `?underlay=<layer>` picks which layer the raster underlay reads; default is the FIRST listed
+  // layer, which is wrong as soon as a base layer (eu5 `land`) is listed first for z-order: the
+  // underlay would then be a flat land raster instead of the class-coloured landuse one.
+  var wmsName = params.get('underlay') || layerNames[0] || 'vector';
+  // `?wms=0` starts with the underlay OFF (the tick box still turns it on; param name kept for
+  // backward compatibility with existing bookmarked/embedded URLs — it predates the WMTS switch).
   if (params.get('wms') === '0' || params.get('wms') === 'false') {
     wmsChk.checked = false;
   }
   function setWmsUnderlay(on) {
     if (on && !wmsLayer) {
-      var src = new ol.source.TileWMS({
-        url: 'wms',
-        params: { LAYERS: wmsName, VERSION: '1.3.0', FORMAT: 'image/png', TRANSPARENT: true },
-        // Each tile is a windowed GetMap → smaller tiles project fewer features → they trickle in.
+      var src = new ol.source.TileImage({
+        projection: projection,
+        tileGrid: tileGrid,
+        tileUrlFunction: function (tileCoord) {
+          if (!tileCoord) return undefined;
+          var z = tileCoord[0], x = tileCoord[1], y = tileCoord[2];
+          return 'wmts/1.0.0/' + encodeURIComponent(wmsName) + '/default/' +
+            encodeURIComponent(gridId) + '/' + z + '/' + y + '/' + x + '.png';
+        },
         crossOrigin: 'anonymous'
       });
-      // Feed the existing spinner tally so the "rendering N tiles…" cue covers the WMS renders too.
+      // Feed the existing spinner tally so the "rendering N tiles…" cue covers archive-miss renders.
       src.on('tileloadstart', function () { if (inflight === 0) tileErrors = 0; inflight++; updateSpinner(); });
       src.on('tileloadend', function () { inflight = Math.max(0, inflight - 1); updateSpinner(); });
       src.on('tileloaderror', function () { inflight = Math.max(0, inflight - 1); tileErrors++; updateSpinner(); });
-      wmsLayer = new ol.layer.Tile({ source: src, properties: { name: wmsName + ' (WMS raster)' } });
-      map.getLayers().insertAt(0, wmsLayer); // index 0 = BOTTOM of the stack → under the vector X-ray
+      wmsLayer = new ol.layer.Tile({ source: src, properties: { name: wmsName + ' (WMTS raster)' } });
+      // Directly UNDER the layer it depicts (index 0 = bottom when the default first layer is used),
+      // not always at the bottom: an opaque base layer listed first (eu5 `land`) would hide it there.
+      map.getLayers().insertAt(Math.max(0, layerNames.indexOf(wmsName)), wmsLayer);
     } else if (!on && wmsLayer) {
       map.removeLayer(wmsLayer);
       wmsLayer = null;

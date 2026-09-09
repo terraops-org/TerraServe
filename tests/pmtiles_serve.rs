@@ -63,6 +63,7 @@ fn countries_layer(name: &str) -> Layer {
             style,
             shaper,
             lod: None,
+            zoom_sources: Vec::new(),
         }),
         pmtiles: std::collections::BTreeMap::new(),
         raster_pmtiles: std::collections::BTreeMap::new(),
@@ -144,9 +145,13 @@ fn read_through_hits_archive_and_falls_back_live() {
             // (0 bytes on the wire), so it carries no embedded name to distinguish it from a live
             // "countries" encode of the same empty ground -- skip to a tile that actually has data.
             if let Some(archived) = reader.get(2, x, y).unwrap().filter(|b| !b.is_empty()) {
-                let served = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 2, x, y).unwrap();
+                let served = render_mvt_tile(&st, LAYER, "WebMercatorQuad", 2, x, y, false)
+                    .unwrap()
+                    .bytes;
                 let live_countries =
-                    render_mvt_tile(&st_no_archive, LAYER, "WebMercatorQuad", 2, x, y).unwrap();
+                    render_mvt_tile(&st_no_archive, LAYER, "WebMercatorQuad", 2, x, y, false)
+                        .unwrap()
+                        .bytes;
                 assert_eq!(
                     served, archived,
                     "archived z2 tile {x}/{y} served from archive"
@@ -179,12 +184,135 @@ fn read_through_hits_archive_and_falls_back_live() {
         "z6 must be outside the archive's built 0..=2 range"
     );
 
-    let served_z6 = render_mvt_tile(&st, LAYER, "WebMercatorQuad", z, x, y).unwrap();
-    let live_z6 = render_mvt_tile(&st_no_archive, LAYER, "WebMercatorQuad", z, x, y).unwrap();
+    let served_z6 = render_mvt_tile(&st, LAYER, "WebMercatorQuad", z, x, y, false).unwrap();
+    let live_z6 =
+        render_mvt_tile(&st_no_archive, LAYER, "WebMercatorQuad", z, x, y, false).unwrap();
     assert_eq!(
         served_z6, live_z6,
         "unarchived z6 tile falls back to live encode, matching a no-archive layer"
     );
 
     std::fs::remove_file(&out).ok();
+}
+
+/// The same read-through, over WMTS GetTile instead of `/mvt`.
+///
+/// `wmts::get_tile_mvt` used to go straight to `features_for_tile` + `encode_tile_opt`, so EVERY
+/// WMTS vector tile was a live encode even when a baked archive covered it -- the `/mvt` XYZ route
+/// checked the archive and WMTS did not. The two routes are documented as byte-identical for the
+/// same z/x/y (they even share a cache key), so an archive hit on one and a live encode on the
+/// other is a real divergence, not just a missed optimization.
+///
+/// Same construction as `read_through_hits_archive_and_falls_back_live` above, and same reason the
+/// assertion is not a tautology: the archive is generated under the name "ARCHIVED" while the
+/// served layer is "countries", so the encoder's embedded `Layer.name` tells the two apart.
+/// WMTS addresses tiles as `(z, row, col)` = `(z, y, x)`.
+#[test]
+fn wmts_get_tile_mvt_reads_the_archive_like_the_mvt_route() {
+    let mut grid = terraserve::tms::preset("WebMercatorQuad", 4096).unwrap();
+    grid.id = "WebMercatorQuad".to_string();
+
+    let gen_layer = countries_layer(ARCHIVE_LAYER_NAME);
+    let gen_v = gen_layer.vector.as_ref().unwrap();
+    let gen_opts =
+        MvtOptimizations::for_layer(&ServeState::new(vec![], "http://h/wms".into(), 16), gen_v);
+
+    // Its OWN scratch directory: `build_pmtiles` uses fixed names inside the scratch it is given,
+    // so sharing `temp_dir()` with the test above makes the two race when cargo runs them in
+    // parallel (observed as "reopen temp: No such file or directory").
+    let scratch = std::env::temp_dir().join(format!("ts_wmts_serve_{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let out = scratch.join("out.pmtiles");
+    build_pmtiles(
+        &gen_layer,
+        &gen_opts,
+        &grid,
+        0,
+        2,
+        gen_layer.bounds_wgs84,
+        &out,
+        &scratch,
+    )
+    .unwrap();
+
+    let mut served_layer = countries_layer(LAYER);
+    let reader_owned = PmtilesReader::open(&out).unwrap();
+    served_layer
+        .pmtiles
+        .insert(reader_owned.grid_id(), Arc::new(reader_owned));
+    let st = ServeState::new(vec![served_layer], "http://h/wms".into(), 16);
+
+    let reader = st.layers[0].pmtiles.get("WebMercatorQuad").unwrap().clone();
+    let bbox3857 = terraserve::reproj::crs_bounds(
+        "EPSG:4326",
+        "EPSG:3857",
+        gen_layer.bounds_wgs84[0],
+        gen_layer.bounds_wgs84[1],
+        gen_layer.bounds_wgs84[2],
+        gen_layer.bounds_wgs84[3],
+    )
+    .expect("reproject bounds to 3857");
+    let (c0, c1, r0, r1) = grid
+        .tile_limits(bbox3857, 2)
+        .expect("z2 tile range for the fixture bounds");
+
+    let mut found_archive_hit = false;
+    'outer: for x in c0..=c1 {
+        for y in r0..=r1 {
+            if let Some(archived) = reader.get(2, x, y).unwrap().filter(|b| !b.is_empty()) {
+                let served = terraserve::wmts::get_tile_mvt(
+                    &st,
+                    LAYER,
+                    "default",
+                    "WebMercatorQuad",
+                    2,
+                    y,
+                    x,
+                    false,
+                )
+                .expect("WMTS GetTile MVT");
+                assert!(
+                    !served.gzip,
+                    "a client that did not offer gzip gets identity"
+                );
+                assert_eq!(
+                    served.bytes, archived,
+                    "WMTS GetTile z2 row {y} col {x} must come from the archive, \
+                     exactly as the /mvt route serves it"
+                );
+                // ...and a gzip-capable client gets the archive's STORED bytes, untouched: the
+                // same pass-through the `/mvt` route does, which only reaches WMTS because the
+                // archive is consulted at all.
+                let gz = terraserve::wmts::get_tile_mvt(
+                    &st,
+                    LAYER,
+                    "default",
+                    "WebMercatorQuad",
+                    2,
+                    y,
+                    x,
+                    true,
+                )
+                .expect("WMTS GetTile MVT, gzip accepted");
+                assert!(
+                    gz.gzip,
+                    "archive stores gzip; a willing client is handed it"
+                );
+                assert_eq!(
+                    gz.bytes,
+                    reader.get_raw(2, x, y).unwrap().unwrap(),
+                    "the body must be the archive's STORED blob verbatim, not a re-compression"
+                );
+
+                found_archive_hit = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(
+        found_archive_hit,
+        "expected at least one non-empty z2 tile in the archive"
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
 }

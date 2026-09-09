@@ -142,6 +142,28 @@ pub struct VectorLayer {
     /// pick a zoom/scale-appropriate `FeatureSource` from here instead of `source`. `None` = no LOD
     /// (serve `source` at all zooms — the raw / single-tolerance path).
     pub lod: Option<Arc<crate::vector::topology::lod::LodSet>>,
+    /// Per-zoom pre-generalized subsets (`terraserve extract` output), consulted BEFORE `lod` and
+    /// before `source`. Empty = none declared, which is every layer that has not been extracted.
+    ///
+    /// This is what makes the extract worth cutting for a live server rather than only for a bake:
+    /// without it, an archive miss at a shallow zoom falls through to a full-source query over the
+    /// whole dataset, which is the whole-continent-query -> 500 failure mode. Bands are validated
+    /// non-overlapping at startup, so the first match is the only match.
+    pub zoom_sources: Vec<ZoomBand>,
+}
+
+/// One per-zoom pre-generalized source, as cut by `terraserve extract`.
+///
+/// The subset holds every feature that passes the band's own size threshold, selected ONCE over
+/// the whole dataset -- so a tile cut from it involves no per-tile selection and neighbouring
+/// tiles cannot disagree about a feature that straddles them. `[min_zoom, max_zoom]` is inclusive
+/// and is honoured STRICTLY: serving a band outside the zooms it was cut for is silent data loss
+/// at the deep end (features the deeper threshold would have kept are simply not in the file) and
+/// depends on threshold monotonicity at the shallow end, which `extract` itself only warns about.
+pub struct ZoomBand {
+    pub min_zoom: u32,
+    pub max_zoom: u32,
+    pub source: crate::vector::source::VectorSource,
 }
 
 impl VectorLayer {
@@ -152,15 +174,36 @@ impl VectorLayer {
     /// generator. Windowed sources have no LOD pool (a windowed reader's whole point is not
     /// materializing per-zoom pools), so the LOD branch always yields `LoadAll`.
     pub fn source_for_zoom(&self, z: u32) -> crate::vector::source::VectorSource {
+        if let Some(b) = self.band_for_zoom(z) {
+            return b.source.clone();
+        }
         match &self.lod {
             Some(l) => crate::vector::source::VectorSource::LoadAll(l.for_zoom(z).clone()),
             None => self.source.clone(),
         }
     }
 
+    /// The declared band covering tile zoom `z`, if any. Bands are non-overlapping (checked at
+    /// startup), so the first hit is the answer.
+    pub fn band_for_zoom(&self, z: u32) -> Option<&ZoomBand> {
+        self.zoom_sources
+            .iter()
+            .find(|b| z >= b.min_zoom && z <= b.max_zoom)
+    }
+
     /// The `VectorSource` for a WMS GetMap scale-denominator: the scale-appropriate LOD pool when this
     /// layer has LOD, else `source`. WMS has no integer tile zoom, so it maps scale → effective zoom.
     pub fn source_for_scale(&self, scale: f64) -> crate::vector::source::VectorSource {
+        // Bands are declared per tile ZOOM, so a scale denominator has to be inverted to one
+        // first -- through the SAME inversion `LodSet::for_scale_denominator` and the raster
+        // size gate use. Anything else lets a raster tile read one band while the MVT tile over
+        // the same ground reads another. A degenerate scale yields no zoom and so no band, which
+        // falls through to the pre-existing behaviour below.
+        if let Some(b) = crate::vector::mvt::zoom_for_scale_denominator(scale)
+            .and_then(|z| self.band_for_zoom(z))
+        {
+            return b.source.clone();
+        }
         match &self.lod {
             Some(l) => {
                 crate::vector::source::VectorSource::LoadAll(l.for_scale_denominator(scale).clone())
@@ -306,6 +349,8 @@ pub struct ServeState {
     /// `0` = compact only on a size-cap breach, an explicit `/flush`, or shutdown). Each
     /// `--pmtiles-cache` layer's controller ticks on this. Task 6.
     pub pmtiles_flush_interval: u64,
+    /// `Cache-Control: public, max-age=N` on tile responses; 0 = header absent (`--tile-max-age`).
+    pub tile_max_age: u32,
 }
 
 impl ServeState {
@@ -375,6 +420,7 @@ impl ServeState {
             mvt_cache: None,
             wms_cache: None,
             pmtiles_flush_interval: 0,
+            tile_max_age: 0,
         }
     }
 }
@@ -664,18 +710,119 @@ fn xml_response(xml: String) -> Response {
         .unwrap()
 }
 
-fn png_response(png: Vec<u8>) -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "image/png")
-        .body(Body::from(png))
-        .unwrap()
+/// Strong `ETag` for one tile representation: a hash of the FINAL bytes (after gzip) AND of the
+/// encoding, so the gzip and identity representations of one tile always carry different tags,
+/// as a strong validator must. SipHash over a 200 KB tile is ~0.1 ms next to the ~1 ms archive
+/// read it sits beside.
+fn tile_etag(bytes: &[u8], gzip: bool) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    gzip.hash(&mut h);
+    bytes.hash(&mut h);
+    format!("\"{:016x}\"", h.finish())
 }
 
-fn mvt_response(pbf: Vec<u8>) -> Response {
-    Response::builder()
-        .header(header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile")
-        .body(Body::from(pbf))
-        .unwrap()
+/// Does the request's `If-None-Match` name this tag? A comma-separated list, a `W/` prefix
+/// ignored (a weak match is enough to skip a byte-identical transfer), `*` matches anything.
+fn if_none_match_hits(req: &axum::http::HeaderMap, etag: &str) -> bool {
+    req.get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| {
+            v.split(',')
+                .map(str::trim)
+                .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+        })
+}
+
+/// One tile response, shared by EVERY tile route (TMS, WMTS KVP + RESTful, `/mvt`), so the
+/// validators are the same everywhere:
+/// - `ETag` always, and a `304 Not Modified` when the request's `If-None-Match` names it: a
+///   revisit then costs a ~200-byte round trip instead of the tile (the tile is still produced,
+///   the archive read is ~1 ms; what is saved is the transfer, which is where the time goes).
+/// - `Cache-Control: public, max-age=N` when `max_age > 0` (`--tile-max-age`): no request at all
+///   on a revisit inside the window, at the price that a rebake + restart inside it stays
+///   invisible to returning visitors until it expires. 0 = header absent.
+/// - `Vary: Accept-Encoding` whenever the route can answer gzip or identity for one URL (`/mvt`,
+///   see `accepts_gzip`), on BOTH encodings: any cache in front of us (traefik today, a CDN
+///   tomorrow) must key on it or it will eventually hand gzip bytes to a client that never asked.
+/// A 304 carries `ETag`, `Cache-Control` and `Vary` but no body, `Content-Type` or
+/// `Content-Encoding`.
+fn tile_response(
+    bytes: Vec<u8>,
+    content_type: &'static str,
+    gzip: bool,
+    varies_by_encoding: bool,
+    req: &axum::http::HeaderMap,
+    max_age: u32,
+) -> Response {
+    let etag = tile_etag(&bytes, gzip);
+    let mut r = Response::builder().header(header::ETAG, etag.as_str());
+    if varies_by_encoding {
+        r = r.header(header::VARY, "Accept-Encoding");
+    }
+    if max_age > 0 {
+        r = r.header(header::CACHE_CONTROL, format!("public, max-age={max_age}"));
+    }
+    if if_none_match_hits(req, &etag) {
+        return r
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    r = r.header(header::CONTENT_TYPE, content_type);
+    if gzip {
+        r = r.header(header::CONTENT_ENCODING, "gzip");
+    }
+    r.body(Body::from(bytes)).unwrap()
+}
+
+/// A raster tile (TMS, WMTS): PNG bytes, never content-encoded.
+fn png_response(png: Vec<u8>, req: &axum::http::HeaderMap, max_age: u32) -> Response {
+    tile_response(png, "image/png", false, false, req, max_age)
+}
+
+/// One MVT tile response: gzip or identity per the request (`accepts_gzip`), so it varies.
+fn mvt_response(
+    body: crate::mvt_http::TileBody,
+    req: &axum::http::HeaderMap,
+    max_age: u32,
+) -> Response {
+    tile_response(
+        body.bytes,
+        "application/vnd.mapbox-vector-tile",
+        body.gzip,
+        true,
+        req,
+        max_age,
+    )
+}
+
+/// Does this client accept gzip? Parses `Accept-Encoding` well enough to be honest about it:
+/// the coding is the token before any `;`, `*` accepts anything, and an explicit `q=0` is a
+/// refusal rather than an offer. Absent header means no -- serving gzip to a client that never
+/// advertised it is exactly the bug this check exists to prevent.
+fn accepts_gzip(headers: &axum::http::HeaderMap) -> bool {
+    let Some(v) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    v.split(',').any(|part| {
+        let mut bits = part.split(';');
+        let coding = bits.next().unwrap_or("").trim();
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            return false;
+        }
+        !bits.any(|p| {
+            let p = p.trim();
+            p.get(..2)
+                .filter(|k| k.eq_ignore_ascii_case("q="))
+                .and_then(|_| p[2..].trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        })
+    })
 }
 
 fn status_response(status: u16, msg: String) -> Response {
@@ -711,6 +858,7 @@ async fn tms_tilemap_handler(
 async fn tms_tile_handler(
     State(state): State<Arc<ServeState>>,
     Path((layerspec, z, x, yfile)): Path<(String, u32, u32, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let ystr = yfile.strip_suffix(".png").unwrap_or(&yfile);
     let y: u32 = match ystr.parse() {
@@ -725,7 +873,7 @@ async fn tms_tile_handler(
     })
     .await;
     match result {
-        Ok(Ok(png)) => png_response(png),
+        Ok(Ok(png)) => png_response(png, &headers, state.tile_max_age),
         Ok(Err((status, msg))) => status_response(status, msg),
         Err(_) => status_response(500, "tile render task panicked".into()),
     }
@@ -737,20 +885,22 @@ async fn tms_tile_handler(
 async fn mvt_tile_handler(
     State(state): State<Arc<ServeState>>,
     Path((layer, tms, z, x, yfile)): Path<(String, String, u32, u32, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let ystr = yfile.strip_suffix(".pbf").unwrap_or(&yfile);
     let y: u32 = match ystr.parse() {
         Ok(v) => v,
         Err(_) => return status_response(400, format!("bad tile y '{yfile}'")),
     };
+    let want_gzip = accepts_gzip(&headers);
     let _permit = state.render_limiter.acquire().await; // admission control (bounded concurrent renders)
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::mvt_http::render_mvt_tile(&st, &layer, &tms, z, x, y)
+        crate::mvt_http::render_mvt_tile(&st, &layer, &tms, z, x, y, want_gzip)
     })
     .await;
     match result {
-        Ok(Ok(pbf)) => mvt_response(pbf),
+        Ok(Ok(body)) => mvt_response(body, &headers, state.tile_max_age),
         Ok(Err((status, msg))) => status_response(status, msg),
         Err(_) => status_response(500, "tile encode task panicked".into()),
     }
@@ -961,25 +1111,29 @@ async fn wmts_kvp_handler(
         } => {
             let _permit = state.render_limiter.acquire().await; // admission control
             let st = state.clone();
-            // Task 5 — WMTS-MVT: FORMAT selects the vector-tile encoder instead of the raster
-            // render path. Both branches return the same `Result<Vec<u8>, WmtsErr>` shape.
-            let is_mvt = format.eq_ignore_ascii_case(crate::wmts::MVT_FORMAT);
+            // Task 5 — WMTS-MVT: FORMAT selects the vector-tile path instead of the raster render
+            // path. The two no longer share a return type (a vector tile carries its own encoding,
+            // a PNG does not), so they are dispatched separately rather than through one closure.
+            if format.eq_ignore_ascii_case(crate::wmts::MVT_FORMAT) {
+                // Whether the CLIENT can take gzip, so an archive hit reaches it in the encoding
+                // the archive already stores — the same negotiation the `/mvt` route does.
+                let accept_gzip = accepts_gzip(&headers);
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::wmts::get_tile_mvt(&st, &layer, &style, &tms, z, row, col, accept_gzip)
+                })
+                .await;
+                return match result {
+                    Ok(Ok(body)) => mvt_response(body, &headers, state.tile_max_age),
+                    Ok(Err(e)) => wmts_exception_response(e),
+                    Err(_) => status_response(500, "tile render task panicked".into()),
+                };
+            }
             let result = tokio::task::spawn_blocking(move || {
-                if is_mvt {
-                    crate::wmts::get_tile_mvt(&st, &layer, &style, &tms, z, row, col)
-                } else {
-                    crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
-                }
+                crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
             })
             .await;
             match result {
-                Ok(Ok(bytes)) => {
-                    if is_mvt {
-                        mvt_response(bytes)
-                    } else {
-                        png_response(bytes)
-                    }
-                }
+                Ok(Ok(png)) => png_response(png, &headers, state.tile_max_age),
                 Ok(Err(e)) => wmts_exception_response(e), // OWS ExceptionReport on the KVP binding
                 Err(_) => status_response(500, "tile render task panicked".into()),
             }
@@ -1051,6 +1205,7 @@ async fn wmts_caps_handler(
 async fn wmts_rest_tile_handler(
     State(state): State<Arc<ServeState>>,
     Path((layer, style, tms, z, row, colfile)): Path<(String, String, String, u32, u32, String)>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let cstr = colfile.strip_suffix(".png").unwrap_or(&colfile);
     let col: u32 = match cstr.parse() {
@@ -1064,7 +1219,7 @@ async fn wmts_rest_tile_handler(
     })
     .await;
     match result {
-        Ok(Ok(png)) => png_response(png),
+        Ok(Ok(png)) => png_response(png, &headers, state.tile_max_age),
         Ok(Err(e)) => status_response(e.http, e.text), // RESTful binding: bare status
         Err(_) => status_response(500, "tile render task panicked".into()),
     }
@@ -1289,5 +1444,183 @@ mod inline_json_tests {
         // a literal recovers the original value exactly.
         let parsed: Vec<String> = serde_json::from_str(&out).expect("still valid JSON");
         assert_eq!(parsed, vec!["a</script>b".to_string()]);
+    }
+    /// `Accept-Encoding` decides whether an archive's stored gzip can go out untouched, so getting
+    /// this parse wrong either loses the win (false negatives) or hands gzip to a client that
+    /// cannot decode it (false positives). The false positives are the dangerous half.
+    #[test]
+    fn accept_encoding_is_parsed_before_we_dare_send_gzip() {
+        use axum::http::{header, HeaderMap};
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
+            m
+        };
+
+        // Real browsers, in the shapes they actually send.
+        assert!(super::accepts_gzip(&h("gzip, deflate, br")));
+        assert!(super::accepts_gzip(&h("gzip;q=1.0, identity;q=0.5")));
+        assert!(super::accepts_gzip(&h("br;q=1.0, gzip;q=0.8")));
+        assert!(super::accepts_gzip(&h("GZIP"))); // codings are case-insensitive
+        assert!(super::accepts_gzip(&h("*")));
+
+        // Absent header is NOT permission -- this is the default for curl, and for anything
+        // hand-rolled that would choke on a compressed body.
+        assert!(!super::accepts_gzip(&HeaderMap::new()));
+
+        // An explicit refusal must be honoured even though the token is present.
+        assert!(!super::accepts_gzip(&h("gzip;q=0")));
+        assert!(!super::accepts_gzip(&h("gzip;q=0.0")));
+        assert!(!super::accepts_gzip(&h("identity")));
+        assert!(!super::accepts_gzip(&h("deflate, br")));
+        assert!(!super::accepts_gzip(&h("")));
+        // Substring traps: neither of these offers gzip.
+        assert!(!super::accepts_gzip(&h("x-gzip-ish")));
+        assert!(!super::accepts_gzip(&h("notgzip")));
+    }
+
+    /// The response must never claim an encoding it did not apply, and must always tell caches
+    /// that this URL varies -- traefik sits in front of these tiles in production.
+    #[test]
+    fn the_response_labels_its_encoding_and_always_varies() {
+        use axum::http::header;
+        let none = axum::http::HeaderMap::new();
+        let gz = super::mvt_response(
+            crate::mvt_http::TileBody {
+                bytes: vec![1, 2, 3],
+                gzip: true,
+            },
+            &none,
+            0,
+        );
+        assert_eq!(gz.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(gz.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+
+        let plain =
+            super::mvt_response(crate::mvt_http::TileBody::identity(vec![1, 2, 3]), &none, 0);
+        assert!(
+            plain.headers().get(header::CONTENT_ENCODING).is_none(),
+            "identity bytes must carry NO Content-Encoding"
+        );
+        assert_eq!(
+            plain.headers().get(header::VARY).unwrap(),
+            "Accept-Encoding",
+            "Vary is required on BOTH encodings or a cache will cross them over"
+        );
+    }
+
+    fn inm(v: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(axum::http::header::IF_NONE_MATCH, v.parse().unwrap());
+        h
+    }
+
+    /// Every tile carries a strong ETag, and the two encodings of one tile carry DIFFERENT tags:
+    /// a validator names bytes on the wire, and gzip bytes are not identity bytes.
+    #[test]
+    fn tiles_carry_an_etag_per_representation() {
+        use axum::http::header;
+        let none = axum::http::HeaderMap::new();
+        let gz = super::mvt_response(
+            crate::mvt_http::TileBody {
+                bytes: vec![1, 2, 3],
+                gzip: true,
+            },
+            &none,
+            0,
+        );
+        let plain =
+            super::mvt_response(crate::mvt_http::TileBody::identity(vec![1, 2, 3]), &none, 0);
+        let png = super::png_response(vec![1, 2, 3], &none, 0);
+        let e_gz = gz
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let e_plain = plain
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            e_gz.starts_with('"') && e_gz.ends_with('"'),
+            "quoted strong ETag: {e_gz}"
+        );
+        assert_ne!(
+            e_gz, e_plain,
+            "same bytes, different encoding: different tag"
+        );
+        // Same bytes, same (identity) encoding -> same tag, whatever the route.
+        assert_eq!(
+            png.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            e_plain
+        );
+        assert!(
+            png.headers().get(header::VARY).is_none(),
+            "a PNG tile never varies by encoding, so it must not claim to"
+        );
+        assert!(
+            gz.headers().get(header::CACHE_CONTROL).is_none(),
+            "max-age 0 = no Cache-Control at all, the behaviour before the flag existed"
+        );
+    }
+
+    /// `If-None-Match` naming the tag -> 304 with the validators and NO body/type/encoding; a
+    /// different tag -> the full 200. `W/`, lists and `*` are all honoured.
+    #[test]
+    fn if_none_match_turns_a_hit_into_a_304() {
+        use axum::http::{header, StatusCode};
+        let body = || crate::mvt_http::TileBody {
+            bytes: vec![1, 2, 3],
+            gzip: true,
+        };
+        let none = axum::http::HeaderMap::new();
+        let etag = super::mvt_response(body(), &none, 3600)
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let hit = super::mvt_response(body(), &inm(&etag), 3600);
+        assert_eq!(hit.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            hit.headers().get(header::ETAG).unwrap().to_str().unwrap(),
+            etag
+        );
+        assert_eq!(
+            hit.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=3600"
+        );
+        assert_eq!(hit.headers().get(header::VARY).unwrap(), "Accept-Encoding");
+        assert!(hit.headers().get(header::CONTENT_TYPE).is_none());
+        assert!(hit.headers().get(header::CONTENT_ENCODING).is_none());
+
+        let weak_list = format!("\"nope\", W/{etag}");
+        assert_eq!(
+            super::mvt_response(body(), &inm(&weak_list), 0).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        assert_eq!(
+            super::mvt_response(body(), &inm("*"), 0).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        let miss = super::mvt_response(body(), &inm("\"0000000000000000\""), 0);
+        assert_eq!(miss.status(), StatusCode::OK);
+        assert_eq!(
+            miss.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        // The identity encoding of the same tile has its own tag, so the gzip tag must NOT match it.
+        let cross = super::mvt_response(
+            crate::mvt_http::TileBody::identity(vec![1, 2, 3]),
+            &inm(&etag),
+            0,
+        );
+        assert_eq!(cross.status(), StatusCode::OK);
     }
 }

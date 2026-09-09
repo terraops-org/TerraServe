@@ -53,6 +53,49 @@ fn resolve_grid(layer: &Layer, tms_id: &str) -> Result<TileMatrixSet, (u16, Stri
     tms::preset(tms_id, 4096).ok_or((404u16, format!("no TileMatrixSet '{tms_id}'")))
 }
 
+/// A tile body plus the encoding its bytes are already in.
+///
+/// The PMTiles archives have always stored their MVT gzip'd, and until now the serving path
+/// inflated every hit only for the response to go out uncompressed -- paying CPU to make the
+/// payload roughly 3x bigger. Carrying the encoding alongside the bytes lets an archive hit go
+/// to a gzip-capable client untouched, while a live-encoded tile (which is never compressed)
+/// still goes out as identity from the same code path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TileBody {
+    pub bytes: Vec<u8>,
+    /// True iff `bytes` are gzip'd and the response must say `Content-Encoding: gzip`.
+    pub gzip: bool,
+}
+
+impl TileBody {
+    /// Plain, uncompressed MVT -- what the live encoder produces.
+    pub fn identity(bytes: Vec<u8>) -> Self {
+        TileBody { bytes, gzip: false }
+    }
+}
+
+/// Turn a STORED blob into a response body, given how the archive stored it and whether this
+/// client can take gzip.
+///
+/// The `compression` argument must come from the archive header (`tile_compression`), never from
+/// an assumption: an archive is legally `COMPRESSION_NONE`, and labelling identity bytes as gzip
+/// hands the client something it cannot decode behind a 200.
+fn deliver(bytes: Vec<u8>, compression: u8, accept_gzip: bool) -> Result<TileBody, String> {
+    use crate::vector::pmtiles::write::{COMPRESSION_GZIP, COMPRESSION_NONE};
+    match compression {
+        // The win: hand over exactly what is on disk.
+        COMPRESSION_GZIP if accept_gzip => Ok(TileBody { bytes, gzip: true }),
+        // A client that did not offer gzip still gets correct bytes, at the old cost.
+        COMPRESSION_GZIP => Ok(TileBody::identity(crate::vector::pmtiles::codec::gunzip(
+            &bytes,
+        )?)),
+        COMPRESSION_NONE => Ok(TileBody::identity(bytes)),
+        other => Err(format!(
+            "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
+        )),
+    }
+}
+
 /// Render one MVT tile: `{layer}/{tms}/{z}/{x}/{y}`. Out-of-range `z/x/y` -> `Err((404,_))`;
 /// in-range with no features (or everything clipped away by the encoder) -> `Ok` with an empty body.
 pub fn render_mvt_tile(
@@ -62,7 +105,8 @@ pub fn render_mvt_tile(
     z: u32,
     x: u32,
     y: u32,
-) -> Result<Vec<u8>, (u16, String)> {
+    accept_gzip: bool,
+) -> Result<TileBody, (u16, String)> {
     let (l, v) = resolve_vector(state, layer)?;
     let grid = resolve_grid(l, tms_id)?;
     let lvl = grid
@@ -80,8 +124,16 @@ pub fn render_mvt_tile(
     // unchanged. Supersedes Spec-1 `l.pmtiles.get(tms_id)` when present (the loader populates at most
     // one of the two for a given grid, but the overlay path is checked first regardless).
     if let Some(ov) = l.overlay.get(tms_id) {
-        match ov.get(z, x, y) {
-            Ok(Some(bytes)) => return Ok(bytes),
+        // Read the STORED blob (plus how it was stored) rather than an inflated copy, so a
+        // gzip-capable client can be handed it verbatim. `get_raw` reports the compression of
+        // whichever source answered -- the overlay log is always gzip, the base archive may not be.
+        match ov.get_raw(z, x, y) {
+            Ok(Some((bytes, comp))) => match deliver(bytes, comp, accept_gzip) {
+                Ok(body) => return Ok(body),
+                // A blob we cannot decode is a real failure, not a reason to silently re-render:
+                // fall through to the live path, same as any other overlay read error.
+                Err(e) => eprintln!("overlay decode {z}/{x}/{y}: {e}"),
+            },
             Ok(None) => {}
             Err(e) => eprintln!("overlay read {z}/{x}/{y}: {e}"),
         }
@@ -94,7 +146,7 @@ pub fn render_mvt_tile(
             let id = crate::vector::pmtiles::zxy_to_tileid(z, x, y);
             let _ = ov.put(id, &crate::vector::pmtiles::codec::gzip(&live)); // best-effort
         }
-        return Ok(live);
+        return Ok(TileBody::identity(live));
     }
     // Archive-first (opt-in): a hit is served straight from the pre-built PMTiles archive for the
     // REQUESTED grid (`tms_id`); a miss (or no archive registered for this grid) falls through to the
@@ -103,8 +155,14 @@ pub fn render_mvt_tile(
     // layer with e.g. a WebMercatorQuad archive AND a swissLV95 archive serves each grid from its own
     // file (design commitment 1: never mixed in one archive).
     if let Some(reader) = l.pmtiles.get(tms_id) {
-        match reader.get(z, x, y) {
-            Ok(Some(bytes)) => return Ok(bytes),
+        // Same pass-through as the overlay branch: the archive already holds gzip, so an inflate
+        // here would only be undone by the wire. `tile_compression()` is the archive's own header,
+        // so a `COMPRESSION_NONE` archive still serves identity correctly.
+        match reader.get_raw(z, x, y) {
+            Ok(Some(bytes)) => match deliver(bytes, reader.tile_compression(), accept_gzip) {
+                Ok(body) => return Ok(body),
+                Err(e) => eprintln!("pmtiles decode {z}/{x}/{y}: {e}"), // degrade to live encode
+            },
             Ok(None) => {}
             Err(e) => eprintln!("pmtiles read {z}/{x}/{y}: {e}"), // degrade to live encode
         }
@@ -120,9 +178,17 @@ pub fn render_mvt_tile(
     // correct — a harmless no-op for `LoadAll` (encode_tile_opt still runs its own candidate filter
     // over whatever slice it's handed).
     let batch = features_for_tile(&vs, &grid, z, x, y, &l.src_crs, &opts).map_err(read_failed)?;
-    Ok(cached_or_encode(state, &l.name, tms_id, z, x, y, || {
-        encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts)
-    }))
+    // The live encoder never compresses, and the MVT byte cache holds those identity bytes -- so
+    // this path is unchanged by gzip pass-through, and the cache can never mix the two encodings.
+    Ok(TileBody::identity(cached_or_encode(
+        state,
+        &l.name,
+        tms_id,
+        z,
+        x,
+        y,
+        || encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts),
+    )))
 }
 
 /// A failed source READ is a 500, never an empty tile. Encoding whatever came back from a broken
@@ -335,16 +401,11 @@ pub fn style_json(
     // thematic style (e.g. the DGT COS2018 land-cover legend) is served without the engine knowing
     // the classification — the `metadata` (e.g. a legend) rides along to the client.
     let (raw_layers, metadata) = match &state.mvt_style {
-        Some(serde_json::Value::Array(arr)) => (arr.clone(), serde_json::Value::Null),
-        Some(serde_json::Value::Object(obj)) => (
-            obj.get("layers")
-                .and_then(|l| l.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            obj.get("metadata")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        ),
+        // A style layer that names a `source-layer` is served to that layer only; an untagged one
+        // to every layer (see `mvt_style_for_layer`).
+        Some(v @ (serde_json::Value::Array(_) | serde_json::Value::Object(_))) => {
+            mvt_style_for_layer(v, layer)
+        }
         // No `--mvt-style`: derive a class-colour fill from the layer's `--vec-style` SLD/JSON (the
         // same palette the WMS renders) so the X-ray viewer's "Use WMS style" can colour the vector
         // tiles from the one SLD; fall back to the generic X-ray line default when there's no
@@ -454,6 +515,54 @@ pub fn feature_field_schema_vs(
     }
 }
 
+/// The style layers of an operator `--mvt-style` document that apply to the served `layer`,
+/// plus the document's `metadata`. A style layer that names a `source-layer` (plain MapLibre;
+/// nothing TerraServe-specific) is served ONLY to the served layer of that name, so ONE file can
+/// theme every layer of a multi-layer server. A style layer without one keeps the original
+/// single-layer convention and is served to every layer, `source-layer` filled in by the handler.
+/// A bare `[...]` array is accepted as the layer list with no metadata.
+pub fn mvt_style_for_layer(
+    style: &serde_json::Value,
+    layer: &str,
+) -> (Vec<serde_json::Value>, serde_json::Value) {
+    let (all, metadata) = match style {
+        serde_json::Value::Array(arr) => (arr.clone(), serde_json::Value::Null),
+        serde_json::Value::Object(obj) => (
+            obj.get("layers")
+                .and_then(|l| l.as_array())
+                .cloned()
+                .unwrap_or_default(),
+            obj.get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        ),
+        _ => (Vec::new(), serde_json::Value::Null),
+    };
+    let layers = all
+        .into_iter()
+        .filter(|l| match l.get("source-layer").and_then(|s| s.as_str()) {
+            None => true,
+            Some(s) => s == layer,
+        })
+        .collect();
+    (layers, metadata)
+}
+
+/// [`mvt_style_fields`] restricted to the style layers that [`mvt_style_for_layer`] would serve
+/// to `layer` — what the startup column warning must use, or a five-layer style file reports every
+/// layer's fields against every other layer.
+pub fn mvt_style_fields_for_layer(
+    style: &serde_json::Value,
+    layer: &str,
+) -> std::collections::BTreeSet<String> {
+    let (layers, _) = mvt_style_for_layer(style, layer);
+    let mut out = std::collections::BTreeSet::new();
+    for l in &layers {
+        collect_get_fields(l, &mut out);
+    }
+    out
+}
+
 /// Every feature property a MapLibre/Mapbox `--mvt-style` reads, i.e. the `FIELD` of every
 /// `["get", "FIELD"]` expression anywhere in the document.
 ///
@@ -515,6 +624,62 @@ fn feature_field_schema_slice(
 mod tests {
     use super::mvt_style_fields;
     use super::sld_class_fill_layer;
+    use super::{mvt_style_fields_for_layer, mvt_style_for_layer};
+
+    const MULTI: &str = r##"{
+        "layers": [
+          { "id": "roads-line", "type": "line", "source-layer": "roads",
+            "paint": { "line-color": ["match", ["get", "highway"], "motorway", "#f00", "#888"] } },
+          { "id": "landuse-fill", "type": "fill", "source-layer": "landuse",
+            "paint": { "fill-color": ["match", ["get", "landuse"], "forest", "#0a0", "#ccc"] } },
+          { "id": "any-label", "type": "symbol",
+            "layout": { "text-field": ["get", "name"] } }
+        ],
+        "metadata": { "glow": true } }"##;
+
+    #[test]
+    fn a_style_layer_tagged_with_a_source_layer_is_served_only_to_that_layer() {
+        // One --mvt-style file, five served layers: a MapLibre style layer that names its
+        // `source-layer` belongs to that served layer alone; an untagged one (the pre-existing
+        // single-layer convention) still goes to everybody. Metadata rides along unchanged.
+        let v: serde_json::Value = serde_json::from_str(MULTI).unwrap();
+        let (roads, md) = mvt_style_for_layer(&v, "roads");
+        let ids: Vec<&str> = roads.iter().map(|l| l["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["roads-line", "any-label"]);
+        assert_eq!(md["glow"], serde_json::json!(true));
+        let (water, _) = mvt_style_for_layer(&v, "water");
+        let ids: Vec<&str> = water.iter().map(|l| l["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            ["any-label"],
+            "an unnamed layer gets only the untagged entries"
+        );
+    }
+
+    #[test]
+    fn an_untagged_style_still_reaches_every_layer_exactly_as_before() {
+        // The cos2023 / vida / swiss styles carry no `source-layer`; a bare array form is legal
+        // too. Both must serve to any layer unchanged, or three live demos lose their palette.
+        let v: serde_json::Value =
+            serde_json::from_str(r#"[{"id":"fill","type":"fill"},{"id":"line","type":"line"}]"#)
+                .unwrap();
+        let (layers, md) = mvt_style_for_layer(&v, "whatever");
+        assert_eq!(layers.len(), 2);
+        assert!(md.is_null());
+    }
+
+    #[test]
+    fn style_fields_are_reported_per_served_layer_not_across_the_whole_file() {
+        // The startup warning must not tell `roads` it lacks `landuse`: only the fields read by
+        // style layers that apply to a served layer count against it.
+        let v: serde_json::Value = serde_json::from_str(MULTI).unwrap();
+        let roads = mvt_style_fields_for_layer(&v, "roads");
+        assert_eq!(roads.iter().collect::<Vec<_>>(), ["highway", "name"]);
+        let landuse = mvt_style_fields_for_layer(&v, "landuse");
+        assert_eq!(landuse.iter().collect::<Vec<_>>(), ["landuse", "name"]);
+        let places = mvt_style_fields_for_layer(&v, "places");
+        assert_eq!(places.iter().collect::<Vec<_>>(), ["name"]);
+    }
 
     #[test]
     fn mvt_style_fields_finds_every_get_expression_however_deeply_nested() {
@@ -659,6 +824,7 @@ mod tests {
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: std::collections::BTreeMap::new(),
             raster_pmtiles: std::collections::BTreeMap::new(),
@@ -666,8 +832,9 @@ mod tests {
         };
 
         let st = ServeState::new(vec![layer], "http://h/wms".into(), 16);
-        let bytes = super::render_mvt_tile(&st, "mini", "testgrid", 0, 0, 0)
-            .expect("custom grid 'testgrid' should resolve, not 404");
+        let bytes = super::render_mvt_tile(&st, "mini", "testgrid", 0, 0, 0, false)
+            .expect("custom grid 'testgrid' should resolve, not 404")
+            .bytes;
         assert!(!bytes.is_empty(), "z0/0/0 covers the whole fixture");
     }
 
@@ -735,6 +902,7 @@ mod tests {
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: std::collections::BTreeMap::new(),
             raster_pmtiles: std::collections::BTreeMap::new(),
@@ -999,6 +1167,7 @@ mod tests {
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles: std::collections::BTreeMap::new(),
             raster_pmtiles: std::collections::BTreeMap::new(),
@@ -1009,8 +1178,9 @@ mod tests {
 
         // WorldCRS84Quad z0: matrix_w=2, matrix_h=1; col 1 = [0,180] x [-90,90] (the whole eastern
         // hemisphere) — covers lon 8.2 / lat 46.8 with no per-feature arithmetic.
-        let crs84_bytes = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0)
-            .expect("WorldCRS84Quad z0/1/0 should render");
+        let crs84_bytes = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0, false)
+            .expect("WorldCRS84Quad z0/1/0 should render")
+            .bytes;
         assert!(
             dec::feature_with_str_prop(&crs84_bytes, "name", "swiss_test"),
             "feature must appear in the WorldCRS84Quad (CRS84 baseline) tile"
@@ -1019,8 +1189,9 @@ mod tests {
         // swissLV95 z0: matrixWidth=matrixHeight=1 — the single z0/0/0 tile covers the whole
         // official CH extent [2420000,1030000,2900000,1350000], guaranteed to contain the
         // reprojected feature.
-        let lv95_bytes = super::render_mvt_tile(&st, "mini", "swissLV95", 0, 0, 0)
-            .expect("swissLV95 z0/0/0 should render");
+        let lv95_bytes = super::render_mvt_tile(&st, "mini", "swissLV95", 0, 0, 0, false)
+            .expect("swissLV95 z0/0/0 should render")
+            .bytes;
         assert!(
             dec::feature_with_str_prop(&lv95_bytes, "name", "swiss_test"),
             "feature must appear in the swissLV95 (EPSG:2056, reprojected 4326->2056) tile"
@@ -1124,6 +1295,7 @@ mod tests {
                 style,
                 shaper,
                 lod: None,
+                zoom_sources: Vec::new(),
             }),
             pmtiles,
             raster_pmtiles: std::collections::BTreeMap::new(),
@@ -1134,8 +1306,12 @@ mod tests {
         // End-to-end through `render_mvt_tile`: each grid's request must be served from ITS OWN
         // archive, not the other's (and not a live encode — a live tile would be valid MVT bytes,
         // never the literal `MERCATOR_TILE`/`CRS84_TILE` markers).
-        let got_a = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0).unwrap();
-        let got_b = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 0, 0).unwrap();
+        let got_a = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0, false)
+            .unwrap()
+            .bytes;
+        let got_b = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 0, 0, false)
+            .unwrap()
+            .bytes;
         assert_eq!(got_a, b"MERCATOR_TILE");
         assert_eq!(got_b, b"CRS84_TILE");
         assert_ne!(got_a, got_b);
@@ -1229,5 +1405,143 @@ mod tests {
             super::advertised_origin(&b, Some("maps.example.org"), None),
             "https://maps.example.org/ts"
         );
+    }
+    /// The gzip pass-through, end to end through `render_mvt_tile`.
+    ///
+    /// The archives have always stored gzip'd MVT. Before this, every archive hit was inflated and
+    /// then shipped uncompressed -- CPU spent to make the payload ~3x bigger. Now an archive hit
+    /// goes to a gzip-capable client verbatim, while everything else is byte-for-byte unchanged.
+    #[test]
+    fn an_archive_hit_is_served_gzipped_only_when_the_client_accepts_it() {
+        use crate::server::{Layer, ServeState, VectorLayer};
+        use crate::vector::geojson::GeoJsonSource;
+        use crate::vector::pmtiles::codec::{gunzip, gzip};
+        use crate::vector::pmtiles::read::PmtilesReader;
+        use crate::vector::pmtiles::write::{
+            HeaderFields, PmtilesWriter, COMPRESSION_NONE, TILE_TYPE_MVT,
+        };
+        use crate::vector::pmtiles::zxy_to_tileid;
+        use crate::vector::shape::Shaper;
+        use crate::vector::source::{FeatureSource, VectorSource};
+        use std::sync::Arc;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ts_mvt_gzip_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Compressible enough that gzip is unmistakably smaller -- otherwise the test could pass
+        // while the pass-through saved nothing.
+        let payload = b"ARCHIVED_TILE_BYTES ".repeat(50);
+
+        let mk = |name: &str, compression_none: bool| -> PmtilesReader {
+            let dir = tmp.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let out = dir.join("out.pmtiles");
+            let mut w = PmtilesWriter::new(&dir).unwrap();
+            let stored = if compression_none {
+                w = w.tile_format(TILE_TYPE_MVT, COMPRESSION_NONE);
+                payload.clone()
+            } else {
+                gzip(&payload)
+            };
+            w.add(zxy_to_tileid(0, 0, 0), stored).unwrap();
+            w.finish(
+                HeaderFields {
+                    min_zoom: 0,
+                    max_zoom: 0,
+                    bounds_e7: [0, 0, 0, 0],
+                    center: (0, 0, 0),
+                },
+                r#"{"vector_layers":[],"grid_id":"WebMercatorQuad"}"#,
+                &out,
+            )
+            .unwrap();
+            let r = PmtilesReader::open(&out).unwrap();
+            r.require_tile_type(TILE_TYPE_MVT, "test").unwrap();
+            r
+        };
+
+        let mk_state = |reader: PmtilesReader| {
+            let src = Arc::new(GeoJsonSource::load("fixtures/vector/mini_mvt.geojson").unwrap());
+            let style = Style::load("fixtures/styles/airports.vec.json").unwrap();
+            let font = std::fs::read("fixtures/fonts/DejaVuSans.ttf").unwrap();
+            let shaper = Arc::new(Shaper::from_font_bytes(&font).unwrap());
+            let ext = src.full_extent();
+            let mut pmtiles = std::collections::BTreeMap::new();
+            pmtiles.insert("WebMercatorQuad".to_string(), Arc::new(reader));
+            let layer = Layer {
+                name: "mini".into(),
+                cog_path: String::new(),
+                cog: None,
+                source: None,
+                style: None,
+                src_crs: "EPSG:4326".into(),
+                band_math: None,
+                bounds_wgs84: ext,
+                tile_cache: None,
+                index_cache: crate::cache::new_index_cache(crate::cache::index_cache_bytes()),
+                grids: Vec::new(),
+                vector: Some(VectorLayer {
+                    fields: super::feature_field_schema(src.as_ref()),
+                    area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                    min_feature_px: 0.0,
+                    source: VectorSource::LoadAll(src),
+                    style,
+                    shaper,
+                    lod: None,
+                    zoom_sources: Vec::new(),
+                }),
+                pmtiles,
+                raster_pmtiles: std::collections::BTreeMap::new(),
+                overlay: std::collections::BTreeMap::new(),
+            };
+            ServeState::new(vec![layer], "http://h/wms".into(), 16)
+        };
+
+        // --- a gzip archive, client accepts gzip: pass the stored blob straight through ---
+        let st = mk_state(mk("gz", false));
+        let got = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0, true).unwrap();
+        assert!(got.gzip, "an archive hit must be labelled gzip");
+        assert_eq!(
+            gunzip(&got.bytes).unwrap(),
+            payload,
+            "the gzip body must inflate to exactly the archived tile"
+        );
+        assert!(
+            got.bytes.len() < payload.len(),
+            "pass-through must be SMALLER than the tile ({} vs {}), or there is no win",
+            got.bytes.len(),
+            payload.len()
+        );
+
+        // --- same archive, client did NOT offer gzip: inflate, and never claim an encoding ---
+        let plain = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0, false).unwrap();
+        assert!(!plain.gzip);
+        assert_eq!(plain.bytes, payload);
+        // The two encodings are two spellings of ONE tile. This is the invariant the whole change
+        // rests on: a client must not see different map data depending on its Accept-Encoding.
+        assert_eq!(gunzip(&got.bytes).unwrap(), plain.bytes);
+
+        // --- an archive stored UNCOMPRESSED: identity, even for a gzip-capable client ---
+        let st_none = mk_state(mk("none", true));
+        let raw =
+            super::render_mvt_tile(&st_none, "mini", "WebMercatorQuad", 0, 0, 0, true).unwrap();
+        assert!(
+            !raw.gzip,
+            "a COMPRESSION_NONE archive must never be labelled gzip"
+        );
+        assert_eq!(raw.bytes, payload);
+
+        // --- an archive MISS falls through to the live encoder, which never compresses ---
+        let miss = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 1, 0, 0, true).unwrap();
+        assert!(
+            !miss.gzip,
+            "a live-encoded tile is not gzip'd, whatever the client offered"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

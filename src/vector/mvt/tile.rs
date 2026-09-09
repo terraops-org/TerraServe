@@ -261,6 +261,34 @@ pub fn min_area_src_for_scale(scale: f64, area_scale: f64, min_feature_px: f64) 
 /// (the entry the tests and any default caller use). Kept taking a bare `&dyn FeatureSource` —
 /// several test fixtures build one directly and this is the one place that still needs the whole
 /// slice (there is no bbox to narrow by, since this wrapper doesn't take a `VectorSource`).
+/// The per-zoom size gate's keep/drop decision for ONE feature, against already-computed
+/// thresholds.
+///
+/// Both thresholds are per-layer/per-zoom CONSTANTS (see `min_area_src_for_grid` /
+/// `min_len_src_for_grid`), independent of x/y, which is precisely what makes this selection
+/// seam-free: the same feature is kept or dropped in EVERY tile at a zoom. A per-TILE quantity
+/// in this position is what `--mvt-max-features` was, and what tippecanoe's own README warns
+/// "will probably look ugly at the tile boundaries".
+///
+/// The two gates partition the geometry types between them and neither can touch a Point:
+/// `f.length` is 0 for points and polygons exactly as `f.area` is 0 for lines and points, and a
+/// zero measure is always exempt. Gating points by size would blank a places layer at every zoom.
+///
+/// Shared by the MVT encoder and `terraserve extract` so a materialized per-zoom subset contains
+/// exactly what the encoder would have selected at that zoom -- if these two ever disagreed, a
+/// subset would be silently wrong in a way no test of either alone could catch. `extract` calls
+/// it on the UNCLIPPED feature, which is the only correct place: a feature clipped small at a
+/// tile edge would otherwise fail a threshold its whole-geometry neighbour passes.
+pub fn passes_size_gate(f: &Feature, min_area_src: f64, min_len_src: f64) -> bool {
+    if min_area_src > 0.0 && f.area > 0.0 && f.area < min_area_src {
+        return false;
+    }
+    if min_len_src > 0.0 && f.length > 0.0 && f.length < min_len_src {
+        return false;
+    }
+    true
+}
+
 pub fn encode_tile(
     src: &dyn FeatureSource,
     tms: &TileMatrixSet,
@@ -518,21 +546,9 @@ pub fn encode_tile_opt(
         // them would blank a roads/airports layer at every zoom.
         // SKIPPED when the mosaic is active — it votes on the raw set (Fable-5 finding 2); dropping
         // small polygons here would leave the very holes the mosaic exists to fill.
-        if !(mosaic_active || dissolve_active)
-            && min_area_src > 0.0
-            && f.area > 0.0
-            && f.area < min_area_src
-        {
-            continue;
-        }
-        // The same selection for LINE geometry, against `min_len_src`. `f.length` is 0 for points
-        // and polygons exactly as `f.area` is 0 for lines, so the two gates partition the geometry
-        // types between them and neither can touch a Point. Per-zoom constant, so seam-free.
-        if !(mosaic_active || dissolve_active)
-            && min_len_src > 0.0
-            && f.length > 0.0
-            && f.length < min_len_src
-        {
+        // Both size gates live in `passes_size_gate`, shared with `terraserve extract` so a
+        // materialized per-zoom subset selects exactly what this encoder would.
+        if !(mosaic_active || dissolve_active) && !passes_size_gate(f, min_area_src, min_len_src) {
             continue;
         }
         // No filter (transform unavailable) keeps every feature; otherwise keep those whose
@@ -1219,6 +1235,62 @@ mod tests {
             t6.len(),
             t5.len()
         );
+    }
+
+    /// The shared gate's defining property: the two thresholds partition the geometry types and
+    /// NEITHER can touch a point. This is the predicate `terraserve extract` uses to materialize a
+    /// per-zoom subset, so if it ever disagreed with the encoder a subset would be silently wrong.
+    #[test]
+    fn the_shared_size_gate_partitions_the_geometry_types_and_spares_points() {
+        use super::passes_size_gate;
+        use crate::vector::feature::{Feature, Geometry, Props};
+        let poly = rect_feature(0.0, 0.0, 1.0, 1.0, 1); // area 1, length 0
+        let line = Feature::new(
+            Geometry::LineString(vec![[0.0, 0.0], [3.0, 0.0]]), // length 3, area 0
+            Props::new(),
+            2,
+        );
+        let point = Feature::new(Geometry::Point([0.0, 0.0]), Props::new(), 3); // both 0
+
+        // Area gate: bites the polygon, cannot see the line or the point.
+        assert!(
+            !passes_size_gate(&poly, 2.0, 0.0),
+            "small polygon is dropped"
+        );
+        assert!(
+            passes_size_gate(&poly, 0.5, 0.0),
+            "big enough polygon is kept"
+        );
+        assert!(
+            passes_size_gate(&line, 1e9, 0.0),
+            "an area gate never touches a line"
+        );
+        assert!(
+            passes_size_gate(&point, 1e9, 0.0),
+            "an area gate never touches a point"
+        );
+
+        // Length gate: the mirror image.
+        assert!(!passes_size_gate(&line, 0.0, 5.0), "short line is dropped");
+        assert!(
+            passes_size_gate(&line, 0.0, 2.0),
+            "long enough line is kept"
+        );
+        assert!(
+            passes_size_gate(&poly, 0.0, 1e9),
+            "a length gate never touches a polygon"
+        );
+        assert!(
+            passes_size_gate(&point, 0.0, 1e9),
+            "a length gate never touches a point"
+        );
+
+        // Both off = keep everything, which is what an unset gate must mean.
+        for f in [&poly, &line, &point] {
+            assert!(passes_size_gate(f, 0.0, 0.0));
+        }
+        // A point is never gated, whatever either threshold says.
+        assert!(passes_size_gate(&point, 1e9, 1e9));
     }
 
     #[test]

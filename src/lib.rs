@@ -43,6 +43,7 @@ pub type Error = Box<dyn std::error::Error>;
 // The frozen crate-root contract: `main.rs` names these types and functions directly, and
 // `score.sh` drives the binary by the flags they define. Moving them into `cmd/` must not move
 // them out of the crate root.
+pub use cmd::extract::{run_extract, ExtractArgs};
 pub use cmd::pmtiles::{run_build_pmtiles, BuildPmtilesArgs};
 pub use cmd::render::{run_render, run_wms_handle, RenderArgs, WmsArgs};
 pub use cmd::serve::{run_serve, ServeArgs};
