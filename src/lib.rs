@@ -46,7 +46,7 @@ pub type Error = Box<dyn std::error::Error>;
 // them out of the crate root.
 // Staging for the embedded PROJ database. A no-op unless `bundled-proj` is on; see
 // `projdata` for why it must run before the first PROJ context is built.
-pub use projdata::{ensure_proj_data, run_info};
+pub use projdata::{ensure_proj_data, proj_status, run_info, ProjStatus};
 
 pub use cmd::extract::{run_extract, ExtractArgs};
 pub use cmd::pmtiles::{run_build_pmtiles, BuildPmtilesArgs};

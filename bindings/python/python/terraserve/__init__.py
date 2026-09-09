@@ -5,6 +5,6 @@ callers write ``import terraserve; terraserve.render_png(...)``. The pygeoapi
 OGC API - Maps provider lives in ``terraserve.pygeoapi``.
 """
 
-from ._terraserve import render_png
+from ._terraserve import proj_info, render_png
 
-__all__ = ["render_png"]
+__all__ = ["proj_info", "render_png"]

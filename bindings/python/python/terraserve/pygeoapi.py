@@ -19,7 +19,7 @@ branches on the data type so that becomes a fill-in, not a rewrite.
 
 from pygeoapi.provider.base import BaseProvider
 
-from . import render_png
+from . import proj_info, render_png
 from ._crs import to_epsg
 
 _RASTER_EXT = (".tif", ".tiff", ".cog")
@@ -35,6 +35,32 @@ class TerraServeProvider(BaseProvider):
         self.src_crs = opts.get("src_crs", "EPSG:4326")
         self.style = opts["style"]
         self.resample = opts.get("resample", "bilinear")
+
+    def info(self):
+        """Diagnostics: how this provider is configured, and which PROJ data answers it.
+
+        The wheel carries a statically linked PROJ with its ``proj.db`` embedded, staged to
+        a cache directory on import. When a request fails with a transform error there is
+        otherwise nothing to look at: pygeoapi surfaces the exception, not the geodetic
+        setup behind it. Call this from a shell or a health endpoint::
+
+            from terraserve.pygeoapi import TerraServeProvider
+            TerraServeProvider(provider_def).info()
+
+        Returns a dict with a ``provider`` section (this layer's configuration) and a
+        ``proj`` section (see :func:`terraserve.proj_info`). A ``proj["proj_db"]`` of
+        ``None`` means PROJ found no database and every reprojection will fail.
+        """
+        return {
+            "provider": {
+                "data": self.data,
+                "kind": "raster" if self.data.lower().endswith(_RASTER_EXT) else "vector",
+                "src_crs": self.src_crs,
+                "style": self.style,
+                "resample": self.resample,
+            },
+            "proj": proj_info(),
+        }
 
     def query(self, style=None, bbox=[], width=500, height=300, crs=None,
               datetime_=None, format_="png", transparent=True, **kwargs):

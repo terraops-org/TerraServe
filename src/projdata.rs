@@ -192,48 +192,94 @@ mod tests {
 /// database path it resolved. CI asserts on that line; a user with a transform problem can
 /// paste it into an issue.
 pub fn run_info() -> Result<(), Box<dyn std::error::Error>> {
-    let (proj_release, search_path) = proj_build_info();
+    let s = proj_status();
 
-    println!("terraserve   {}", env!("CARGO_PKG_VERSION"));
+    println!("terraserve   {}", s.terraserve_version);
     println!(
         "PROJ         {} ({})",
-        proj_release,
-        if cfg!(feature = "bundled-proj") {
+        s.proj_release,
+        if s.bundled {
             "statically linked, vendored"
         } else {
             "system libproj, dynamically linked"
         }
     );
-
-    match proj_database_path() {
-        Some(p) => {
-            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    match (&s.database_path, s.database_bytes) {
+        (Some(p), Some(n)) => {
             println!("proj.db      {p}");
-            println!("             {size} bytes");
+            println!("             {n} bytes");
         }
-        // Not a hard error: the caller may only ever do same-CRS work, which needs no
+        // Not a hard error: a caller may only ever do same-CRS work, which needs no
         // database. But it is the single most useful thing to see when a transform fails.
-        None => println!("proj.db      NOT FOUND - reprojection will fail"),
+        _ => println!("proj.db      NOT FOUND - reprojection will fail"),
     }
+    if let (Some(n), Some(id)) = (s.embedded_bytes, s.embedded_id) {
+        println!("embedded     {n} bytes, id {id}");
+    }
+    println!(
+        "PROJ_DATA    {}",
+        s.proj_data.as_deref().unwrap_or("(unset)")
+    );
+    println!(
+        "PROJ_LIB     {}",
+        s.proj_lib.as_deref().unwrap_or("(unset)")
+    );
+    println!("search path  {}", s.search_path);
+    Ok(())
+}
+
+/// What `terraserve info` reports, as data.
+///
+/// Shared with the Python binding: a wheel embeds `proj.db` exactly as the binary does, so a
+/// pygeoapi user whose transforms fail needs the same answer and has no CLI to ask.
+#[derive(Debug, Clone)]
+pub struct ProjStatus {
+    pub terraserve_version: &'static str,
+    /// PROJ's own release string, e.g. "Rel. 9.6.0, March 15th, 2025".
+    pub proj_release: String,
+    /// True when PROJ is statically linked and its database is embedded in this binary.
+    pub bundled: bool,
+    /// The `proj.db` PROJ actually resolved. `None` means no database was found at all.
+    pub database_path: Option<String>,
+    pub database_bytes: Option<u64>,
+    /// Size and content id of the copy compiled into this binary (bundled builds only).
+    pub embedded_bytes: Option<usize>,
+    pub embedded_id: Option<&'static str>,
+    pub proj_data: Option<String>,
+    pub proj_lib: Option<String>,
+    pub search_path: String,
+}
+
+/// Ask PROJ what it is and what data it resolved. Cheap enough to call per request, though
+/// it is meant for diagnostics rather than a hot path.
+pub fn proj_status() -> ProjStatus {
+    let (proj_release, search_path) = proj_build_info();
+    let database_path = proj_database_path();
+    let database_bytes = database_path
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
 
     #[cfg(feature = "bundled-proj")]
-    {
+    let (embedded_bytes, embedded_id) = {
         const DB: &[u8] = include_bytes!(env!("TERRASERVE_PROJ_DB_PATH"));
-        println!(
-            "embedded     {} bytes, id {}",
-            DB.len(),
-            env!("TERRASERVE_PROJ_DB_ID")
-        );
-    }
+        (Some(DB.len()), Some(env!("TERRASERVE_PROJ_DB_ID")))
+    };
+    #[cfg(not(feature = "bundled-proj"))]
+    let (embedded_bytes, embedded_id) = (None, None);
 
-    for var in ["PROJ_DATA", "PROJ_LIB"] {
-        match std::env::var(var) {
-            Ok(v) => println!("{var:<12} {v}"),
-            Err(_) => println!("{var:<12} (unset)"),
-        }
+    ProjStatus {
+        terraserve_version: env!("CARGO_PKG_VERSION"),
+        proj_release,
+        bundled: cfg!(feature = "bundled-proj"),
+        database_path,
+        database_bytes,
+        embedded_bytes,
+        embedded_id,
+        proj_data: std::env::var("PROJ_DATA").ok(),
+        proj_lib: std::env::var("PROJ_LIB").ok(),
+        search_path,
     }
-    println!("search path  {search_path}");
-    Ok(())
 }
 
 /// PROJ's own release string and search path, straight from `proj_info()`.

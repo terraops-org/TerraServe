@@ -11,7 +11,7 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use terraserve::{backend::Resample, cache, pngio, render, reproj, style::Style};
 
 /// Render a COG window to PNG bytes.
@@ -71,6 +71,34 @@ fn render_png<'py>(
     Ok(PyBytes::new(py, &png))
 }
 
+/// Report the PROJ build and the `proj.db` actually in use, as a dict.
+///
+/// The wheel is built with PROJ statically linked and its database embedded, staged to a
+/// cache directory when this module is imported. When a transform fails there is otherwise
+/// no way to see which database answered: there is no CLI in a wheel, and PROJ's own error
+/// does not name the file. This is `terraserve info` for Python, and the first thing to ask
+/// a user to paste into a bug report.
+///
+/// Keys: `terraserve`, `proj`, `bundled`, `proj_db`, `proj_db_bytes`, `embedded_bytes`,
+/// `embedded_id`, `proj_data`, `proj_lib`, `search_path`. `proj_db` is `None` when PROJ
+/// found no database at all, which means every reprojection will fail.
+#[pyfunction]
+fn proj_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let s = terraserve::proj_status();
+    let d = PyDict::new(py);
+    d.set_item("terraserve", s.terraserve_version)?;
+    d.set_item("proj", s.proj_release)?;
+    d.set_item("bundled", s.bundled)?;
+    d.set_item("proj_db", s.database_path)?;
+    d.set_item("proj_db_bytes", s.database_bytes)?;
+    d.set_item("embedded_bytes", s.embedded_bytes)?;
+    d.set_item("embedded_id", s.embedded_id)?;
+    d.set_item("proj_data", s.proj_data)?;
+    d.set_item("proj_lib", s.proj_lib)?;
+    d.set_item("search_path", s.search_path)?;
+    Ok(d)
+}
+
 /// The compiled core module — imported as `terraserve._terraserve`, re-exported from
 /// the pure-Python `terraserve/__init__.py`.
 #[pymodule]
@@ -82,5 +110,6 @@ fn _terraserve(m: &Bound<'_, PyModule>) -> PyResult<()> {
     terraserve::ensure_proj_data();
 
     m.add_function(wrap_pyfunction!(render_png, m)?)?;
+    m.add_function(wrap_pyfunction!(proj_info, m)?)?;
     Ok(())
 }
