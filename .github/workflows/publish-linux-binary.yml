@@ -24,6 +24,12 @@ jobs:
     name: linux binary ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
+    defaults:
+      run:
+        # The manylinux container makes GitHub fall back to `sh -e`, not the usual
+        # `bash -eo pipefail`, so bash-isms (arrays, mapfile, process substitution) are
+        # syntax errors. Ask for bash explicitly; the image has it.
+        shell: bash
     strategy:
       fail-fast: false
       matrix:

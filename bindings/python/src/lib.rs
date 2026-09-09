@@ -45,9 +45,11 @@ fn render_png<'py>(
     };
     let src_crs = src_crs.unwrap_or_else(|| reproj::SRC_CRS.to_string());
 
-    // CPU-bound render off the GIL: nothing inside touches Python.
+    // CPU-bound render off the GIL: nothing inside touches Python. `detach` is what pyo3
+    // 0.25+ calls the old `allow_threads`, renamed for the free-threaded build where the
+    // operation is detaching the thread from the interpreter rather than dropping a lock.
     let png = py
-        .allow_threads(move || -> Result<Vec<u8>, String> {
+        .detach(move || -> Result<Vec<u8>, String> {
             let sty = Style::load(&style)?;
             let req = render::RenderRequest {
                 cog_path: &cog_path,
