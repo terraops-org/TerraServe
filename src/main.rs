@@ -44,6 +44,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Report the PROJ version and the proj.db actually in use, then exit. The only check
+    /// that proves reprojection can work: --version and --help never touch PROJ.
+    Info,
     /// Render a window of a COG to a PNG (the engine core).
     Render(terraserve::RenderArgs),
     /// Answer a one-shot WMS request (GetMap / GetCapabilities / exception) to stdout.
@@ -60,8 +63,14 @@ enum Cmd {
 }
 
 fn main() -> std::process::ExitCode {
+    // FIRST, before argument parsing and before any thread exists: a `bundled-proj` build
+    // has a statically linked PROJ whose data directory does not exist on this machine, so
+    // point it at the embedded copy. Compiles to nothing on a system-libproj build.
+    terraserve::ensure_proj_data();
+
     let cli = Cli::parse();
     let result = match cli.cmd {
+        Cmd::Info => terraserve::run_info(),
         Cmd::Render(args) => terraserve::run_render(&args),
         Cmd::WmsHandle(args) => terraserve::run_wms_handle(&args),
         Cmd::Serve(args) => terraserve::run_serve(&args),

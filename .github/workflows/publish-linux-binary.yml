@@ -1,0 +1,146 @@
+# Build a standalone Linux server binary and attach it to the GitHub release.
+#
+# Why this exists: before 0.3.0 the releases carried ONLY Python wheels, so anyone who wanted to
+# actually run the server had to pull a Docker image or build Rust + PROJ + bindgen from source.
+# This produces the artifact people reach for first: download, untar, `./terraserve serve`.
+#
+# Portability comes from the same recipe publish-wheels.yml uses — build inside the manylinux_2_28
+# image (AlmaLinux 8, glibc 2.28) and vendor PROJ via the crate's `bundled-proj` feature, so the
+# binary runs on ~every Linux since 2019 (Ubuntu 20.04+, Debian 11+, RHEL/Alma 8+) with no libproj
+# installed. SQLite is already vendored by rusqlite, and jemalloc is compiled in.
+#
+# x86_64 only for now. An aarch64 job is a near-copy with `runs-on: ubuntu-24.04-arm` and the
+# aarch64 manylinux image — worth adding once this one has proven itself.
+
+name: Publish Linux binary
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:      # lets you build and sanity-check the tarball without cutting a tag
+
+jobs:
+  build:
+    name: linux binary ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - uses: actions/checkout@v5
+
+      # The manylinux image is deliberately minimal. The vendored PROJ build needs cmake and
+      # sqlite; proj-sys' bindgen needs libclang (clang-devel puts libclang.so in /usr/lib64,
+      # which is where clang-sys looks by default).
+      - name: Install build dependencies
+        run: |
+          (command -v cmake || yum install -y cmake || dnf install -y cmake)
+          (yum install -y clang clang-devel sqlite-devel sqlite || \
+           dnf install -y clang clang-devel sqlite-devel sqlite)
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build (release, PROJ vendored)
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+          LIBCLANG_PATH: /usr/lib64
+        run: cargo build --release --features bundled-proj --bin terraserve
+
+      # A binary that cannot start is worse than no binary, and one that starts but cannot
+      # reproject is worse still, because it passes every cheap check. `--version` and
+      # `--help` never touch PROJ, so they proved nothing; the smoke test below renders a
+      # real reprojected tile and asserts on its pixels.
+      - name: Verify the binary is self-contained
+        run: |
+          echo "--- dynamic dependencies ---"
+          ldd ./target/release/terraserve || true
+          if ldd ./target/release/terraserve | grep -qi 'libproj'; then
+            echo "FAIL: binary links a system libproj; bundled-proj did not take effect"
+            exit 1
+          fi
+          echo "ok: no libproj dependency"
+
+      # The real test. Moving the build prefix aside first is what makes it honest: a
+      # statically linked PROJ is configured to look in the directory proj-sys staged during
+      # this very build, which exists on the runner and on no user's machine. With it gone,
+      # the only proj.db left is the one the binary carries inside itself.
+      - name: Smoke test - reproject, render, encode
+        run: |
+          # A fresh checkout builds proj-sys exactly once, so this glob must match one path.
+          # If it ever matches more, stop rather than hide the wrong one.
+          mapfile -t prefixes < <(ls -d target/release/build/proj-sys-*/out/share/proj)
+          if [ "${#prefixes[@]}" -ne 1 ]; then
+            printf 'FAIL: expected one proj data prefix, found %d:\n' "${#prefixes[@]}"
+            printf '  %s\n' "${prefixes[@]}"
+            exit 1
+          fi
+          PREFIX="${prefixes[0]}"
+          mv "$PREFIX" "$PREFIX.hidden"
+          set +e
+          tools/smoke_binary.sh ./target/release/terraserve
+          rc=$?
+          set -e
+          mv "$PREFIX.hidden" "$PREFIX"
+          exit $rc
+
+      - name: Package
+        id: pkg
+        run: |
+          VERSION="$(./target/release/terraserve --version | awk '{print $NF}')"
+          DIR="terraserve-${VERSION}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$DIR"
+          cp target/release/terraserve "dist/$DIR/"
+          cp LICENSE "dist/$DIR/"
+          cp README.md "dist/$DIR/"
+          cp THIRD-PARTY-NOTICES.md "dist/$DIR/"
+          # PROJ is MIT and its licence explicitly covers the data files, so the embedded
+          # proj.db is redistributable - but only WITH the notice. Ship the upstream text
+          # verbatim, plus the registry versions read out of the database we actually
+          # embedded, so the provenance travels with the binary instead of going stale in a
+          # document. See THIRD-PARTY-NOTICES.md.
+          mkdir -p "dist/$DIR/proj"
+          PROJ_OUT="$(ls -d target/release/build/proj-sys-*/out)"
+          cp "$PROJ_OUT/share/doc/proj/COPYING" "dist/$DIR/proj/COPYING"
+          sqlite3 "$PROJ_OUT/share/proj/proj.db" \
+            "SELECT key || ' = ' || value FROM metadata ORDER BY key" > "dist/$DIR/proj/VERSIONS.txt"
+          cat "dist/$DIR/proj/VERSIONS.txt"
+          tar -C dist -czf "dist/$DIR.tar.gz" "$DIR"
+          ( cd dist && sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256" )
+          ls -la dist/
+          echo "name=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-binary-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  release:
+    name: attach binary to release
+    needs: build
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write     # create the release and upload assets
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the binary to the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true

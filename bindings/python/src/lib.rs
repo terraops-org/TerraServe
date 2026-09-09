@@ -73,6 +73,12 @@ fn render_png<'py>(
 /// the pure-Python `terraserve/__init__.py`.
 #[pymodule]
 fn _terraserve(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // The wheel is built with `bundled-proj`, so it carries a statically linked PROJ whose
+    // compiled-in data directory does not exist on the user's machine. Stage the embedded
+    // proj.db and point PROJ at it before any transform is attempted. Module init is the
+    // wheel's equivalent of the binary's first line of main().
+    terraserve::ensure_proj_data();
+
     m.add_function(wrap_pyfunction!(render_png, m)?)?;
     Ok(())
 }

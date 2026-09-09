@@ -24,6 +24,7 @@ pub mod legend;
 pub mod mvt_http;
 pub mod pngio;
 pub mod pread;
+pub mod projdata;
 pub mod render;
 pub mod reproj;
 pub mod s3;
@@ -43,6 +44,10 @@ pub type Error = Box<dyn std::error::Error>;
 // The frozen crate-root contract: `main.rs` names these types and functions directly, and
 // `score.sh` drives the binary by the flags they define. Moving them into `cmd/` must not move
 // them out of the crate root.
+// Staging for the embedded PROJ database. A no-op unless `bundled-proj` is on; see
+// `projdata` for why it must run before the first PROJ context is built.
+pub use projdata::{ensure_proj_data, run_info};
+
 pub use cmd::extract::{run_extract, ExtractArgs};
 pub use cmd::pmtiles::{run_build_pmtiles, BuildPmtilesArgs};
 pub use cmd::render::{run_render, run_wms_handle, RenderArgs, WmsArgs};
