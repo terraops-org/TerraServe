@@ -17,6 +17,17 @@ To make it clear lets copy the best of OsGEO but only what we need for lean and 
 
 ## Get it running
 
+**Download** the standalone Linux binary from the
+[latest release](https://github.com/terraops-org/TerraServe/releases/latest): one file, no
+dependencies. PROJ and its 9.4 MB `proj.db` are compiled in, so it reprojects on a host with no
+`libproj` installed, and glibc 2.28 means it runs on Ubuntu 20.04+, Debian 11+ and RHEL/Alma 8+:
+
+```bash
+tar xzf terraserve-*-linux-x86_64.tar.gz && cd terraserve-*-linux-x86_64
+./terraserve info                       # PROJ build + the proj.db actually in use
+./terraserve serve --cog ortho.cog.tif --style rgb.json --port 8080
+```
+
 **Docker** build the image and serve a dataset. Point QGIS at `http://localhost:8080/wms`, or open the viewer at `http://localhost:8080/viewer`:
 
 ```bash
@@ -121,6 +132,10 @@ the German Gauss-Kruger zones - where guessing wrong yields empty tiles behind a
 ## CLI
 
 ```bash
+# what PROJ is this build using, and which proj.db is answering transforms?
+# The first thing to check when a reprojection fails, and to paste into a bug report.
+terraserve info
+
 # render a window of the Cascais orthophoto to a PNG (the engine core, no server).
 # --src-crs is the source projection (native EPSG:3763); the window reprojects into --crs.
 terraserve render --cog cascais.cog.deflate.tif --bbox -9.45,38.68,-9.38,38.72 \
