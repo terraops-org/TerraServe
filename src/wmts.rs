@@ -47,7 +47,10 @@ pub enum WmtsRequest {
 
 /// A GetTile failure carrying its OWS exception code. The KVP binding renders it as an
 /// `ows:ExceptionReport`; the RESTful binding uses `http` directly (bare status).
-#[derive(Debug)]
+///
+/// `Clone` so the raster tile cache's single-flight path can hand one render's failure to every
+/// request that was waiting on it (see `server::cached_or_render_png`).
+#[derive(Debug, Clone)]
 pub struct WmtsErr {
     pub http: u16,
     pub code: String,

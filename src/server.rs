@@ -778,6 +778,37 @@ fn tile_response(
 }
 
 /// A raster tile (TMS, WMTS): PNG bytes, never content-encoded.
+/// The cache key for one rendered raster tile. Prefixed per front-end so the WMTS and TMS
+/// namespaces cannot collide with each other or with `wms_handler`, which keys on a raw GetMap
+/// query string.
+fn raster_tile_key(front_end: &str, parts: &[&str]) -> String {
+    format!("{front_end}:{}", parts.join("/"))
+}
+
+/// Serve a rendered raster tile from the raster byte cache, rendering only on a miss.
+///
+/// Why this exists: `--wms-cache` used to be consulted ONLY by `wms_handler`, so every WMTS and
+/// TMS tile was re-rendered on every request, forever. Measured on the live cos2023 demo
+/// (842k features, no raster archive): 60 tiles took 9.4 s, and a SECOND pass over the same 60
+/// tiles against the same replica took 9.4 s again — no reuse whatsoever.
+///
+/// `try_get_with` is single-flight, matching `mvt_http::cached_or_encode`: a burst of requests
+/// for the same cold tile renders it ONCE and the rest wait for that result, instead of each
+/// paying the full render. An `Err` is never cached, so a transient failure cannot be pinned.
+fn cached_or_render_png<E: Clone + Send + Sync + 'static>(
+    state: &ServeState,
+    key: String,
+    render: impl FnOnce() -> Result<Vec<u8>, E>,
+) -> Result<Vec<u8>, E> {
+    match &state.wms_cache {
+        Some(cache) => cache
+            .try_get_with(key, || render().map(Arc::new))
+            .map(|a| (*a).clone())
+            .map_err(|e| (*e).clone()),
+        None => render(),
+    }
+}
+
 fn png_response(png: Vec<u8>, req: &axum::http::HeaderMap, max_age: u32) -> Response {
     tile_response(png, "image/png", false, false, req, max_age)
 }
@@ -865,11 +896,21 @@ async fn tms_tile_handler(
         Ok(v) => v,
         Err(_) => return status_response(400, format!("bad tile y '{yfile}'")),
     };
+    // Cache lookup before the permit: see `cached_or_render_png`.
+    let key = raster_tile_key(
+        "tms",
+        &[&layerspec, &z.to_string(), &x.to_string(), &y.to_string()],
+    );
+    if let Some(hit) = state.wms_cache.as_ref().and_then(|c| c.get(&key)) {
+        return png_response((*hit).to_vec(), &headers, state.tile_max_age);
+    }
     let _permit = state.render_limiter.acquire().await; // admission control (bounded concurrent renders)
     let st = state.clone();
     // Render on a blocking worker — never on the async reactor.
     let result = tokio::task::spawn_blocking(move || {
-        crate::tms_http::render_tms_tile(&st, &layerspec, z, x, y)
+        cached_or_render_png(&st, key, || {
+            crate::tms_http::render_tms_tile(&st, &layerspec, z, x, y)
+        })
     })
     .await;
     match result {
@@ -1128,8 +1169,23 @@ async fn wmts_kvp_handler(
                     Err(_) => status_response(500, "tile render task panicked".into()),
                 };
             }
+            // Same key space as the RESTful binding above: the two bindings are one service, so
+            // a tile fetched either way warms the other.
+            let key = raster_tile_key(
+                "wmts",
+                &[
+                    &layer,
+                    &style,
+                    &tms,
+                    &z.to_string(),
+                    &row.to_string(),
+                    &col.to_string(),
+                ],
+            );
             let result = tokio::task::spawn_blocking(move || {
-                crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
+                cached_or_render_png(&st, key, || {
+                    crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
+                })
             })
             .await;
             match result {
@@ -1212,10 +1268,29 @@ async fn wmts_rest_tile_handler(
         Ok(v) => v,
         Err(_) => return status_response(400, format!("bad tile col '{colfile}'")),
     };
+    // Check the cache BEFORE taking a render permit. A hit costs no permit and no blocking
+    // worker, so warm tiles are served even while every render slot is busy — which is exactly
+    // the case that used to make a demo feel slow.
+    let key = raster_tile_key(
+        "wmts",
+        &[
+            &layer,
+            &style,
+            &tms,
+            &z.to_string(),
+            &row.to_string(),
+            &col.to_string(),
+        ],
+    );
+    if let Some(hit) = state.wms_cache.as_ref().and_then(|c| c.get(&key)) {
+        return png_response((*hit).to_vec(), &headers, state.tile_max_age);
+    }
     let _permit = state.render_limiter.acquire().await; // admission control
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
+        cached_or_render_png(&st, key, || {
+            crate::wmts::get_tile(&st, &layer, &style, &tms, z, row, col)
+        })
     })
     .await;
     match result {
@@ -1622,5 +1697,90 @@ mod inline_json_tests {
             0,
         );
         assert_eq!(cross.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod raster_tile_cache_tests {
+    use super::{cached_or_render_png, raster_tile_key, ServeState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn state(cache_mib: u64) -> ServeState {
+        let mut st = ServeState::new(vec![], "http://x/wms".into(), 1);
+        if cache_mib > 0 {
+            st.wms_cache = Some(crate::mvt_http::build_byte_cache(cache_mib));
+        }
+        st
+    }
+
+    /// The regression this whole thing exists for: before 2026-09-10 the raster byte cache was
+    /// consulted ONLY by `wms_handler`, so every WMTS/TMS tile re-rendered on every request. A
+    /// second request for the same tile must not call the renderer again.
+    #[test]
+    fn a_repeated_tile_renders_once() {
+        let st = state(16);
+        let calls = AtomicUsize::new(0);
+        let key = raster_tile_key("wmts", &["l", "default", "g", "3", "4", "5"]);
+        let render = || -> Result<Vec<u8>, (u16, String)> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0x89, b'P', b'N', b'G', 1, 2, 3])
+        };
+        let a = cached_or_render_png(&st, key.clone(), render).unwrap();
+        let b = cached_or_render_png(&st, key, render).unwrap();
+        assert_eq!(a, b, "cached bytes must match the rendered bytes");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the tile was rendered twice"
+        );
+    }
+
+    /// With the cache off (`--wms-cache 0`) nothing is retained: the old behaviour, still
+    /// available, and the path a memory-constrained deployment takes.
+    #[test]
+    fn cache_disabled_renders_every_time() {
+        let st = state(0);
+        let calls = AtomicUsize::new(0);
+        let key = raster_tile_key("tms", &["l", "3", "4", "5"]);
+        let render = || -> Result<Vec<u8>, (u16, String)> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![1])
+        };
+        cached_or_render_png(&st, key.clone(), render).unwrap();
+        cached_or_render_png(&st, key, render).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A failure must NOT be cached, or one transient error would be pinned for the life of the
+    /// process and served to everyone.
+    #[test]
+    fn errors_are_not_cached() {
+        let st = state(16);
+        let calls = AtomicUsize::new(0);
+        let key = raster_tile_key("wmts", &["l", "default", "g", "0", "0", "0"]);
+        let failing = || -> Result<Vec<u8>, (u16, String)> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err((500, "boom".into()))
+        };
+        assert!(cached_or_render_png(&st, key.clone(), failing).is_err());
+        assert!(cached_or_render_png(&st, key.clone(), failing).is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "an error was cached");
+        // and the key is still usable once the underlying cause clears
+        let ok = cached_or_render_png(&st, key, || -> Result<Vec<u8>, (u16, String)> {
+            Ok(vec![7u8])
+        })
+        .unwrap();
+        assert_eq!(ok, vec![7u8]);
+    }
+
+    /// The front-end prefix keeps WMTS and TMS from colliding: both address tiles by three
+    /// numbers, and TMS flips y, so a shared key space would serve one front-end's tile to the
+    /// other at the mirrored row.
+    #[test]
+    fn front_ends_do_not_share_a_key_space() {
+        assert_ne!(
+            raster_tile_key("wmts", &["l", "3", "4", "5"]),
+            raster_tile_key("tms", &["l", "3", "4", "5"])
+        );
     }
 }

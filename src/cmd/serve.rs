@@ -279,9 +279,17 @@ pub struct ServeArgs {
     /// by the `/mvt` + WMTS routes.
     #[arg(long, default_value_t = 256)]
     pub mvt_cache: u64,
-    /// Bounded cache of rendered WMS GetMap PNG bytes — max **N MiB** (`0` = off). Renders each
-    /// GetMap once (keyed by its query) and reuses it — the mitigation for a costly vector render
-    /// (e.g. the X-ray raster underlay); revisited tiles become instant. Byte-weighted → RSS bounded.
+    /// Bounded cache of rendered RASTER bytes — max **N MiB** (`0` = off). Byte-weighted → RSS
+    /// bounded. Covers WMS GetMap (keyed by its query) AND, since 2026-09-10, the WMTS and TMS
+    /// tile routes (keyed by front-end + layer/style/grid/z/row/col). The mitigation for a costly
+    /// vector render such as the X-ray raster underlay; revisited tiles become instant.
+    ///
+    /// ⚠ It used to be consulted ONLY by the WMS handler, so a layer with no raster archive
+    /// re-rendered every WMTS tile on every request forever. Measured on the live cos2023 demo:
+    /// 60 tiles in 9.4 s, and a second pass over the SAME tiles on the SAME replica also 9.4 s.
+    /// The tile routes now check the cache BEFORE taking a render permit, so a warm tile is
+    /// served even when every render slot is busy, and use single-flight so a burst on one cold
+    /// tile renders it once.
     #[arg(long, default_value_t = 256)]
     pub wms_cache: u64,
     /// `Cache-Control: public, max-age=N` seconds on every tile response (TMS, WMTS, `/mvt`).
