@@ -42,6 +42,32 @@ fn resolve_vector<'a>(
 /// handling below, per R3). Falls back to the MVT tile-grid preset at the encoder's 4096-unit local
 /// extent (an explicit `_{px}` size suffix in the id still overrides, per `tms::preset`'s R3 rule)
 /// for the 4 built-ins. `Err((404,_))` when neither resolves.
+/// The per-grid archive (or write-through overlay) that answers a request, found the way the
+/// grid itself was: by the id as requested, then the PUBLISHED grid it resolved to, then that
+/// grid's base name with any `_{px}` size suffix stripped.
+///
+/// Why all three: an MVT archive files itself under the grid id stamped at bake time, which for
+/// the defaults (`build-pmtiles --grid WebMercatorQuad`) is the bare `WebMercatorQuad`. A layer
+/// served at the default `--tms-tile-px 512` PUBLISHES `WebMercatorQuad_512`, and that is the id
+/// the X-ray viewer asks for. Looking the archive up by the raw requested id meant a request for
+/// `WebMercatorQuad` hit the archive while the viewer's `WebMercatorQuad_512` missed it and was
+/// rendered live, every time. Found on the live cos2023 demo 2026-09-11: the same z7 tile was 983 KB
+/// in 0.35 s by one name and 42 MB in 17 s by the other. The raster loader already resolved its
+/// archives this way (`layer/mod.rs`, `strip_size_suffix`); MVT now matches it.
+///
+/// Stripping only a NUMERIC suffix keeps distinct grids apart: `WorldCRS84Quad` can never resolve to
+/// `WebMercatorQuad`, and every `_{px}` variant of one grid shares its tile extents, which is what
+/// makes serving an MVT tile (pixel-size independent) from the base grid's archive correct.
+fn for_grid<'a, V>(
+    map: &'a std::collections::BTreeMap<String, V>,
+    requested: &str,
+    grid: &TileMatrixSet,
+) -> Option<&'a V> {
+    map.get(requested)
+        .or_else(|| map.get(grid.id.as_str()))
+        .or_else(|| map.get(crate::tms::strip_size_suffix(&grid.id)))
+}
+
 fn resolve_grid(layer: &Layer, tms_id: &str) -> Result<TileMatrixSet, (u16, String)> {
     if let Some(g) = layer
         .grids
@@ -123,7 +149,7 @@ pub fn render_mvt_tile(
     // `zxy_to_tileid`. When no overlay is registered for this grid, the Spec-1 base check below runs
     // unchanged. Supersedes Spec-1 `l.pmtiles.get(tms_id)` when present (the loader populates at most
     // one of the two for a given grid, but the overlay path is checked first regardless).
-    if let Some(ov) = l.overlay.get(tms_id) {
+    if let Some(ov) = for_grid(&l.overlay, tms_id, &grid) {
         // Read the STORED blob (plus how it was stored) rather than an inflated copy, so a
         // gzip-capable client can be handed it verbatim. `get_raw` reports the compression of
         // whichever source answered -- the overlay log is always gzip, the base archive may not be.
@@ -142,11 +168,24 @@ pub fn render_mvt_tile(
         let batch =
             features_for_tile(&vs, &grid, z, x, y, &l.src_crs, &opts).map_err(read_failed)?;
         let live = encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts);
-        if !live.is_empty() && !ov.is_compacting() {
-            let id = crate::vector::pmtiles::zxy_to_tileid(z, x, y);
-            let _ = ov.put(id, &crate::vector::pmtiles::codec::gzip(&live)); // best-effort
+        if live.is_empty() {
+            return Ok(TileBody::identity(live));
         }
-        return Ok(TileBody::identity(live));
+        // One gzip serves both purposes: the overlay stores gzip anyway, and a gzip-capable
+        // client can have the same bytes.
+        let gz = crate::vector::pmtiles::codec::gzip(&live);
+        if !ov.is_compacting() {
+            let id = crate::vector::pmtiles::zxy_to_tileid(z, x, y);
+            let _ = ov.put(id, &gz); // best-effort
+        }
+        return Ok(if accept_gzip {
+            TileBody {
+                bytes: gz,
+                gzip: true,
+            }
+        } else {
+            TileBody::identity(live)
+        });
     }
     // Archive-first (opt-in): a hit is served straight from the pre-built PMTiles archive for the
     // REQUESTED grid (`tms_id`); a miss (or no archive registered for this grid) falls through to the
@@ -154,7 +193,7 @@ pub fn render_mvt_tile(
     // path. Selecting by `tms_id` rather than "the" archive is what makes per-grid PMTiles work: a
     // layer with e.g. a WebMercatorQuad archive AND a swissLV95 archive serves each grid from its own
     // file (design commitment 1: never mixed in one archive).
-    if let Some(reader) = l.pmtiles.get(tms_id) {
+    if let Some(reader) = for_grid(&l.pmtiles, tms_id, &grid) {
         // Same pass-through as the overlay branch: the archive already holds gzip, so an inflate
         // here would only be undone by the wire. `tile_compression()` is the archive's own header,
         // so a `COMPRESSION_NONE` archive still serves identity correctly.
@@ -178,17 +217,38 @@ pub fn render_mvt_tile(
     // correct — a harmless no-op for `LoadAll` (encode_tile_opt still runs its own candidate filter
     // over whatever slice it's handed).
     let batch = features_for_tile(&vs, &grid, z, x, y, &l.src_crs, &opts).map_err(read_failed)?;
-    // The live encoder never compresses, and the MVT byte cache holds those identity bytes -- so
-    // this path is unchanged by gzip pass-through, and the cache can never mix the two encodings.
-    Ok(TileBody::identity(cached_or_encode(
-        state,
-        &l.name,
-        tms_id,
-        z,
-        x,
-        y,
-        || encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts),
-    )))
+    // A live tile is gzip'd once and CACHED gzip'd, which is both the smaller cache entry and the
+    // encoding almost every caller wants: an archive hit has always passed its stored gzip through,
+    // while anything encoded here used to go out raw even to a client asking for gzip (a vida z12
+    // tile: 1,028,450 B raw against 466,228 B gzip'd). Compressing before the cache means a warm
+    // tile is never re-compressed; a client that does not offer gzip is served an inflate of the
+    // same bytes, so both representations come from one cache entry and cannot disagree.
+    //
+    // Level: the flate2 default (6). On a real 246 KB vida tile that is 7.9 ms against 3.2 ms at
+    // level 1 for 6.5% more bytes, and the encode that produced the tile costs far more than
+    // either, so the bytes are worth more than the milliseconds here.
+    let gz = cached_or_encode(state, &l.name, tms_id, z, x, y, || {
+        let live = encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts);
+        // An empty tile stays an empty body: a valid, cheap 200 that says "nothing here", rather
+        // than the 20-byte gzip envelope of nothing.
+        if live.is_empty() {
+            live
+        } else {
+            crate::vector::pmtiles::codec::gzip(&live)
+        }
+    });
+    if gz.is_empty() {
+        return Ok(TileBody::identity(gz));
+    }
+    if accept_gzip {
+        return Ok(TileBody {
+            bytes: gz,
+            gzip: true,
+        });
+    }
+    crate::vector::pmtiles::codec::gunzip(&gz)
+        .map(TileBody::identity)
+        .map_err(|e| (500u16, format!("mvt gunzip: {e}")))
 }
 
 /// A failed source READ is a 500, never an empty tile. Encoding whatever came back from a broken
@@ -211,6 +271,8 @@ pub fn build_byte_cache(max_mib: u64) -> moka::sync::Cache<String, std::sync::Ar
 }
 
 /// Serve `encode()`'s bytes via the MVT cache when enabled — computed once per `layer/tms/z/x/y`
+/// (as of 0.3.2 the live path stores GZIP'd bytes here, so a warm tile is never re-compressed and
+/// the cache holds roughly three times as many tiles per MiB)
 /// (the encode is a pure function of that key + the fixed-per-run opts), with `get_with`
 /// single-flight so a cold (e.g. dissolved low-zoom) tile isn't recomputed N times under a burst.
 /// Shared by the `/mvt` XYZ + WMTS GetTile routes.
@@ -1198,6 +1260,139 @@ mod tests {
         );
     }
 
+    /// 0.3.2: a LIVE-encoded tile must go out gzip'd when the client accepts it.
+    ///
+    /// Until now only an archive hit passed its stored gzip through; anything the engine encoded
+    /// on the spot went out as raw identity bytes even to a browser that asked for gzip. Measured
+    /// on the live demos, a vida z12 tile is 1,028,450 B raw and 466,228 B gzip'd, and every tile
+    /// above an archive's max zoom pays that. The traefik `tiles-compress` middleware is the
+    /// stopgap this test exists to retire.
+    ///
+    /// The three properties that matter: the gzip response inflates to EXACTLY the identity bytes
+    /// (same map, not a cheaper one), a client that does not offer gzip still gets identity, and
+    /// the byte cache cannot mix the two encodings whichever order the requests arrive in.
+    #[test]
+    fn a_live_encoded_tile_is_gzipped_when_the_client_accepts_it() {
+        let st = live_only_state(Some(64));
+        let plain = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0, false)
+            .expect("z0/1/0 renders");
+        assert!(
+            !plain.gzip,
+            "a client that did not offer gzip gets identity"
+        );
+        assert!(
+            !plain.bytes.is_empty(),
+            "the fixture tile must carry features"
+        );
+
+        let zipped = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0, true)
+            .expect("z0/1/0 renders");
+        assert!(
+            zipped.gzip,
+            "a gzip-capable client must get Content-Encoding: gzip"
+        );
+        assert_eq!(
+            crate::vector::pmtiles::codec::gunzip(&zipped.bytes).expect("valid gzip"),
+            plain.bytes,
+            "the gzip body must inflate to exactly the identity bytes"
+        );
+        // No size assertion here: this fixture tile is a few dozen bytes, and gzip's header
+        // costs more than it saves at that size. The win is on real tiles, where it is 2.2x
+        // (vida z12: 1,028,450 B raw against 466,228 B), and it is measured on the live demos
+        // rather than asserted on a toy.
+
+        // The cache was warmed by the identity request above. Warm it the other way round too:
+        // a cache that stored one encoding and handed it out under the other flag would serve
+        // gzip bytes labelled identity, which is a 200 the client cannot decode.
+        let st2 = live_only_state(Some(64));
+        let zipped_first = super::render_mvt_tile(&st2, "mini", "WorldCRS84Quad", 0, 1, 0, true)
+            .expect("z0/1/0 renders");
+        let plain_after = super::render_mvt_tile(&st2, "mini", "WorldCRS84Quad", 0, 1, 0, false)
+            .expect("z0/1/0 renders");
+        assert!(
+            zipped_first.gzip && !plain_after.gzip,
+            "each request gets its own encoding"
+        );
+        assert_eq!(
+            plain_after.bytes, plain.bytes,
+            "identity after a gzip hit is unchanged"
+        );
+        assert_eq!(
+            crate::vector::pmtiles::codec::gunzip(&zipped_first.bytes).unwrap(),
+            plain.bytes,
+            "gzip from a cold cache inflates to the same bytes"
+        );
+
+        // And with no cache at all, both encodings still come out right.
+        let nc = live_only_state(None);
+        let a = super::render_mvt_tile(&nc, "mini", "WorldCRS84Quad", 0, 1, 0, true).unwrap();
+        let b = super::render_mvt_tile(&nc, "mini", "WorldCRS84Quad", 0, 1, 0, false).unwrap();
+        assert!(a.gzip && !b.gzip);
+        assert_eq!(
+            crate::vector::pmtiles::codec::gunzip(&a.bytes).unwrap(),
+            b.bytes
+        );
+    }
+
+    /// One tiny vector layer on `WorldCRS84Quad`, no archive and no overlay, so every request
+    /// takes the LIVE encode path. `cache_mib` mirrors `--mvt-cache`.
+    fn live_only_state(cache_mib: Option<u64>) -> crate::server::ServeState {
+        use crate::server::{Layer, ServeState, VectorLayer};
+        use crate::vector::geojson::GeoJsonSource;
+        use crate::vector::shape::Shaper;
+        use crate::vector::source::{FeatureSource, VectorSource};
+        use std::sync::Arc;
+
+        let geojson = r#"{
+          "type": "FeatureCollection",
+          "features": [
+            { "type": "Feature", "properties": { "name": "one" },
+              "geometry": { "type": "Polygon", "coordinates": [[
+                [8.15, 46.75], [8.25, 46.75], [8.25, 46.85], [8.15, 46.85], [8.15, 46.75]]] } },
+            { "type": "Feature", "properties": { "name": "two" },
+              "geometry": { "type": "Polygon", "coordinates": [[
+                [9.15, 45.75], [9.45, 45.75], [9.45, 46.05], [9.15, 46.05], [9.15, 45.75]]] } }
+          ]
+        }"#;
+        let src = Arc::new(GeoJsonSource::from_str(geojson).unwrap());
+        let style = Style::load("fixtures/styles/airports.vec.json").unwrap();
+        let font = std::fs::read("fixtures/fonts/DejaVuSans.ttf").unwrap();
+        let shaper = Arc::new(Shaper::from_font_bytes(&font).unwrap());
+        let ext = src.full_extent();
+        let layer = Layer {
+            name: "mini".into(),
+            cog_path: String::new(),
+            cog: None,
+            source: None,
+            style: None,
+            src_crs: "EPSG:4326".into(),
+            band_math: None,
+            bounds_wgs84: ext,
+            tile_cache: None,
+            index_cache: crate::cache::new_index_cache(crate::cache::index_cache_bytes()),
+            grids: vec![crate::server::PublishedGrid {
+                tms: crate::tms::TileMatrixSet::world_crs84_quad(256),
+                data_bounds: None,
+            }],
+            vector: Some(VectorLayer {
+                fields: super::feature_field_schema(src.as_ref()),
+                area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                min_feature_px: 0.0,
+                source: VectorSource::LoadAll(src),
+                style,
+                shaper,
+                lod: None,
+                zoom_sources: Vec::new(),
+            }),
+            pmtiles: std::collections::BTreeMap::new(),
+            raster_pmtiles: std::collections::BTreeMap::new(),
+            overlay: std::collections::BTreeMap::new(),
+        };
+        let mut st = ServeState::new(vec![layer], "http://h/wms".into(), 16);
+        st.mvt_cache = cache_mib.map(super::build_byte_cache);
+        st
+    }
+
     /// Task 3: `Layer.pmtiles` is a `BTreeMap<grid_id, Arc<PmtilesReader>>`, and `render_mvt_tile`
     /// must select the entry matching the REQUESTED grid (`tms_id`), not just "the" archive (Spec 1's
     /// old `Option<Arc<PmtilesReader>>` shape). Builds two tiny, REAL `.pmtiles` archives (the same
@@ -1315,6 +1510,26 @@ mod tests {
         assert_eq!(got_a, b"MERCATOR_TILE");
         assert_eq!(got_b, b"CRS84_TILE");
         assert_ne!(got_a, got_b);
+
+        // The size-suffixed variant of a grid must be answered by the archive baked on its base
+        // name. This is the live cos2023 bug of 2026-09-11: the archive was baked on the default
+        // `WebMercatorQuad`, the layer is served at the default 512 px so it PUBLISHES
+        // `WebMercatorQuad_512`, and the X-ray viewer requests that id. The lookup used the raw
+        // requested id, so every viewer request missed the archive and was encoded live (a z7
+        // tile: 42 MB in 17 s instead of 983 KB in 0.35 s). A live encode here would return real
+        // MVT bytes built from the fixture, never the literal marker, so this separates the two.
+        let got_a512 = super::render_mvt_tile(&st, "mini", "WebMercatorQuad_512", 0, 0, 0, false)
+            .unwrap()
+            .bytes;
+        assert_eq!(
+            got_a512, b"MERCATOR_TILE",
+            "WebMercatorQuad_512 must be served from the WebMercatorQuad archive, not encoded live"
+        );
+        // ...and stripping a size suffix must never cross into a different grid's archive.
+        let got_b512 = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad_512", 0, 0, 0, false)
+            .unwrap()
+            .bytes;
+        assert_eq!(got_b512, b"CRS84_TILE");
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -1535,12 +1750,28 @@ mod tests {
         );
         assert_eq!(raw.bytes, payload);
 
-        // --- an archive MISS falls through to the live encoder, which never compresses ---
+        // --- an archive MISS falls through to the live encoder, which gzips too since 0.3.2 ---
         let miss = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 1, 0, 0, true).unwrap();
+        let miss_plain =
+            super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 1, 0, 0, false).unwrap();
         assert!(
-            !miss.gzip,
-            "a live-encoded tile is not gzip'd, whatever the client offered"
+            !miss_plain.gzip,
+            "a client that did not offer gzip gets identity"
         );
+        if !miss_plain.bytes.is_empty() {
+            assert!(
+                miss.gzip,
+                "since 0.3.2 a live-encoded tile is gzip'd for a client that accepts it"
+            );
+            assert_eq!(
+                gunzip(&miss.bytes).unwrap(),
+                miss_plain.bytes,
+                "the two encodings of a live tile must be the same tile"
+            );
+        } else {
+            // An empty tile stays an empty body in both encodings.
+            assert!(!miss.gzip && miss.bytes.is_empty());
+        }
 
         std::fs::remove_dir_all(&tmp).ok();
     }
