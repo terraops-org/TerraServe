@@ -7,8 +7,10 @@
 //! (deduplicated, near-zero-cost) entry too -- see the note on the `mvt.is_empty()` check below for
 //! why omitting them is a production outage, not a size optimization.
 
+use super::encoding::{Effort, TileEncoding};
+use super::write::TILE_TYPE_MVT;
 use super::write::{Counts, HeaderFields, PmtilesWriter};
-use super::{codec::gzip, zxy_to_tileid, PmResult};
+use super::{zxy_to_tileid, PmResult};
 use crate::reproj;
 use crate::server::Layer;
 use crate::tms::TileMatrixSet;
@@ -34,6 +36,39 @@ pub fn build_pmtiles(
     out_path: &Path,
     tmp_dir: &Path,
 ) -> PmResult<Counts> {
+    build_pmtiles_with(
+        layer,
+        opts,
+        grid,
+        min_zoom,
+        max_zoom,
+        bbox_wgs84,
+        out_path,
+        tmp_dir,
+        TileEncoding::Gzip,
+        None,
+    )
+}
+
+/// `build_pmtiles` with the tile encoding chosen (`build-pmtiles --tile-compression`). The header's
+/// `tile_compression` byte is set from the same value the tiles are compressed with, so the two
+/// cannot disagree. `level` overrides the archive default (gzip 6, brotli 11, zstd 19).
+#[allow(clippy::too_many_arguments)]
+pub fn build_pmtiles_with(
+    layer: &Layer,
+    opts: &MvtOptimizations,
+    grid: &TileMatrixSet,
+    min_zoom: u8,
+    max_zoom: u8,
+    bbox_wgs84: [f64; 4],
+    out_path: &Path,
+    tmp_dir: &Path,
+    encoding: TileEncoding,
+    level: Option<i32>,
+) -> PmResult<Counts> {
+    if encoding == TileEncoding::Identity {
+        return Err("build-pmtiles: an MVT archive must be compressed (gzip, br or zstd)".into());
+    }
     let v = layer
         .vector
         .as_ref()
@@ -50,7 +85,7 @@ pub fn build_pmtiles(
         bbox_wgs84[3],
     )
     .ok_or_else(|| format!("build_pmtiles: cannot reproject bounds to {}", grid.crs))?;
-    let mut w = PmtilesWriter::new(tmp_dir)?;
+    let mut w = PmtilesWriter::new(tmp_dir)?.tile_format(TILE_TYPE_MVT, encoding.to_pmtiles());
     for z in (min_zoom as u32)..=(max_zoom as u32) {
         let Some((c0, c1, r0, r1)) = grid.tile_limits(bbox_grid, z) else {
             continue;
@@ -106,12 +141,17 @@ pub fn build_pmtiles(
                             opts,
                         ))
                     });
-                    (id, mvt)
+                    // Compress HERE, on the rayon worker: at zstd 19 a heavy tile costs ~0.2 s and
+                    // the writer loop below is sequential.
+                    (
+                        id,
+                        mvt.map(|m| encoding.compress(&m, Effort::Archive, level)),
+                    )
                 })
                 .collect();
             for (id, mvt) in rendered {
-                let mvt = mvt?;
-                // Write an entry EVEN when `mvt` is empty. `(x,y)` only reaches this loop because
+                let blob = mvt?;
+                // Write an entry EVEN when the tile is empty. `(x,y)` only reaches this loop because
                 // `grid.tile_limits` already put it inside the layer's real bbox -- omitting the
                 // entry does not shrink the archive's claimed coverage, it just makes this one tile
                 // MISSING inside a range the archive otherwise promises to cover. A missing tile and
@@ -124,7 +164,7 @@ pub fn build_pmtiles(
                 // of writing them all: `PmtilesWriter::add` dedups by content hash, so every empty
                 // tile at a zoom collapses to ONE stored (tiny, gzip-of-nothing) blob, and RLE
                 // collapses their directory entries into one run when they're id-adjacent.
-                w.add(id, gzip(&mvt))?;
+                w.add(id, blob)?;
             }
         }
     }

@@ -122,6 +122,20 @@ pub fn min_area_src_for_grid(
     area_scale: f64,
     min_feature_px: f64,
 ) -> f64 {
+    min_area_src_for_grid_extent(tms, z, src_crs, area_scale, min_feature_px, EXTENT)
+}
+
+/// [`min_area_src_for_grid`] for a tile encoded at `extent` units instead of the standard 4096
+/// (`--mvt-fine-extent-zoom`, see `MvtOptimizations::extent_at`). Only the always-on one-cell
+/// floor depends on it: a finer grid has smaller cells, so smaller features survive.
+pub fn min_area_src_for_grid_extent(
+    tms: &TileMatrixSet,
+    z: u32,
+    src_crs: &str,
+    area_scale: f64,
+    min_feature_px: f64,
+    extent: u32,
+) -> f64 {
     let Some(lvl) = tms.level(z) else {
         return 0.0; // out of the grid: gate off rather than guess
     };
@@ -157,7 +171,7 @@ pub fn min_area_src_for_grid(
     // `WebMercatorQuad_512`): it would divide by 256 (16²) when the true divisor on a 512-px tile
     // is 64 (8²), making the floor 4x too lenient there. A per-zoom constant like the configured
     // gate either way, so still seam-free by the same argument as the rest of this function.
-    let cells_per_px = EXTENT as f64 / tms.tile_w as f64;
+    let cells_per_px = extent as f64 / tms.tile_w as f64;
     let cell_floor_src = one_px_area_src / cells_per_px.powi(2);
 
     if min_feature_px <= 0.0 {
@@ -189,6 +203,19 @@ pub fn min_len_src_for_grid(
     area_scale: f64,
     len_px: f64,
 ) -> f64 {
+    min_len_src_for_grid_extent(tms, z, src_crs, area_scale, len_px, EXTENT)
+}
+
+/// [`min_len_src_for_grid`] for a tile encoded at `extent` units; the mirror of
+/// [`min_area_src_for_grid_extent`].
+pub fn min_len_src_for_grid_extent(
+    tms: &TileMatrixSet,
+    z: u32,
+    src_crs: &str,
+    area_scale: f64,
+    len_px: f64,
+    extent: u32,
+) -> f64 {
     let Some(lvl) = tms.level(z) else {
         return 0.0; // out of the grid: gate off rather than guess
     };
@@ -202,7 +229,7 @@ pub fn min_len_src_for_grid(
     } else {
         return 0.0; // fail OPEN, as the area path does
     };
-    let cell_floor_src = one_px_len_src / (EXTENT as f64 / tms.tile_w as f64);
+    let cell_floor_src = one_px_len_src / (extent as f64 / tms.tile_w as f64);
     if len_px <= 0.0 {
         return cell_floor_src;
     }
@@ -493,24 +520,6 @@ pub fn encode_tile_opt(
     // routes produce identical bytes from a single derivation site. `max_features`/`dedup` come
     // straight off the opts. (Cell-mosaic wiring lands in Task B6.)
     let max_features = opts.max_features;
-    // Banded via `min_feature_px_at`: outside the configured zoom band this passes `0.0` and
-    // `min_area_src_for_grid` returns its always-on cell floor, exactly as an unset gate does.
-    let min_area_src =
-        min_area_src_for_grid(tms, z, src_crs, opts.area_scale, opts.min_feature_px_at(z));
-    let min_len_src = min_len_src_for_grid(
-        tms,
-        z,
-        src_crs,
-        opts.area_scale,
-        opts.min_feature_len_px_at(z),
-    );
-    let Some(bbox) = tms.tile_bounds(z, x, y) else {
-        return Vec::new();
-    };
-    let tile_crs = tms.crs.as_str();
-    let Ok(proj) = Projector::new(src_crs, tile_crs, bbox, EXTENT, EXTENT) else {
-        return Vec::new();
-    };
 
     // Stage B (cell mosaic) active for THIS tile? When active, POLYGONS are replaced by the
     // dominant-class mosaic (which votes on the RAW candidate set — the size gate below is skipped so
@@ -520,11 +529,48 @@ pub fn encode_tile_opt(
     // `for_layer`); it also votes on the raw candidate set (size gate skipped below).
     let dissolve_active = is_dissolve_active(opts, z);
 
+    // The tile's coordinate grid: 4096, or finer below `--mvt-fine-extent-zoom`. The mosaic and
+    // the dissolve work in tile-4096 units (cell sizes, their own projector), so a tile they
+    // replace keeps 4096.
+    let extent = if mosaic_active || dissolve_active {
+        EXTENT
+    } else {
+        opts.extent_at(z)
+    };
+
+    // Banded via `min_feature_px_at`: outside the configured zoom band this passes `0.0` and
+    // `min_area_src_for_grid` returns its always-on cell floor, exactly as an unset gate does.
+    let min_area_src = min_area_src_for_grid_extent(
+        tms,
+        z,
+        src_crs,
+        opts.area_scale,
+        opts.min_feature_px_at(z),
+        extent,
+    );
+    let min_len_src = min_len_src_for_grid_extent(
+        tms,
+        z,
+        src_crs,
+        opts.area_scale,
+        opts.min_feature_len_px_at(z),
+        extent,
+    );
+    let Some(bbox) = tms.tile_bounds(z, x, y) else {
+        return Vec::new();
+    };
+    let tile_crs = tms.crs.as_str();
+    let Ok(proj) = Projector::new(src_crs, tile_crs, bbox, extent, extent) else {
+        return Vec::new();
+    };
+
     if features.is_empty() {
         return Vec::new();
     }
 
-    let rect: [f64; 4] = [-BUF, -BUF, EXTENT as f64 + BUF, EXTENT as f64 + BUF];
+    // The conventional 1/16 overscan, scaled with the grid (`BUF` at the standard 4096).
+    let buf = extent as f64 / 16.0;
+    let rect: [f64; 4] = [-buf, -buf, extent as f64 + buf, extent as f64 + buf];
 
     // The tile's footprint in the SOURCE CRS (for the cheap pre-filter): reproject the tile bbox
     // (tile CRS) back to the source CRS — densified along the edges by `crs_bounds` — then expand
@@ -712,7 +758,7 @@ pub fn encode_tile_opt(
         }
         layer_w.field_bytes(4, &val_w.into_bytes());
     }
-    layer_w.field_varint(5, EXTENT as u64);
+    layer_w.field_varint(5, extent as u64);
 
     // Tile { layers=3* }.
     let mut tile_w = PbfWriter::new();
@@ -1125,6 +1171,62 @@ mod tests {
         assert!(
             encode_tile_opt(src.features(), &grid, 6, 32, 24, "EPSG:3857", "t", &opts).is_empty(),
             "z6 is inside the band: the configured gate applies and this feature is under it"
+        );
+    }
+
+    /// `--mvt-fine-extent-zoom`, at the encoder: a 200 m building is smaller than one 4096-unit
+    /// cell at z4 (~611 m on this grid), so the standard grid cannot encode it and drops it; with
+    /// the fine extent from z6 the z4 tile is written at 16,384 units (~153 m cells), the building
+    /// is kept, and the layer DECLARES that extent (a client scales coordinates by it). At and above
+    /// the configured zoom the bytes must be identical to the default, or every existing archive
+    /// would silently change on a flag meant for overview zooms only.
+    #[test]
+    fn a_fine_extent_keeps_small_features_at_overview_zooms_only() {
+        use super::{encode_tile_opt, MvtOptimizations};
+        let grid = crate::tms::preset("WebMercatorQuad", 256).unwrap();
+        // Well inside z6 tile 32/24, whose z4 parent is 8/6.
+        let (x0, y0, side) = (100_000.0, 4.6e6, 200.0);
+        let src = VecSource {
+            feats: vec![rect_feature(x0, y0, x0 + side, y0 + side, 1)],
+            extent: [x0, y0, x0 + side, y0 + side],
+        };
+        let standard = MvtOptimizations {
+            max_features: 0,
+            area_scale: 1.0,
+            ..MvtOptimizations::defaults()
+        };
+        let fine = MvtOptimizations {
+            fine_extent_zoom: 6,
+            ..standard.clone()
+        };
+        assert_eq!(fine.extent_at(4), 16_384);
+        assert!(
+            encode_tile_opt(src.features(), &grid, 4, 8, 6, "EPSG:3857", "t", &standard).is_empty(),
+            "at 4096 a 200 m square is under one cell at z4 and cannot be encoded"
+        );
+        let z4 = encode_tile_opt(src.features(), &grid, 4, 8, 6, "EPSG:3857", "t", &fine);
+        assert!(
+            !z4.is_empty(),
+            "at 16,384 the same square clears the cell floor"
+        );
+        // Layer field 5 (extent), varint 16384 = 0x80 0x80 0x01, after the tag byte 0x28.
+        assert!(
+            z4.windows(4).any(|w| w == [0x28, 0x80, 0x80, 0x01]),
+            "the z4 layer must declare extent 16384"
+        );
+        assert_eq!(
+            encode_tile_opt(src.features(), &grid, 6, 32, 24, "EPSG:3857", "t", &fine),
+            encode_tile_opt(
+                src.features(),
+                &grid,
+                6,
+                32,
+                24,
+                "EPSG:3857",
+                "t",
+                &standard
+            ),
+            "from the configured zoom up the tile must be byte-identical to the default"
         );
     }
 

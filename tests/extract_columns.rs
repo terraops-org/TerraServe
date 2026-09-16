@@ -26,6 +26,7 @@ fn args(out: &str) -> ExtractArgs {
         mvt_min_feature_px: 0.0,
         mvt_min_feature_min_zoom: 0,
         mvt_min_feature_len_px: String::new(),
+        mvt_fine_extent_zoom: 0,
         src_crs: Some("EPSG:4326".into()),
         extent: None,
         keep_fields: None,

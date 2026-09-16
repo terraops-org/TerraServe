@@ -1378,6 +1378,8 @@ mod windowed_gpkg_dispatch_tests {
             mvt_cell_max_zoom: 0,
             mvt_dissolve: None,
             mvt_dissolve_max_zoom: 0,
+            mvt_fine_extent_zoom: 0,
+            tile_encoding: "gzip".into(),
             mvt_cache: 256,
             wms_cache: 256,
             tile_max_age: 0,

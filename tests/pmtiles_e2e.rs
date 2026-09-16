@@ -168,6 +168,7 @@ fn build_pmtiles_uses_the_given_layer_name() {
         mvt_cell_max_zoom: 0,
         mvt_dissolve: None,
         mvt_dissolve_max_zoom: 0,
+        mvt_fine_extent_zoom: 0,
         snap_tolerance: 0.01,
         topology_simplify: None,
         topology_dissolve: None,
@@ -178,6 +179,8 @@ fn build_pmtiles_uses_the_given_layer_name() {
         // (tests/pmtiles_raster_serve.rs).
         tile_format: "mvt".into(),
         tile_px: 512,
+        tile_compression: "gzip".into(),
+        tile_compression_level: None,
     };
 
     terraserve::run_build_pmtiles(&args).unwrap();
@@ -202,4 +205,97 @@ fn build_pmtiles_uses_the_given_layer_name() {
 
     std::fs::remove_file(&out).ok();
     std::fs::remove_dir_all(&tmpdir).ok();
+}
+
+/// 0.3.3: `--tile-compression` must reach the archive, not just the parser. Bake the same layer as
+/// gzip, zstd and br through the CLI entry point; each header must say what its tiles are, and every
+/// tile must decode to the same MVT across the three.
+#[test]
+fn tile_compression_flag_is_applied_to_the_archive() {
+    use terraserve::vector::pmtiles::encoding::TileEncoding;
+    let mut archives = Vec::new();
+    for enc in ["gzip", "zstd", "br"] {
+        let out =
+            std::env::temp_dir().join(format!("ts_e2e_comp_{enc}_{}.pmtiles", std::process::id()));
+        let tmpdir =
+            std::env::temp_dir().join(format!("ts_e2e_comp_tmp_{enc}_{}", std::process::id()));
+        std::fs::create_dir_all(&tmpdir).expect("create test tmpdir");
+        let args = terraserve::BuildPmtilesArgs {
+            zoom_source: Vec::new(),
+            columns: Vec::new(),
+            vector: Some("fixtures/vector/countries.geojson".into()),
+            out: out.to_string_lossy().into_owned(),
+            min_zoom: 0,
+            max_zoom: 6,
+            bbox: None,
+            // Only a postgis:// source needs this; a file source carries its own extent.
+            extent: None,
+            tmpdir: Some(tmpdir.to_string_lossy().into_owned()),
+            vec_style: Some("fixtures/styles/countries.vec.json".into()),
+            src_crs: Some("EPSG:4326".into()),
+            font: None,
+            name: Some("countries".into()),
+            mvt_max_features: terraserve::vector::mvt::DEFAULT_MAX_FEATURES_PER_TILE,
+            mvt_min_feature_px: 0.0,
+            mvt_min_feature_min_zoom: 0,
+            mvt_min_feature_len_px: String::new(),
+            raster_min_feature_px: None,
+            mvt_no_optimizations: false,
+            mvt_no_safety_limit: true,
+            mvt_cell_px: 0.0,
+            mvt_cell_field: None,
+            mvt_cell_max_zoom: 0,
+            mvt_dissolve: None,
+            mvt_dissolve_max_zoom: 0,
+            mvt_fine_extent_zoom: 0,
+            snap_tolerance: 0.01,
+            topology_simplify: None,
+            topology_dissolve: None,
+            topology_dissolve_rollup: None,
+            keep_fields: None,
+            grid: "WebMercatorQuad".into(),
+            // MVT is the default format; the raster bake has its own end-to-end test
+            // (tests/pmtiles_raster_serve.rs).
+            tile_format: "mvt".into(),
+            tile_px: 512,
+            tile_compression: enc.into(),
+            tile_compression_level: None,
+        };
+
+        terraserve::run_build_pmtiles(&args).unwrap();
+        let reader = PmtilesReader::open(&out).expect("open pmtiles");
+        std::fs::remove_dir_all(&tmpdir).ok();
+        archives.push((enc, out, reader));
+    }
+    let want = |name: &str| TileEncoding::parse_cli(name).unwrap().to_pmtiles();
+    for (enc, _, r) in &archives {
+        assert_eq!(r.tile_compression(), want(enc), "{enc}: header byte");
+    }
+    let (_, _, gz) = &archives[0];
+    let ids = gz.all_tile_ids().unwrap();
+    assert!(!ids.is_empty());
+    let mut non_empty = 0;
+    for z in 0..=6u32 {
+        for x in 0..(1u32 << z) {
+            for y in 0..(1u32 << z) {
+                let a = gz.get(z, x, y).unwrap();
+                for (enc, _, r) in &archives[1..] {
+                    assert_eq!(
+                        r.get(z, x, y).unwrap(),
+                        a,
+                        "{enc} z{z}/{x}/{y} differs from gzip"
+                    );
+                }
+                non_empty += a.map_or(0, |t| (!t.is_empty()) as usize);
+            }
+        }
+    }
+    assert!(
+        non_empty > 0,
+        "the fixture must produce real tiles (ids {})",
+        ids.len()
+    );
+    for (_, out, _) in &archives {
+        std::fs::remove_file(out).ok();
+    }
 }

@@ -15,6 +15,7 @@ use crate::server::{Layer, ServeState, VectorLayer};
 use crate::tms::{self, TileMatrixSet};
 use crate::vector::feature::Value;
 use crate::vector::mvt::{encode_tile_opt, features_for_tile, MvtOptimizations};
+use crate::vector::pmtiles::encoding::{Effort, TileEncoding};
 
 /// Resolve `{layer}` to its `VectorLayer`. `Err((404,_))` for an unknown layer, `Err((400,_))` when
 /// the named layer exists but is raster-only (no `FeatureSource`) — MVT only applies to vector layers.
@@ -81,45 +82,123 @@ fn resolve_grid(layer: &Layer, tms_id: &str) -> Result<TileMatrixSet, (u16, Stri
 
 /// A tile body plus the encoding its bytes are already in.
 ///
-/// The PMTiles archives have always stored their MVT gzip'd, and until now the serving path
-/// inflated every hit only for the response to go out uncompressed -- paying CPU to make the
-/// payload roughly 3x bigger. Carrying the encoding alongside the bytes lets an archive hit go
-/// to a gzip-capable client untouched, while a live-encoded tile (which is never compressed)
-/// still goes out as identity from the same code path.
+/// The PMTiles archives store their MVT compressed, and the serving path used to inflate every
+/// hit only for the response to go out uncompressed. Carrying the encoding alongside the bytes lets
+/// an archive hit reach a client that accepts that encoding untouched, while a tile in some other
+/// encoding is transcoded once (and cached) rather than mislabelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileBody {
     pub bytes: Vec<u8>,
-    /// True iff `bytes` are gzip'd and the response must say `Content-Encoding: gzip`.
-    pub gzip: bool,
+    /// The encoding `bytes` are in; the response's `Content-Encoding` says exactly this.
+    pub encoding: TileEncoding,
 }
 
 impl TileBody {
     /// Plain, uncompressed MVT -- what the live encoder produces.
     pub fn identity(bytes: Vec<u8>) -> Self {
-        TileBody { bytes, gzip: false }
+        TileBody {
+            bytes,
+            encoding: TileEncoding::Identity,
+        }
+    }
+
+    pub fn is_gzip(&self) -> bool {
+        self.encoding == TileEncoding::Gzip
     }
 }
 
-/// Turn a STORED blob into a response body, given how the archive stored it and whether this
-/// client can take gzip.
-///
-/// The `compression` argument must come from the archive header (`tile_compression`), never from
-/// an assumption: an archive is legally `COMPRESSION_NONE`, and labelling identity bytes as gzip
-/// hands the client something it cannot decode behind a 200.
-fn deliver(bytes: Vec<u8>, compression: u8, accept_gzip: bool) -> Result<TileBody, String> {
-    use crate::vector::pmtiles::write::{COMPRESSION_GZIP, COMPRESSION_NONE};
-    match compression {
-        // The win: hand over exactly what is on disk.
-        COMPRESSION_GZIP if accept_gzip => Ok(TileBody { bytes, gzip: true }),
-        // A client that did not offer gzip still gets correct bytes, at the old cost.
-        COMPRESSION_GZIP => Ok(TileBody::identity(crate::vector::pmtiles::codec::gunzip(
-            &bytes,
-        )?)),
-        COMPRESSION_NONE => Ok(TileBody::identity(bytes)),
-        other => Err(format!(
-            "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
-        )),
+/// The content-codings a client offered with a non-zero q (`Accept-Encoding`). Identity is always
+/// acceptable. `From<bool>` keeps the pre-0.3.3 meaning, where the only question was "gzip or not".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Accepted {
+    pub gzip: bool,
+    pub br: bool,
+    pub zstd: bool,
+}
+
+impl From<bool> for Accepted {
+    fn from(gzip: bool) -> Self {
+        Accepted {
+            gzip,
+            ..Default::default()
+        }
     }
+}
+
+impl Accepted {
+    pub fn accepts(self, e: TileEncoding) -> bool {
+        match e {
+            TileEncoding::Identity => true,
+            TileEncoding::Gzip => self.gzip,
+            TileEncoding::Brotli => self.br,
+            TileEncoding::Zstd => self.zstd,
+        }
+    }
+
+    /// Which encoding to send a blob stored as `stored` in.
+    ///
+    /// Browsers send `gzip, deflate, br, zstd` with no q values, so the tie rule IS the policy:
+    /// 1. the stored encoding, when accepted: free pass-through, the bytes on disk;
+    /// 2. else the server's live preference (`--tile-encoding`), when accepted;
+    /// 3. else the most widely supported accepted coding, gzip, then br, then zstd;
+    /// 4. else identity.
+    ///
+    /// A stored gzip tile therefore stays gzip for a client that also takes br: it is never
+    /// transcoded "up" at request time.
+    pub fn choose(self, stored: TileEncoding, preferred: TileEncoding) -> TileEncoding {
+        if self.accepts(stored) {
+            return stored;
+        }
+        if preferred != TileEncoding::Identity && self.accepts(preferred) {
+            return preferred;
+        }
+        [TileEncoding::Gzip, TileEncoding::Brotli, TileEncoding::Zstd]
+            .into_iter()
+            .find(|e| self.accepts(*e))
+            .unwrap_or(TileEncoding::Identity)
+    }
+}
+
+/// Turn a STORED blob into a response body, given how it was stored and what this client accepts.
+///
+/// `stored` must come from the archive header (`tile_compression`) or from the code that
+/// compressed the blob, never from sniffing: brotli has no magic bytes, and labelling a blob with
+/// the wrong encoding hands the client something it cannot decode behind a 200.
+///
+/// A transcode to a compressed encoding is cached under `{key}#{token}` when `--mvt-cache` is on,
+/// so a brotli archive served to a gzip-only client pays the transcode once per tile. An inflate
+/// to identity is not cached (it is the cheap direction, and it was never cached before).
+fn deliver(
+    state: &ServeState,
+    key: &str,
+    bytes: Vec<u8>,
+    stored: TileEncoding,
+    accepted: Accepted,
+) -> Result<TileBody, String> {
+    let want = accepted.choose(stored, state.tile_encoding);
+    if want == stored {
+        return Ok(TileBody {
+            bytes,
+            encoding: stored,
+        });
+    }
+    let transcode = || -> Result<Vec<u8>, String> {
+        let raw = stored.decompress(&bytes)?;
+        Ok(want.compress(&raw, Effort::Live, None))
+    };
+    let out = match (&state.mvt_cache, want.http_token()) {
+        (Some(cache), Some(token)) => cache
+            .try_get_with(format!("{key}#{token}"), || {
+                transcode().map(std::sync::Arc::new)
+            })
+            .map(|a| (*a).clone())
+            .map_err(|e| (*e).clone())?,
+        _ => transcode()?,
+    };
+    Ok(TileBody {
+        bytes: out,
+        encoding: want,
+    })
 }
 
 /// Render one MVT tile: `{layer}/{tms}/{z}/{x}/{y}`. Out-of-range `z/x/y` -> `Err((404,_))`;
@@ -131,8 +210,10 @@ pub fn render_mvt_tile(
     z: u32,
     x: u32,
     y: u32,
-    accept_gzip: bool,
+    accepted: impl Into<Accepted>,
 ) -> Result<TileBody, (u16, String)> {
+    let accepted: Accepted = accepted.into();
+    let key = format!("{layer}/{tms_id}/{z}/{x}/{y}");
     let (l, v) = resolve_vector(state, layer)?;
     let grid = resolve_grid(l, tms_id)?;
     let lvl = grid
@@ -154,7 +235,9 @@ pub fn render_mvt_tile(
         // gzip-capable client can be handed it verbatim. `get_raw` reports the compression of
         // whichever source answered -- the overlay log is always gzip, the base archive may not be.
         match ov.get_raw(z, x, y) {
-            Ok(Some((bytes, comp))) => match deliver(bytes, comp, accept_gzip) {
+            Ok(Some((bytes, comp))) => match TileEncoding::from_pmtiles(comp)
+                .and_then(|stored| deliver(state, &key, bytes, stored, accepted))
+            {
                 Ok(body) => return Ok(body),
                 // A blob we cannot decode is a real failure, not a reason to silently re-render:
                 // fall through to the live path, same as any other overlay read error.
@@ -171,21 +254,18 @@ pub fn render_mvt_tile(
         if live.is_empty() {
             return Ok(TileBody::identity(live));
         }
-        // One gzip serves both purposes: the overlay stores gzip anyway, and a gzip-capable
-        // client can have the same bytes.
+        // One gzip serves both purposes: the overlay log stores gzip (its compaction writes a
+        // gzip archive), and a gzip-capable client can have the same bytes.
         let gz = crate::vector::pmtiles::codec::gzip(&live);
         if !ov.is_compacting() {
             let id = crate::vector::pmtiles::zxy_to_tileid(z, x, y);
             let _ = ov.put(id, &gz); // best-effort
         }
-        return Ok(if accept_gzip {
-            TileBody {
-                bytes: gz,
-                gzip: true,
-            }
-        } else {
-            TileBody::identity(live)
-        });
+        if accepted.choose(TileEncoding::Gzip, state.tile_encoding) == TileEncoding::Identity {
+            return Ok(TileBody::identity(live));
+        }
+        return deliver(state, &key, gz, TileEncoding::Gzip, accepted)
+            .map_err(|e| (500u16, format!("mvt transcode: {e}")));
     }
     // Archive-first (opt-in): a hit is served straight from the pre-built PMTiles archive for the
     // REQUESTED grid (`tms_id`); a miss (or no archive registered for this grid) falls through to the
@@ -198,7 +278,9 @@ pub fn render_mvt_tile(
         // here would only be undone by the wire. `tile_compression()` is the archive's own header,
         // so a `COMPRESSION_NONE` archive still serves identity correctly.
         match reader.get_raw(z, x, y) {
-            Ok(Some(bytes)) => match deliver(bytes, reader.tile_compression(), accept_gzip) {
+            Ok(Some(bytes)) => match TileEncoding::from_pmtiles(reader.tile_compression())
+                .and_then(|stored| deliver(state, &key, bytes, stored, accepted))
+            {
                 Ok(body) => return Ok(body),
                 Err(e) => eprintln!("pmtiles decode {z}/{x}/{y}: {e}"), // degrade to live encode
             },
@@ -227,28 +309,26 @@ pub fn render_mvt_tile(
     // Level: the flate2 default (6). On a real 246 KB vida tile that is 7.9 ms against 3.2 ms at
     // level 1 for 6.5% more bytes, and the encode that produced the tile costs far more than
     // either, so the bytes are worth more than the milliseconds here.
-    let gz = cached_or_encode(state, &l.name, tms_id, z, x, y, || {
+    //
+    // 0.3.3: the cached encoding is `--tile-encoding` (default gzip, so the default is byte-identical
+    // to 0.3.2). With `br` a live tile is brotli 5, measured smaller AND faster than gzip 6 on real
+    // tiles; a client that does not take the cached encoding gets a transcode, cached per encoding.
+    let live_enc = state.tile_encoding;
+    let blob = cached_or_encode(state, &l.name, tms_id, z, x, y, || {
         let live = encode_tile_opt(batch.as_slice(), &grid, z, x, y, &l.src_crs, &l.name, &opts);
         // An empty tile stays an empty body: a valid, cheap 200 that says "nothing here", rather
-        // than the 20-byte gzip envelope of nothing.
+        // than the 20-byte envelope of nothing.
         if live.is_empty() {
             live
         } else {
-            crate::vector::pmtiles::codec::gzip(&live)
+            live_enc.compress(&live, Effort::Live, None)
         }
     });
-    if gz.is_empty() {
-        return Ok(TileBody::identity(gz));
+    if blob.is_empty() {
+        return Ok(TileBody::identity(blob));
     }
-    if accept_gzip {
-        return Ok(TileBody {
-            bytes: gz,
-            gzip: true,
-        });
-    }
-    crate::vector::pmtiles::codec::gunzip(&gz)
-        .map(TileBody::identity)
-        .map_err(|e| (500u16, format!("mvt gunzip: {e}")))
+    deliver(state, &key, blob, live_enc, accepted)
+        .map_err(|e| (500u16, format!("mvt transcode: {e}")))
 }
 
 /// A failed source READ is a 500, never an empty tile. Encoding whatever came back from a broken
@@ -1277,7 +1357,7 @@ mod tests {
         let plain = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0, false)
             .expect("z0/1/0 renders");
         assert!(
-            !plain.gzip,
+            !plain.is_gzip(),
             "a client that did not offer gzip gets identity"
         );
         assert!(
@@ -1288,7 +1368,7 @@ mod tests {
         let zipped = super::render_mvt_tile(&st, "mini", "WorldCRS84Quad", 0, 1, 0, true)
             .expect("z0/1/0 renders");
         assert!(
-            zipped.gzip,
+            zipped.is_gzip(),
             "a gzip-capable client must get Content-Encoding: gzip"
         );
         assert_eq!(
@@ -1310,7 +1390,7 @@ mod tests {
         let plain_after = super::render_mvt_tile(&st2, "mini", "WorldCRS84Quad", 0, 1, 0, false)
             .expect("z0/1/0 renders");
         assert!(
-            zipped_first.gzip && !plain_after.gzip,
+            zipped_first.is_gzip() && !plain_after.is_gzip(),
             "each request gets its own encoding"
         );
         assert_eq!(
@@ -1327,7 +1407,7 @@ mod tests {
         let nc = live_only_state(None);
         let a = super::render_mvt_tile(&nc, "mini", "WorldCRS84Quad", 0, 1, 0, true).unwrap();
         let b = super::render_mvt_tile(&nc, "mini", "WorldCRS84Quad", 0, 1, 0, false).unwrap();
-        assert!(a.gzip && !b.gzip);
+        assert!(a.is_gzip() && !b.is_gzip());
         assert_eq!(
             crate::vector::pmtiles::codec::gunzip(&a.bytes).unwrap(),
             b.bytes
@@ -1621,6 +1701,172 @@ mod tests {
             "https://maps.example.org/ts"
         );
     }
+    /// 0.3.3: brotli and zstd archives, and `--tile-encoding`, negotiated per client.
+    ///
+    /// The cases that matter: a stored encoding the client takes goes out as the bytes on disk; one
+    /// it does not take is transcoded ONCE (cached, its own ETag-bearing representation) and never
+    /// mislabelled; a stored gzip tile is not transcoded "up" for a client that also takes br; and
+    /// every representation inflates to the same tile.
+    #[test]
+    fn brotli_and_zstd_archives_are_negotiated_per_client() {
+        use crate::server::{Layer, ServeState, VectorLayer};
+        use crate::vector::geojson::GeoJsonSource;
+        use crate::vector::pmtiles::encoding::{Effort, TileEncoding};
+        use crate::vector::pmtiles::read::PmtilesReader;
+        use crate::vector::pmtiles::write::{HeaderFields, PmtilesWriter, TILE_TYPE_MVT};
+        use crate::vector::pmtiles::zxy_to_tileid;
+        use crate::vector::shape::Shaper;
+        use crate::vector::source::{FeatureSource, VectorSource};
+        use std::sync::Arc;
+        let tmp = std::env::temp_dir().join(format!("ts_mvt_br_zstd_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let payload = b"ARCHIVED_TILE_BYTES ".repeat(50);
+
+        let mk = |enc: TileEncoding| -> PmtilesReader {
+            let dir = tmp.join(format!("{enc:?}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let out = dir.join("out.pmtiles");
+            let mut w = PmtilesWriter::new(&dir)
+                .unwrap()
+                .tile_format(TILE_TYPE_MVT, enc.to_pmtiles());
+            w.add(
+                zxy_to_tileid(0, 0, 0),
+                enc.compress(&payload, Effort::Archive, None),
+            )
+            .unwrap();
+            w.finish(
+                HeaderFields {
+                    min_zoom: 0,
+                    max_zoom: 0,
+                    bounds_e7: [0, 0, 0, 0],
+                    center: (0, 0, 0),
+                },
+                r#"{"vector_layers":[],"grid_id":"WebMercatorQuad"}"#,
+                &out,
+            )
+            .unwrap();
+            let r = PmtilesReader::open(&out).unwrap();
+            assert_eq!(r.tile_compression(), enc.to_pmtiles());
+            // The decoded read path (WMS/raster use) must understand the new codings too.
+            assert_eq!(r.get(0, 0, 0).unwrap().unwrap(), payload);
+            r
+        };
+        let mk_state = |reader: Option<PmtilesReader>| {
+            let src = Arc::new(GeoJsonSource::load("fixtures/vector/mini_mvt.geojson").unwrap());
+            let style = Style::load("fixtures/styles/airports.vec.json").unwrap();
+            let font = std::fs::read("fixtures/fonts/DejaVuSans.ttf").unwrap();
+            let shaper = Arc::new(Shaper::from_font_bytes(&font).unwrap());
+            let ext = src.full_extent();
+            let mut pmtiles = std::collections::BTreeMap::new();
+            if let Some(r) = reader {
+                pmtiles.insert("WebMercatorQuad".to_string(), Arc::new(r));
+            }
+            let layer = Layer {
+                name: "mini".into(),
+                cog_path: String::new(),
+                cog: None,
+                source: None,
+                style: None,
+                src_crs: "EPSG:4326".into(),
+                band_math: None,
+                bounds_wgs84: ext,
+                tile_cache: None,
+                index_cache: crate::cache::new_index_cache(crate::cache::index_cache_bytes()),
+                grids: Vec::new(),
+                vector: Some(VectorLayer {
+                    fields: super::feature_field_schema(src.as_ref()),
+                    area_scale: crate::vector::mvt::layer_area_scale(ext, ext),
+                    min_feature_px: 0.0,
+                    source: VectorSource::LoadAll(src),
+                    style,
+                    shaper,
+                    lod: None,
+                    zoom_sources: Vec::new(),
+                }),
+                pmtiles,
+                raster_pmtiles: std::collections::BTreeMap::new(),
+                overlay: std::collections::BTreeMap::new(),
+            };
+            let mut st = ServeState::new(vec![layer], "http://h/wms".into(), 16);
+            st.mvt_cache = Some(super::build_byte_cache(16));
+            st
+        };
+        let chrome = super::Accepted {
+            gzip: true,
+            br: true,
+            zstd: true,
+        };
+        let gzip_only = super::Accepted::from(true);
+        let br_only = super::Accepted {
+            br: true,
+            ..Default::default()
+        };
+        let get = |st: &ServeState, a: super::Accepted| {
+            super::render_mvt_tile(st, "mini", "WebMercatorQuad", 0, 0, 0, a).unwrap()
+        };
+        let same_tile = |b: &super::TileBody| b.encoding.decompress(&b.bytes).unwrap() == payload;
+
+        for enc in [TileEncoding::Brotli, TileEncoding::Zstd] {
+            let st = mk_state(Some(mk(enc)));
+            // Accepted: the stored bytes, verbatim.
+            let hit = get(&st, chrome);
+            assert_eq!(
+                hit.encoding, enc,
+                "{enc:?} archive to a client that takes it"
+            );
+            assert_eq!(hit.bytes, enc.compress(&payload, Effort::Archive, None));
+            // Not accepted: transcoded to gzip, labelled gzip, the same tile, and cached.
+            let gz = get(&st, gzip_only);
+            assert_eq!(
+                gz.encoding,
+                TileEncoding::Gzip,
+                "{enc:?} archive to a gzip-only client"
+            );
+            assert!(same_tile(&gz));
+            let key = "mini/WebMercatorQuad/0/0/0#gzip".to_string();
+            assert!(
+                st.mvt_cache.as_ref().unwrap().contains_key(&key),
+                "the transcode must be cached under its encoding"
+            );
+            assert_eq!(get(&st, gzip_only), gz, "a cached transcode is stable");
+            // Nothing accepted: identity, never a label it does not deserve.
+            let plain = get(&st, super::Accepted::default());
+            assert_eq!(plain.encoding, TileEncoding::Identity);
+            assert_eq!(plain.bytes, payload);
+        }
+
+        // A gzip archive stays gzip for a browser that also takes br: no request-time transcode up.
+        let st = mk_state(Some(mk(TileEncoding::Gzip)));
+        assert_eq!(get(&st, chrome).encoding, TileEncoding::Gzip);
+        // ...and a br-only client gets a br transcode of it.
+        let b = get(&st, br_only);
+        assert_eq!(b.encoding, TileEncoding::Brotli);
+        assert!(same_tile(&b));
+
+        // Live tiles with --tile-encoding br: cached as br, served br to a br client, gzip to a
+        // gzip-only one, both the same tile as the identity encode.
+        let mut live = mk_state(None);
+        live.tile_encoding = TileEncoding::Brotli;
+        let plain =
+            super::render_mvt_tile(&live, "mini", "WebMercatorQuad", 0, 0, 0, false).unwrap();
+        if !plain.bytes.is_empty() {
+            let br = get(&live, chrome);
+            assert_eq!(br.encoding, TileEncoding::Brotli);
+            assert_eq!(
+                TileEncoding::Brotli.decompress(&br.bytes).unwrap(),
+                plain.bytes
+            );
+            let gz = get(&live, gzip_only);
+            assert_eq!(gz.encoding, TileEncoding::Gzip);
+            assert_eq!(
+                TileEncoding::Gzip.decompress(&gz.bytes).unwrap(),
+                plain.bytes
+            );
+        }
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     /// The gzip pass-through, end to end through `render_mvt_tile`.
     ///
     /// The archives have always stored gzip'd MVT. Before this, every archive hit was inflated and
@@ -1719,7 +1965,7 @@ mod tests {
         // --- a gzip archive, client accepts gzip: pass the stored blob straight through ---
         let st = mk_state(mk("gz", false));
         let got = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0, true).unwrap();
-        assert!(got.gzip, "an archive hit must be labelled gzip");
+        assert!(got.is_gzip(), "an archive hit must be labelled gzip");
         assert_eq!(
             gunzip(&got.bytes).unwrap(),
             payload,
@@ -1734,7 +1980,7 @@ mod tests {
 
         // --- same archive, client did NOT offer gzip: inflate, and never claim an encoding ---
         let plain = super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 0, 0, 0, false).unwrap();
-        assert!(!plain.gzip);
+        assert!(!plain.is_gzip());
         assert_eq!(plain.bytes, payload);
         // The two encodings are two spellings of ONE tile. This is the invariant the whole change
         // rests on: a client must not see different map data depending on its Accept-Encoding.
@@ -1745,7 +1991,7 @@ mod tests {
         let raw =
             super::render_mvt_tile(&st_none, "mini", "WebMercatorQuad", 0, 0, 0, true).unwrap();
         assert!(
-            !raw.gzip,
+            !raw.is_gzip(),
             "a COMPRESSION_NONE archive must never be labelled gzip"
         );
         assert_eq!(raw.bytes, payload);
@@ -1755,12 +2001,12 @@ mod tests {
         let miss_plain =
             super::render_mvt_tile(&st, "mini", "WebMercatorQuad", 1, 0, 0, false).unwrap();
         assert!(
-            !miss_plain.gzip,
+            !miss_plain.is_gzip(),
             "a client that did not offer gzip gets identity"
         );
         if !miss_plain.bytes.is_empty() {
             assert!(
-                miss.gzip,
+                miss.is_gzip(),
                 "since 0.3.2 a live-encoded tile is gzip'd for a client that accepts it"
             );
             assert_eq!(
@@ -1770,7 +2016,7 @@ mod tests {
             );
         } else {
             // An empty tile stays an empty body in both encodings.
-            assert!(!miss.gzip && miss.bytes.is_empty());
+            assert!(!miss.is_gzip() && miss.bytes.is_empty());
         }
 
         std::fs::remove_dir_all(&tmp).ok();

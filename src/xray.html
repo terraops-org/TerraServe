@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>TerraServe · X-ray</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css">
 <style>
   html, body, #map { margin: 0; height: 100%; width: 100%; background: #05070a; }
   body {
@@ -228,7 +228,10 @@
 <div id="hud">TerraServe · X-ray MVT viewer</div>
 
 <script src="https://cdn.jsdelivr.net/npm/proj4@2/dist/proj4.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/ol@9/dist/ol.js"></script>
+<!-- OpenLayers pinned to an exact release (was the floating `ol@9`, which could change under the
+     demos with no image bump). Measured 2026-09-15 before choosing: OL 10.10 is worse on these
+     demos, on canvas AND WebGL (bench/viewer-memory/README.md). Pin tms_http.rs's pages alike. -->
+<script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
 <script>
 // The X-ray viewer is a fully client-side, self-contained page: the `{layer}`/`{grid}` it renders
 // come from the `?layer=`/`?grid=` query string (comma-separated layers), NOT from any server-side

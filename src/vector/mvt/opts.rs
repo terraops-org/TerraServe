@@ -49,6 +49,10 @@ pub struct MvtOptimizations {
     pub dissolve_field: Option<String>,
     /// Dissolve active only at `z <= dissolve_max_zoom` (per-ZOOM constant → seam-safe). 0 = every zoom.
     pub dissolve_max_zoom: u32,
+    /// Below this zoom the tile's coordinate grid doubles per zoom out, so the smallest encodable
+    /// feature keeps THIS zoom's ground size. `0` = off (every tile at the standard 4096). From
+    /// `--mvt-fine-extent-zoom`; see [`MvtOptimizations::extent_at`].
+    pub fine_extent_zoom: u32,
 }
 
 impl MvtOptimizations {
@@ -75,6 +79,26 @@ impl MvtOptimizations {
             self.min_feature_px
         } else {
             0.0
+        }
+    }
+
+    /// The MVT coordinate extent for a tile at zoom `z`.
+    ///
+    /// A feature smaller than one extent unit rounds to a single point and cannot be encoded, so
+    /// at the standard 4096 an overview tile can only draw huge features: on WebMercatorQuad one
+    /// unit is ~611 m at z4, and a vida tile over Madrid held 10 real buildings at z4 against
+    /// 3,662 at z6. With `fine_extent_zoom = Z` every zoom below Z gets `4096 * 2^(Z - z)`, so a
+    /// unit keeps zoom Z's ground size and the same buildings survive at every zoom from Z down
+    /// (measured over Madrid with Z = 6: z5 5,733, z4 6,432, z3 7,732 real buildings, tiles
+    /// 170-240 KB gzipped). Zooms at or above Z keep 4096, so their bytes do not change.
+    ///
+    /// The shift is capped at 10 (extent 4,194,304) so a coordinate plus the 1/16 clip buffer stays
+    /// far inside i32. Per-ZOOM constant, so every tile at a zoom uses the same grid: seam-free.
+    pub fn extent_at(&self, z: u32) -> u32 {
+        if self.fine_extent_zoom > z {
+            super::tile::EXTENT << (self.fine_extent_zoom - z).min(MAX_FINE_EXTENT_SHIFT)
+        } else {
+            super::tile::EXTENT
         }
     }
 
@@ -112,6 +136,7 @@ impl MvtOptimizations {
             cell_max_zoom: 0,
             dissolve_field: None,
             dissolve_max_zoom: 0,
+            fine_extent_zoom: 0,
         }
     }
 
@@ -119,7 +144,7 @@ impl MvtOptimizations {
     /// Reads `area_scale` off the (pre-computed) layer, resolves the cell-field against THIS layer's
     /// schema, and maps the server flags to knobs via the pure [`MvtOptimizations::resolve`].
     pub fn for_layer(state: &ServeState, layer: &VectorLayer) -> Self {
-        Self::resolve(
+        let mut opts = Self::resolve(
             state.mvt_max_features,
             state.mvt_no_safety_limit,
             state.mvt_no_optimizations,
@@ -132,7 +157,9 @@ impl MvtOptimizations {
             state.mvt_cell_max_zoom,
             resolve_cell_field(&state.mvt_dissolve_field, &layer.fields),
             state.mvt_dissolve_max_zoom,
-        )
+        );
+        opts.fine_extent_zoom = state.mvt_fine_extent_zoom;
+        opts
     }
 
     /// Pure flag→knob mapping (no `ServeState`/`VectorLayer` — unit-testable in isolation).
@@ -172,9 +199,13 @@ impl MvtOptimizations {
             cell_max_zoom,
             dissolve_field,
             dissolve_max_zoom,
+            fine_extent_zoom: 0,
         }
     }
 }
+
+/// Cap on `extent_at`'s doubling: 4096 << 10 = 4,194,304, far inside i32 with the clip buffer.
+pub(crate) const MAX_FINE_EXTENT_SHIFT: u32 = 10;
 
 /// Parse `--mvt-min-feature-len-px` into ascending `(from_zoom, value)` steps.
 ///
@@ -296,6 +327,29 @@ mod tests {
     /// The per-zoom STEP LIST for `--mvt-min-feature-len-px`. Roads need the opposite shape to
     /// buildings -- a STRONG gate at overview zoom and a weak one deep in -- so a single value plus
     /// a one-sided band cannot express it. A step list can express either.
+    /// The extent doubles per zoom below `fine_extent_zoom`, is the standard 4096 at and above it,
+    /// is 4096 everywhere when off, and never shifts past the i32-safe cap.
+    #[test]
+    fn extent_at_doubles_below_the_fine_zoom_and_is_capped() {
+        let off = MvtOptimizations::defaults();
+        assert_eq!(off.extent_at(0), 4096);
+        assert_eq!(off.extent_at(12), 4096);
+        let o = MvtOptimizations {
+            fine_extent_zoom: 6,
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(o.extent_at(6), 4096);
+        assert_eq!(o.extent_at(10), 4096);
+        assert_eq!(o.extent_at(5), 8192);
+        assert_eq!(o.extent_at(4), 16_384);
+        assert_eq!(o.extent_at(0), 262_144);
+        let deep = MvtOptimizations {
+            fine_extent_zoom: 20,
+            ..MvtOptimizations::defaults()
+        };
+        assert_eq!(deep.extent_at(0), 4096 << super::MAX_FINE_EXTENT_SHIFT);
+    }
+
     #[test]
     fn min_feature_len_px_at_walks_the_zoom_steps() {
         let o = MvtOptimizations {

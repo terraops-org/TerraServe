@@ -272,7 +272,7 @@ fn wmts_get_tile_mvt_reads_the_archive_like_the_mvt_route() {
                 )
                 .expect("WMTS GetTile MVT");
                 assert!(
-                    !served.gzip,
+                    !served.is_gzip(),
                     "a client that did not offer gzip gets identity"
                 );
                 assert_eq!(
@@ -295,7 +295,7 @@ fn wmts_get_tile_mvt_reads_the_archive_like_the_mvt_route() {
                 )
                 .expect("WMTS GetTile MVT, gzip accepted");
                 assert!(
-                    gz.gzip,
+                    gz.is_gzip(),
                     "archive stores gzip; a willing client is handed it"
                 );
                 assert_eq!(

@@ -31,7 +31,9 @@ use crate::s3;
 use crate::server;
 use crate::tms;
 use crate::vector::gpkg_write::GpkgWriter;
-use crate::vector::mvt::tile::{min_area_src_for_grid, min_len_src_for_grid, passes_size_gate};
+use crate::vector::mvt::tile::{
+    min_area_src_for_grid_extent, min_len_src_for_grid_extent, passes_size_gate,
+};
 use crate::Error;
 use crate::ServeArgs;
 use clap::Args;
@@ -94,6 +96,11 @@ pub struct ExtractArgs {
     /// list like `0:2.0,7:0.3`.
     #[arg(long = "mvt-min-feature-len-px", default_value = "")]
     pub mvt_min_feature_len_px: String,
+
+    /// See `serve --mvt-fine-extent-zoom`. Must match the bake, or the subset is cut at the coarse
+    /// one-cell floor and drops the small features the finer grid would have kept.
+    #[arg(long = "mvt-fine-extent-zoom", default_value_t = 0)]
+    pub mvt_fine_extent_zoom: u32,
 
     /// Source CRS, when the file does not declare one.
     #[arg(long = "src-crs")]
@@ -214,24 +221,27 @@ pub fn run_extract(args: &ExtractArgs) -> Result<(), Error> {
     state.mvt_min_feature_min_zoom = args.mvt_min_feature_min_zoom;
     state.mvt_min_feature_len_px =
         crate::vector::mvt::parse_len_px_spec(&args.mvt_min_feature_len_px)?;
+    state.mvt_fine_extent_zoom = args.mvt_fine_extent_zoom;
     let opts = crate::vector::mvt::MvtOptimizations::for_layer(&state, vlayer);
     let mut table: Vec<ZoomThreshold> = Vec::new();
     for z in args.min_zoom..=args.max_zoom {
         table.push(ZoomThreshold {
             zoom: z,
-            area: min_area_src_for_grid(
+            area: min_area_src_for_grid_extent(
                 &grid,
                 z,
                 src_crs,
                 opts.area_scale,
                 opts.min_feature_px_at(z),
+                opts.extent_at(z),
             ),
-            len: min_len_src_for_grid(
+            len: min_len_src_for_grid_extent(
                 &grid,
                 z,
                 src_crs,
                 opts.area_scale,
                 opts.min_feature_len_px_at(z),
+                opts.extent_at(z),
             ),
         });
     }
@@ -476,6 +486,8 @@ fn serve_args_for(args: &ExtractArgs) -> ServeArgs {
         mvt_cell_max_zoom: 0,
         mvt_dissolve: None,
         mvt_dissolve_max_zoom: 0,
+        mvt_fine_extent_zoom: args.mvt_fine_extent_zoom,
+        tile_encoding: "gzip".into(),
         mvt_cache: 0,
         wms_cache: 0,
         tile_max_age: 0,

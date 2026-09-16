@@ -1,6 +1,6 @@
 [package]
 name = "terraserve"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MPL-2.0"
 description = "Clean-room raster + vector tile engine in Rust (COG / GeoPackage / FlatGeoBuf → WMS / WMTS / TMS / MVT), no GDAL / MapServer / GeoServer."
@@ -72,6 +72,7 @@ proj-sys = "=0.26.0"
 weezl = "0.1"   # LZW codec (TIFF variant) — a codec crate like flate2/zune-jpeg, not a TIFF reader
 zune-jpeg = "0.4"
 zstd = "0.13"   # ZSTD codec (libzstd binding) — a codec crate like flate2/zune-jpeg, not a TIFF reader
+brotli = "8"   # Brotli codec (pure Rust) for MVT tiles on the wire and in archives — a codec crate, not a format reader
 image-webp = "0.2"   # WEBP codec (pure Rust, decode) — a codec crate like zune-jpeg, not a TIFF reader
 
 # Async HTTP server. The request/I/O path is async; CPU render work is dispatched to a

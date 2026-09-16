@@ -273,6 +273,25 @@ pub struct ServeArgs {
     /// geometry with full attributes renders above it. `0` = every zoom.
     #[arg(long, default_value_t = 0)]
     pub mvt_dissolve_max_zoom: u32,
+    /// Below this zoom, encode MVT tiles on a FINER coordinate grid so small features keep their
+    /// real shapes at overview zooms: zoom `z < Z` gets extent `4096 * 2^(Z - z)`, which holds the
+    /// smallest encodable feature at zoom Z's ground size. At the standard 4096 a unit is ~611 m
+    /// at z4, so a buildings layer has almost nothing left there (vida over Madrid: 10 buildings at
+    /// z4 against 3,662 at z6); with `6`, z5/z4/z3 held 5,733 / 6,432 / 7,732 real buildings.
+    /// Zooms >= Z are byte-identical to the default. `0` (default) = off. A bake and the live
+    /// server MUST agree on it, or an archive miss encodes on a different grid from its neighbours.
+    /// Tiles the cell mosaic or dissolve replace stay at 4096.
+    #[arg(long = "mvt-fine-extent-zoom", default_value_t = 0)]
+    pub mvt_fine_extent_zoom: u32,
+    /// Content encoding for LIVE vector tiles, and the encoding they are cached in: `gzip`
+    /// (default, byte-identical to 0.3.2), `br` or `zstd`. Measured on real tiles, `br` (brotli 5)
+    /// is 1-13 % smaller than gzip 6 AND faster to produce; `zstd` (level 3) is 10-20x faster
+    /// than gzip 6 but 3-6 % bigger. Archive hits are not re-encoded: they go out in their stored
+    /// encoding when the client accepts it. A client that does not accept the chosen encoding gets
+    /// the most widely supported one it does (gzip, then br, then zstd), transcoded once and cached
+    /// per encoding, or identity.
+    #[arg(long = "tile-encoding", default_value = "gzip")]
+    pub tile_encoding: String,
     /// Bounded cache of encoded MVT tile bytes — max **N MiB** (`0` = off). Computes each
     /// `layer/tms/z/x/y` once (single-flight) and reuses it — the mitigation for costly passes like
     /// `--mvt-dissolve` at low zoom (warm requests instant). Byte-weighted → RSS hard-bounded. Shared
@@ -638,6 +657,30 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         };
         println!("MVT dissolve: same-class merge on field '{field}' ({band})");
     }
+    state.mvt_fine_extent_zoom = args.mvt_fine_extent_zoom;
+    state.tile_encoding =
+        crate::vector::pmtiles::encoding::TileEncoding::parse_cli(&args.tile_encoding)
+            .map_err(|e| format!("--tile-encoding: {e}"))?;
+    if state.tile_encoding == crate::vector::pmtiles::encoding::TileEncoding::Identity {
+        return Err(
+            "--tile-encoding none is not supported: live tiles are always compressed (gzip, br or zstd)".into(),
+        );
+    }
+    if state.tile_encoding != crate::vector::pmtiles::encoding::TileEncoding::Gzip {
+        println!(
+            "live vector tiles: {} (negotiated per request; archive hits keep their stored encoding)",
+            state.tile_encoding.http_token().unwrap_or("identity")
+        );
+    }
+    if args.mvt_fine_extent_zoom > 0 {
+        println!(
+            "MVT fine extent below z{}: z{} tiles at {} units (4096 from z{} up)",
+            args.mvt_fine_extent_zoom,
+            args.mvt_fine_extent_zoom - 1,
+            crate::vector::mvt::tile::EXTENT * 2,
+            args.mvt_fine_extent_zoom
+        );
+    }
     if args.mvt_cache > 0 {
         state.mvt_cache = Some(mvt_http::build_byte_cache(args.mvt_cache));
         println!(
@@ -733,6 +776,29 @@ mod cli_name_tests {
     /// from the FIELD, which is `mvt_min_feature_min_zoom` (no `px`). Without the explicit
     /// `long = ...` the two silently disagreed and a four-layer production bake died on
     /// "unexpected argument" one second after launch, 2026-08-29. Pin the name.
+    /// `--mvt-fine-extent-zoom` is the spelling in every doc comment and in the vida bake plan; pin
+    /// it (clap would otherwise derive `--mvt-fine-extent-zoom` from the field today, and silently
+    /// something else after a field rename). Absent = 0 = off.
+    #[test]
+    fn the_fine_extent_flag_parses_and_defaults_off() {
+        let w = Wrap::try_parse_from(["serve", "--cog", "x.tif", "--mvt-fine-extent-zoom", "6"])
+            .expect("--mvt-fine-extent-zoom must parse");
+        assert_eq!(w.inner.mvt_fine_extent_zoom, 6);
+        let d = Wrap::try_parse_from(["serve", "--cog", "x.tif"]).expect("defaults parse");
+        assert_eq!(d.inner.mvt_fine_extent_zoom, 0);
+    }
+
+    /// `--tile-encoding` defaults to gzip, which is what makes a flagless 0.3.3 byte-identical to
+    /// 0.3.2 on the wire.
+    #[test]
+    fn the_tile_encoding_flag_parses_and_defaults_to_gzip() {
+        let w = Wrap::try_parse_from(["serve", "--cog", "x.tif", "--tile-encoding", "br"])
+            .expect("--tile-encoding must parse");
+        assert_eq!(w.inner.tile_encoding, "br");
+        let d = Wrap::try_parse_from(["serve", "--cog", "x.tif"]).expect("defaults parse");
+        assert_eq!(d.inner.tile_encoding, "gzip");
+    }
+
     #[test]
     fn the_gate_band_flag_is_spelled_with_px() {
         let w = Wrap::try_parse_from([

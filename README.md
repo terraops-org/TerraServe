@@ -101,7 +101,7 @@ warp/resample (nearest + bilinear), reprojection via libproj (incl. **polar UPS*
 
 **Vector**:  GeoJSON, **native GeoPackage** and **FlatGeoBuf** readers (bespoke WKB decoder,
 `rusqlite` container, OGC R-tree **windowed reads**), plus a **PostGIS** source that reads straight
-from an existing OSM-in-Postgres estate -> **tiny-skia** polygon / line / point rasterization,
+from an existing OSM-in-Postgres estate -> **vello_cpu** polygon / line / point rasterization,
 **SLD-first** styling (SLD 1.0 -> a Style IR) + a point-label engine, per-zoom LOD (shared-arc
 simplification), and offline **PMTiles** baking, raster as well as vector. Proven live on the
 Portuguese BUPi cadastre (**3.4 M parcels**), the VIDA Iberia buildings (**14.9 M**), and a
@@ -173,6 +173,13 @@ PGPASS=... terraserve serve --config osm.yaml --port 8080
 terraserve build-pmtiles --vector data.gpkg --vec-style style.sld \
   --grid fixtures/grids/EuropeanETRS89_LAEAQuad.json --tile-format png --tile-px 256 \
   --min-zoom 0 --max-zoom 10 --out pyramid.pmtiles
+
+# an MVT archive stored as zstd, with buildings still real shapes at the overview zooms,
+# served with brotli for live tiles (both default to gzip / off, the 0.3.2 behaviour)
+terraserve build-pmtiles --vector buildings.fgb --vec-style buildings.sld --name buildings \
+  --min-zoom 0 --max-zoom 10 --mvt-fine-extent-zoom 6 --tile-compression zstd --out buildings.pmtiles
+terraserve serve --vector buildings.fgb --vec-style buildings.sld --name buildings \
+  --pmtiles buildings.pmtiles --mvt-fine-extent-zoom 6 --tile-encoding br --port 8080
 ```
 
 Full flag reference, the multi-layer YAML, and the **pitfalls** worth knowing before you deploy:
@@ -185,19 +192,20 @@ MapLibre GL): **[terraserve.io/styling](https://terraserve.io/styling.html)**.
 `tiff` / `geotiff` / `cog` / `flatgeobuf` **reader** crate. The COG container, IFD/tiling, windowed
 reads, warp/resample kernels, WKB/GeoPackage decoder, spatial-index traversal, style engine and OGC
 protocol layer are all bespoke. Only codec/infra crates (flate2 / zstd / weezl / zune-jpeg / png,
-bundled `rusqlite`, tiny-skia) and the `proj` FFI (coordinate transforms only) are leaned on. The
+bundled `rusqlite`, vello_cpu, brotli) and the `proj` FFI (coordinate transforms only) are leaned on. The
 constraint can't drift, because CI fails the moment a banned crate appears.
 
 ## Rendering
 
-Vector geometry (polygon fills, line strokes, point markers) is rasterized with **tiny-skia**, a
-pure-Rust port of Skia's rasterizer, the 2D engine behind Chrome, Android and Flutter. That buys
-production-grade, sub-pixel anti-aliasing with no C++ graphics dependency: no AGG, no cairo, no Skia
-over FFI. It is one of the few Rust-native infra crates the clean-room gate allows (it bans dataset
+Vector geometry (polygon fills, line strokes, point markers) is rasterized with **vello_cpu**, the
+CPU renderer of the Linebender Vello project. It replaced tiny-skia in September 2026 after winning
+24 of 24 measured cases on real production tiles, 1.15x to 4.39x faster.
+That buys sub-pixel anti-aliasing with no C++ graphics dependency: no AGG, no cairo, no Skia over
+FFI. It is one of the few Rust-native infra crates the clean-room gate allows (it bans dataset
 readers, not a rasterizer), and it lives in a single file, `src/vector/raster.rs`.
 
 The raster path stays separate: Cloud-Optimized GeoTIFFs run through TerraServe's own decode, warp,
-resample and colorize kernels, so tiny-skia is only ever asked to draw vectors, the right rasterizer
+resample and colorize kernels, so vello_cpu is only ever asked to draw vectors, the right rasterizer
 for each job.
 
 ## Vector tiles
@@ -208,6 +216,14 @@ encoder, LEB128 varints, field tags and zigzag-delta geometry commands (`vector/
 own reader and writer as well. There is no `prost`, no protobuf crate, no MVT or PMTiles library
 anywhere: the banned-crate gate forbids precisely those off-the-shelf tile readers, so the tile format
 is bespoke by design.
+
+Tiles are compressed with gzip, brotli or zstd, both in a baked archive (`build-pmtiles
+--tile-compression`) and for live tiles (`serve --tile-encoding`), and every response is negotiated
+from the client's `Accept-Encoding`: a stored tile goes out as the bytes on disk when the client
+accepts that encoding, and is otherwise transcoded once and cached. On real tiles, brotli 5 for live
+tiles came out smaller than gzip and faster to produce, and zstd 19 archives 7-14 % smaller. At
+overview zooms `--mvt-fine-extent-zoom` keeps small features, such as buildings, as real shapes
+instead of rounding them away.
 
 ## Architecture (`src/`)
 
@@ -222,7 +238,7 @@ is bespoke by design.
 | `wms.rs` | WMS 1.1.1 / 1.3.0 GetMap / GetCapabilities / GetFeatureInfo / GetLegendGraphic |
 | `tms.rs`, `tms_http.rs`, `wmts.rs` | generic `TileMatrixSet` core (a tile IS a GetMap) + OSGeo TMS + WMTS |
 | `sld/` | SLD 1.0 front-end (`roxmltree`, boundary-gated): parse -> model -> filter -> lower to the Style IR |
-| `vector/` | GeoJSON / GeoPackage / FlatGeoBuf readers, tiny-skia raster, label engine, Style IR + SLD lowering |
+| `vector/` | GeoJSON / GeoPackage / FlatGeoBuf readers, vello_cpu raster, label engine, Style IR + SLD lowering |
 | `vector/mvt/`, `vector/pmtiles/` | bespoke MVT protobuf encoder + tile clip; PMTiles read + offline bake + write-through cache |
 | `s3.rs`, `cache.rs`, `config.rs` | SigV4 S3 range reader; bounded LRU tile cache (moka); multi-layer YAML |
 | `server.rs`, `pngio.rs`, `lib.rs`, `main.rs` | async axum/tokio server + PNG encode + CLI plumbing |

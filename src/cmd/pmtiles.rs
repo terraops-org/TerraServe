@@ -131,6 +131,9 @@ pub struct BuildPmtilesArgs {
     pub mvt_dissolve: Option<String>,
     #[arg(long, default_value_t = 0)]
     pub mvt_dissolve_max_zoom: u32,
+    /// See `serve --mvt-fine-extent-zoom`. A bake and the live server MUST agree on this.
+    #[arg(long = "mvt-fine-extent-zoom", default_value_t = 0)]
+    pub mvt_fine_extent_zoom: u32,
     #[arg(long, default_value_t = 0.01)]
     pub snap_tolerance: f64,
     #[arg(long)]
@@ -162,6 +165,16 @@ pub struct BuildPmtilesArgs {
     /// size or serve refuses the archive at startup.
     #[arg(long = "tile-px", default_value_t = 512)]
     pub tile_px: u32,
+    /// How MVT tiles are compressed in the archive: `gzip` (default, what every archive so far
+    /// holds), `zstd` (level 19: 7-14 % smaller than gzip 6 on real tiles, ~0.2 s per heavy tile,
+    /// paid once) or `br` (brotli 11: 15-19 % smaller, but ~1.3 s per heavy tile). The header's
+    /// `tile_compression` byte is written from the same value. Ignored for `--tile-format png`.
+    /// A write-through `serve --pmtiles-cache` needs a gzip base.
+    #[arg(long = "tile-compression", default_value = "gzip")]
+    pub tile_compression: String,
+    /// Override the archive compression level (gzip 0-9, brotli 0-11, zstd 1-22).
+    #[arg(long = "tile-compression-level")]
+    pub tile_compression_level: Option<i32>,
 }
 
 /// Build a `.pmtiles` pyramid offline. Constructs the SAME `Layer` + `MvtOptimizations` `run_serve`
@@ -288,6 +301,8 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         mvt_cell_max_zoom: args.mvt_cell_max_zoom,
         mvt_dissolve: args.mvt_dissolve.clone(),
         mvt_dissolve_max_zoom: args.mvt_dissolve_max_zoom,
+        mvt_fine_extent_zoom: args.mvt_fine_extent_zoom,
+        tile_encoding: "gzip".into(),
         mvt_cache: 0,
         wms_cache: 0,
         tile_max_age: 0,
@@ -365,6 +380,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     state.mvt_cell_max_zoom = serve_args.mvt_cell_max_zoom;
     state.mvt_dissolve_field = serve_args.mvt_dissolve.clone();
     state.mvt_dissolve_max_zoom = serve_args.mvt_dissolve_max_zoom;
+    state.mvt_fine_extent_zoom = serve_args.mvt_fine_extent_zoom;
     let vlayer = layer.vector.as_ref().unwrap();
     let opts = crate::vector::mvt::MvtOptimizations::for_layer(&state, vlayer);
 
@@ -434,6 +450,15 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
             ("--no-optimizations", args.mvt_no_optimizations),
             ("--mvt-cell-px", args.mvt_cell_px != 0.0),
             ("--mvt-dissolve", args.mvt_dissolve.is_some()),
+            ("--mvt-fine-extent-zoom", args.mvt_fine_extent_zoom != 0),
+            (
+                "--tile-compression",
+                !args.tile_compression.trim().eq_ignore_ascii_case("gzip"),
+            ),
+            (
+                "--tile-compression-level",
+                args.tile_compression_level.is_some(),
+            ),
         ];
         for (flag, set) in mvt_only.iter().filter(|(_, set)| *set) {
             let _ = set;
@@ -449,7 +474,9 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
             &tmp,
         )?
     } else {
-        vector::pmtiles::generate::build_pmtiles(
+        let encoding = vector::pmtiles::encoding::TileEncoding::parse_cli(&args.tile_compression)
+            .map_err(|e| format!("--tile-compression: {e}"))?;
+        vector::pmtiles::generate::build_pmtiles_with(
             &layer,
             &opts,
             &grid,
@@ -458,6 +485,8 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
             bbox,
             std::path::Path::new(&args.out),
             &tmp,
+            encoding,
+            args.tile_compression_level,
         )?
     };
     println!(

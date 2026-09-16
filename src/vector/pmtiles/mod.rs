@@ -5,6 +5,7 @@
 //! See docs/superpowers/specs/2026-07-15-pmtiles-pyramid-serve-design.md.
 
 pub mod codec;
+pub mod encoding;
 pub mod generate;
 pub mod overlay;
 pub mod raster;

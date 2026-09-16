@@ -332,7 +332,7 @@ fn vector_viewer_html(base_url: &str, layer: &crate::server::Layer) -> String {
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
 <title>TerraServe · {name} (vector)</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}
 #hud{{position:absolute;z-index:1;top:8px;left:8px;background:rgba(13,17,23,.82);color:#e6edf3;
@@ -343,7 +343,7 @@ font:12px/1.4 system-ui,sans-serif;padding:6px 10px;border-radius:6px;border:1px
 .ol-attribution{{background:rgba(13,17,23,.7)!important;color:#c9d1d9}}
 .ol-attribution a{{color:#79c0ff}}</style></head>
 <body><div id="map"></div><div id="hud">{name} · <b>vector</b> · WMS GetMap labels</div>
-<script src="https://cdn.jsdelivr.net/npm/ol@9/dist/ol.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
 <script>
 var wms = new ol.source.ImageWMS({{
   url: '{wms}',
@@ -408,7 +408,7 @@ pub fn viewer_html(state: &ServeState, origin: &str) -> String {
         r#"<!doctype html><html><head><meta charset="utf-8">
 <meta name="color-scheme" content="dark">
 <title>TerraServe · {name} ({gid})</title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9/ol.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@9.2.4/ol.css">
 <style>html,body,#map{{margin:0;height:100%;width:100%}}
 body,#map{{background:#0d1117}}
 #hud{{position:absolute;z-index:1;top:8px;left:8px;background:rgba(13,17,23,.82);color:#e6edf3;
@@ -421,7 +421,7 @@ font:12px/1.4 system-ui,sans-serif;padding:6px 10px;border-radius:6px;border:1px
 .ol-attribution button{{color:#e6edf3}}</style></head>
 <body><div id="map"></div><div id="hud">{name} · grid <b>{gid}</b> · {crs} · {tile}px</div>
 <script src="https://cdn.jsdelivr.net/npm/proj4@2/dist/proj4.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/ol@9/dist/ol.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ol@9.2.4/dist/ol.js"></script>
 <script>
 {proj4_js}
 var crs = '{crs}';

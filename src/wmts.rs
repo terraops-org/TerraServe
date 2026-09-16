@@ -312,7 +312,7 @@ pub fn get_tile(
 ///
 /// WMTS-specific validation (layer, style, grid, tile range) happens here so the OWS exception
 /// keeps its `code` and `locator`; producing the tile is then `mvt_http::render_mvt_tile`, the
-/// same function the `/mvt` route calls. `accept_gzip` says whether the client offered gzip, so an
+/// same function the `/mvt` route calls. `accepted` says which codings the client offered, so an
 /// archive hit can go out in the encoding it is already stored in.
 pub fn get_tile_mvt(
     state: &crate::server::ServeState,
@@ -322,7 +322,7 @@ pub fn get_tile_mvt(
     z: u32,
     row: u32,
     col: u32,
-    accept_gzip: bool,
+    accepted: impl Into<crate::mvt_http::Accepted>,
 ) -> Result<crate::mvt_http::TileBody, WmtsErr> {
     let ipv = |text: String, loc: &str| WmtsErr {
         http: 400,
@@ -384,7 +384,7 @@ pub fn get_tile_mvt(
     // range check is the same, so the delegate's own 4xx paths are unreachable from here. They are
     // still mapped rather than unwrapped: a future divergence must surface as an OWS exception, not
     // a panic.
-    crate::mvt_http::render_mvt_tile(state, layer, tms, z, col, row, accept_gzip).map_err(
+    crate::mvt_http::render_mvt_tile(state, layer, tms, z, col, row, accepted.into()).map_err(
         |(http, text)| WmtsErr {
             http,
             code: if http >= 500 {

@@ -166,8 +166,9 @@ impl PmtilesReader {
     }
 
     /// Decoded tile bytes for (z,x,y), or None on a miss. Decompression follows the header's
-    /// `tile_compression`: gzip (2) for MVT, none (1) for the raster archives whose PNG payloads are
-    /// already compressed. Any other value is an error rather than a silently mangled tile.
+    /// `tile_compression`: gzip (2), brotli (3) or zstd (4) for MVT, none (1) for the raster archives
+    /// whose PNG payloads are already compressed. Any other value is an error rather than a silently
+    /// mangled tile.
     ///
     /// Thin wrapper over `get_raw` so the directory descent exists once: the two used to carry
     /// byte-identical copies of it, which is exactly the kind of duplication that drifts.
@@ -175,12 +176,9 @@ impl PmtilesReader {
         let Some(blob) = self.get_raw(z, x, y)? else {
             return Ok(None);
         };
-        match self.header.tile_compression {
-            super::write::COMPRESSION_GZIP => Ok(Some(gunzip(&blob)?)),
-            super::write::COMPRESSION_NONE => Ok(Some(blob)),
-            other => Err(format!(
-                "pmtiles: tile_compression {other} is not supported (1 = none, 2 = gzip)"
-            )),
+        match super::encoding::TileEncoding::from_pmtiles(self.header.tile_compression)? {
+            super::encoding::TileEncoding::Identity => Ok(Some(blob)),
+            enc => Ok(Some(enc.decompress(&blob)?)),
         }
     }
 

@@ -24,6 +24,7 @@ use crate::cog::Cog;
 use crate::render::BandMath;
 use crate::s3::AnySource;
 use crate::style::Style;
+use crate::vector::pmtiles::encoding::TileEncoding;
 use crate::vector::pmtiles::overlay::{compact_overlay_layer, TileOverlay};
 use crate::{wms, Error};
 
@@ -330,6 +331,12 @@ pub struct ServeState {
     pub mvt_dissolve_field: Option<String>,
     /// Dissolve active only at zoom ≤ this (`serve --mvt-dissolve-max-zoom`). `0` = every zoom.
     pub mvt_dissolve_max_zoom: u32,
+    /// Below this zoom MVT tiles use a finer coordinate grid (`serve --mvt-fine-extent-zoom`,
+    /// see `MvtOptimizations::extent_at`). `0` = off.
+    pub mvt_fine_extent_zoom: u32,
+    /// The encoding live MVT tiles are compressed to and cached in (`--tile-encoding`), and the
+    /// preferred transcode target. Default gzip = the 0.3.2 behaviour, byte for byte.
+    pub tile_encoding: TileEncoding,
     /// Operator-supplied MapLibre GL **layer array** (from `serve --mvt-style FILE`) served by
     /// `/mvt/{layer}/style.json` with the source binding injected. `None` → the generic X-ray style.
     pub mvt_style: Option<serde_json::Value>,
@@ -416,6 +423,8 @@ impl ServeState {
             mvt_cell_max_zoom: 0,
             mvt_dissolve_field: None,
             mvt_dissolve_max_zoom: 0,
+            mvt_fine_extent_zoom: 0,
+            tile_encoding: TileEncoding::Gzip,
             mvt_style: None,
             mvt_cache: None,
             wms_cache: None,
@@ -714,10 +723,16 @@ fn xml_response(xml: String) -> Response {
 /// encoding, so the gzip and identity representations of one tile always carry different tags,
 /// as a strong validator must. SipHash over a 200 KB tile is ~0.1 ms next to the ~1 ms archive
 /// read it sits beside.
-fn tile_etag(bytes: &[u8], gzip: bool) -> String {
+fn tile_etag(bytes: &[u8], encoding: TileEncoding) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    gzip.hash(&mut h);
+    // Identity and gzip hash the same `bool` they hashed before 0.3.3, so an upgrade does not
+    // invalidate every ETag a browser already holds; the new codings hash their token.
+    match encoding {
+        TileEncoding::Identity => false.hash(&mut h),
+        TileEncoding::Gzip => true.hash(&mut h),
+        other => other.http_token().hash(&mut h),
+    }
     bytes.hash(&mut h);
     format!("\"{:016x}\"", h.finish())
 }
@@ -744,19 +759,19 @@ fn if_none_match_hits(req: &axum::http::HeaderMap, etag: &str) -> bool {
 ///   on a revisit inside the window, at the price that a rebake + restart inside it stays
 ///   invisible to returning visitors until it expires. 0 = header absent.
 /// - `Vary: Accept-Encoding` whenever the route can answer gzip or identity for one URL (`/mvt`,
-///   see `accepts_gzip`), on BOTH encodings: any cache in front of us (traefik today, a CDN
+///   see `accepted_encodings`), on EVERY encoding: any cache in front of us (traefik today, a CDN
 ///   tomorrow) must key on it or it will eventually hand gzip bytes to a client that never asked.
 /// A 304 carries `ETag`, `Cache-Control` and `Vary` but no body, `Content-Type` or
 /// `Content-Encoding`.
 fn tile_response(
     bytes: Vec<u8>,
     content_type: &'static str,
-    gzip: bool,
+    encoding: TileEncoding,
     varies_by_encoding: bool,
     req: &axum::http::HeaderMap,
     max_age: u32,
 ) -> Response {
-    let etag = tile_etag(&bytes, gzip);
+    let etag = tile_etag(&bytes, encoding);
     let mut r = Response::builder().header(header::ETAG, etag.as_str());
     if varies_by_encoding {
         r = r.header(header::VARY, "Accept-Encoding");
@@ -771,8 +786,8 @@ fn tile_response(
             .unwrap();
     }
     r = r.header(header::CONTENT_TYPE, content_type);
-    if gzip {
-        r = r.header(header::CONTENT_ENCODING, "gzip");
+    if let Some(token) = encoding.http_token() {
+        r = r.header(header::CONTENT_ENCODING, token);
     }
     r.body(Body::from(bytes)).unwrap()
 }
@@ -810,10 +825,17 @@ fn cached_or_render_png<E: Clone + Send + Sync + 'static>(
 }
 
 fn png_response(png: Vec<u8>, req: &axum::http::HeaderMap, max_age: u32) -> Response {
-    tile_response(png, "image/png", false, false, req, max_age)
+    tile_response(
+        png,
+        "image/png",
+        TileEncoding::Identity,
+        false,
+        req,
+        max_age,
+    )
 }
 
-/// One MVT tile response: gzip or identity per the request (`accepts_gzip`), so it varies.
+/// One MVT tile response in whichever encoding the request negotiated (`accepted_encodings`), so it varies.
 fn mvt_response(
     body: crate::mvt_http::TileBody,
     req: &axum::http::HeaderMap,
@@ -822,38 +844,58 @@ fn mvt_response(
     tile_response(
         body.bytes,
         "application/vnd.mapbox-vector-tile",
-        body.gzip,
+        body.encoding,
         true,
         req,
         max_age,
     )
 }
 
-/// Does this client accept gzip? Parses `Accept-Encoding` well enough to be honest about it:
-/// the coding is the token before any `;`, `*` accepts anything, and an explicit `q=0` is a
-/// refusal rather than an offer. Absent header means no -- serving gzip to a client that never
-/// advertised it is exactly the bug this check exists to prevent.
-fn accepts_gzip(headers: &axum::http::HeaderMap) -> bool {
+/// Which content-codings does this client accept? Parses `Accept-Encoding` well enough to be
+/// honest about it: the coding is the token before any `;` (case-insensitive), an explicit `q=0` is
+/// a refusal rather than an offer, and `*` offers every coding the header does not name itself.
+/// Absent header means none -- serving a compressed body to a client that never advertised it is
+/// exactly the bug this check exists to prevent.
+fn accepted_encodings(headers: &axum::http::HeaderMap) -> crate::mvt_http::Accepted {
     let Some(v) = headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
     else {
-        return false;
+        return crate::mvt_http::Accepted::default();
     };
-    v.split(',').any(|part| {
+    // (explicitly named?, offered?) per coding, plus the wildcard's verdict.
+    let mut named = [None::<bool>; 3]; // gzip, br, zstd
+    let mut star = None::<bool>;
+    for part in v.split(',') {
         let mut bits = part.split(';');
-        let coding = bits.next().unwrap_or("").trim();
-        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
-            return false;
-        }
-        !bits.any(|p| {
+        let coding = bits.next().unwrap_or("").trim().to_ascii_lowercase();
+        let refused = bits.any(|p| {
             let p = p.trim();
             p.get(..2)
                 .filter(|k| k.eq_ignore_ascii_case("q="))
                 .and_then(|_| p[2..].trim().parse::<f32>().ok())
                 .is_some_and(|q| q <= 0.0)
-        })
-    })
+        });
+        let slot = match coding.as_str() {
+            "gzip" => Some(0),
+            "br" => Some(1),
+            "zstd" => Some(2),
+            "*" => {
+                star = Some(!refused);
+                None
+            }
+            _ => None,
+        };
+        if let Some(i) = slot {
+            named[i] = Some(!refused);
+        }
+    }
+    let get = |i: usize| named[i].unwrap_or(star.unwrap_or(false));
+    crate::mvt_http::Accepted {
+        gzip: get(0),
+        br: get(1),
+        zstd: get(2),
+    }
 }
 
 fn status_response(status: u16, msg: String) -> Response {
@@ -933,11 +975,11 @@ async fn mvt_tile_handler(
         Ok(v) => v,
         Err(_) => return status_response(400, format!("bad tile y '{yfile}'")),
     };
-    let want_gzip = accepts_gzip(&headers);
+    let accepted = accepted_encodings(&headers);
     let _permit = state.render_limiter.acquire().await; // admission control (bounded concurrent renders)
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::mvt_http::render_mvt_tile(&st, &layer, &tms, z, x, y, want_gzip)
+        crate::mvt_http::render_mvt_tile(&st, &layer, &tms, z, x, y, accepted)
     })
     .await;
     match result {
@@ -1158,9 +1200,9 @@ async fn wmts_kvp_handler(
             if format.eq_ignore_ascii_case(crate::wmts::MVT_FORMAT) {
                 // Whether the CLIENT can take gzip, so an archive hit reaches it in the encoding
                 // the archive already stores — the same negotiation the `/mvt` route does.
-                let accept_gzip = accepts_gzip(&headers);
+                let accepted = accepted_encodings(&headers);
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::wmts::get_tile_mvt(&st, &layer, &style, &tms, z, row, col, accept_gzip)
+                    crate::wmts::get_tile_mvt(&st, &layer, &style, &tms, z, row, col, accepted)
                 })
                 .await;
                 return match result {
@@ -1529,29 +1571,85 @@ mod inline_json_tests {
         let h = |v: &str| {
             let mut m = HeaderMap::new();
             m.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
-            m
+            super::accepted_encodings(&m)
         };
+        let gz = |v: &str| h(v).gzip;
 
         // Real browsers, in the shapes they actually send.
-        assert!(super::accepts_gzip(&h("gzip, deflate, br")));
-        assert!(super::accepts_gzip(&h("gzip;q=1.0, identity;q=0.5")));
-        assert!(super::accepts_gzip(&h("br;q=1.0, gzip;q=0.8")));
-        assert!(super::accepts_gzip(&h("GZIP"))); // codings are case-insensitive
-        assert!(super::accepts_gzip(&h("*")));
+        assert!(gz("gzip, deflate, br"));
+        assert!(gz("gzip;q=1.0, identity;q=0.5"));
+        assert!(gz("br;q=1.0, gzip;q=0.8"));
+        assert!(gz("GZIP")); // codings are case-insensitive
+        assert!(gz("*"));
 
         // Absent header is NOT permission -- this is the default for curl, and for anything
         // hand-rolled that would choke on a compressed body.
-        assert!(!super::accepts_gzip(&HeaderMap::new()));
+        assert_eq!(
+            super::accepted_encodings(&HeaderMap::new()),
+            crate::mvt_http::Accepted::default()
+        );
 
         // An explicit refusal must be honoured even though the token is present.
-        assert!(!super::accepts_gzip(&h("gzip;q=0")));
-        assert!(!super::accepts_gzip(&h("gzip;q=0.0")));
-        assert!(!super::accepts_gzip(&h("identity")));
-        assert!(!super::accepts_gzip(&h("deflate, br")));
-        assert!(!super::accepts_gzip(&h("")));
+        assert!(!gz("gzip;q=0"));
+        assert!(!gz("gzip;q=0.0"));
+        assert!(!gz("identity"));
+        assert!(!gz("deflate, br"));
+        assert!(!gz(""));
         // Substring traps: neither of these offers gzip.
-        assert!(!super::accepts_gzip(&h("x-gzip-ish")));
-        assert!(!super::accepts_gzip(&h("notgzip")));
+        assert!(!gz("x-gzip-ish"));
+        assert!(!gz("notgzip"));
+    }
+
+    /// br and zstd get the same honesty as gzip, and `*` offers only what is not named.
+    #[test]
+    fn accept_encoding_sees_br_and_zstd() {
+        use axum::http::{header, HeaderMap};
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::ACCEPT_ENCODING, v.parse().unwrap());
+            super::accepted_encodings(&m)
+        };
+        let chrome = h("gzip, deflate, br, zstd");
+        assert!(chrome.gzip && chrome.br && chrome.zstd);
+        let a = h("gzip, br;q=0");
+        assert!(a.gzip && !a.br && !a.zstd);
+        let b = h("BR, ZSTD;q=0.5");
+        assert!(!b.gzip && b.br && b.zstd);
+        let star = h("*, zstd;q=0");
+        assert!(
+            star.gzip && star.br && !star.zstd,
+            "named refusal beats the wildcard"
+        );
+        let nostar = h("*;q=0, br");
+        assert!(!nostar.gzip && nostar.br && !nostar.zstd);
+        assert!(!h("brotli").br, "the token is `br`, not `brotli`");
+    }
+
+    /// A br or zstd body says so, and gets its own ETag.
+    #[test]
+    fn br_and_zstd_bodies_are_labelled_and_tagged_apart() {
+        use crate::vector::pmtiles::encoding::TileEncoding;
+        use axum::http::header;
+        let none = axum::http::HeaderMap::new();
+        let resp = |enc| {
+            super::mvt_response(
+                crate::mvt_http::TileBody {
+                    bytes: vec![1, 2, 3],
+                    encoding: enc,
+                },
+                &none,
+                0,
+            )
+        };
+        let br = resp(TileEncoding::Brotli);
+        let zs = resp(TileEncoding::Zstd);
+        let gz = resp(TileEncoding::Gzip);
+        assert_eq!(br.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+        assert_eq!(zs.headers().get(header::CONTENT_ENCODING).unwrap(), "zstd");
+        let tag = |r: &axum::response::Response| r.headers().get(header::ETAG).unwrap().clone();
+        assert_ne!(tag(&br), tag(&zs));
+        assert_ne!(tag(&br), tag(&gz));
+        assert_ne!(tag(&zs), tag(&gz));
     }
 
     /// The response must never claim an encoding it did not apply, and must always tell caches
@@ -1563,7 +1661,7 @@ mod inline_json_tests {
         let gz = super::mvt_response(
             crate::mvt_http::TileBody {
                 bytes: vec![1, 2, 3],
-                gzip: true,
+                encoding: crate::vector::pmtiles::encoding::TileEncoding::Gzip,
             },
             &none,
             0,
@@ -1599,7 +1697,7 @@ mod inline_json_tests {
         let gz = super::mvt_response(
             crate::mvt_http::TileBody {
                 bytes: vec![1, 2, 3],
-                gzip: true,
+                encoding: crate::vector::pmtiles::encoding::TileEncoding::Gzip,
             },
             &none,
             0,
@@ -1651,7 +1749,7 @@ mod inline_json_tests {
         use axum::http::{header, StatusCode};
         let body = || crate::mvt_http::TileBody {
             bytes: vec![1, 2, 3],
-            gzip: true,
+            encoding: crate::vector::pmtiles::encoding::TileEncoding::Gzip,
         };
         let none = axum::http::HeaderMap::new();
         let etag = super::mvt_response(body(), &none, 3600)

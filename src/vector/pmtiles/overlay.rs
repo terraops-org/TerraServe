@@ -120,6 +120,18 @@ impl TileOverlay {
     /// in-RAM index and truncates any torn tail (a crash mid-append) so the file ends on a clean
     /// record boundary.
     pub fn open(log_path: &Path, base: Option<Arc<PmtilesReader>>) -> PmResult<TileOverlay> {
+        // The log stores gzip and compaction writes ONE `tile_compression` byte for base + log
+        // together, so a brotli/zstd base would come out of compaction mislabelled. Refuse it up
+        // front; bake the base with gzip (the default) to use write-through.
+        if let Some(b) = &base {
+            if b.tile_compression() != crate::vector::pmtiles::write::COMPRESSION_GZIP {
+                return Err(format!(
+                    "write-through cache needs a gzip base archive, this one has tile_compression {} \
+                     (re-bake it with --tile-compression gzip)",
+                    b.tile_compression()
+                ));
+            }
+        }
         let exists = log_path.exists();
         if !exists {
             let mut f = File::create(log_path).map_err(|e| format!("overlay create: {e}"))?;
@@ -489,6 +501,43 @@ pub(crate) fn compact_overlay_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A brotli/zstd base archive would come out of compaction under a gzip header; refuse it.
+    #[test]
+    fn a_non_gzip_base_archive_is_refused() {
+        use crate::vector::pmtiles::encoding::{Effort, TileEncoding};
+        use crate::vector::pmtiles::read::PmtilesReader;
+        use crate::vector::pmtiles::write::{HeaderFields, PmtilesWriter, TILE_TYPE_MVT};
+        let dir = std::env::temp_dir().join(format!("ts_ov_br_base_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base_path = dir.join("base.pmtiles");
+        let mut w = PmtilesWriter::new(&dir)
+            .unwrap()
+            .tile_format(TILE_TYPE_MVT, TileEncoding::Brotli.to_pmtiles());
+        w.add(
+            crate::vector::pmtiles::zxy_to_tileid(0, 0, 0),
+            TileEncoding::Brotli.compress(b"tile", Effort::Archive, None),
+        )
+        .unwrap();
+        w.finish(
+            HeaderFields {
+                min_zoom: 0,
+                max_zoom: 0,
+                bounds_e7: [0, 0, 0, 0],
+                center: (0, 0, 0),
+            },
+            "{}",
+            &base_path,
+        )
+        .unwrap();
+        let base = Arc::new(PmtilesReader::open(&base_path).unwrap());
+        let err = match TileOverlay::open(&dir.join("log.tsov"), Some(base)) {
+            Ok(_) => panic!("a brotli base must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("gzip base"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn put_get_and_last_writer_wins() {
