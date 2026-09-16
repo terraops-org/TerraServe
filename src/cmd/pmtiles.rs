@@ -501,3 +501,65 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// `terraserve pmtiles-recompress`: re-encode an MVT archive's tiles into another compression
+/// without re-baking it (no source read, no gates): the decoded tiles are byte-identical, and the
+/// command proves it tile by tile before it reports success.
+#[derive(clap::Args, Debug, Clone)]
+pub struct RecompressPmtilesArgs {
+    /// The MVT archive to read.
+    #[arg(long = "in")]
+    pub input: String,
+    /// The archive to write. Refused if it is the same path as `--in`.
+    #[arg(long = "out")]
+    pub out: String,
+    /// Target compression: `zstd` (default, level 19), `br` (brotli 11) or `gzip` (level 6).
+    #[arg(long = "tile-compression", default_value = "zstd")]
+    pub tile_compression: String,
+    /// Override the level: gzip 0-9, brotli 0-11, zstd 1-22.
+    #[arg(long = "tile-compression-level")]
+    pub tile_compression_level: Option<i32>,
+    /// Scratch directory for the streamed data section. Default: next to `--out`.
+    #[arg(long = "tmpdir")]
+    pub tmpdir: Option<String>,
+}
+
+pub fn run_recompress_pmtiles(args: &RecompressPmtilesArgs) -> Result<(), Error> {
+    use crate::vector::pmtiles::{encoding::TileEncoding, recompress};
+    let input = std::path::Path::new(&args.input);
+    let out = std::path::Path::new(&args.out);
+    if input.canonicalize().ok() == out.canonicalize().ok() && out.exists() {
+        return Err("pmtiles-recompress: --out must differ from --in".into());
+    }
+    let to = TileEncoding::parse_cli(&args.tile_compression)
+        .map_err(|e| format!("--tile-compression: {e}"))?;
+    let tmp = match &args.tmpdir {
+        Some(t) => std::path::PathBuf::from(t),
+        None => out
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(".")),
+    };
+    let started = std::time::Instant::now();
+    let counts = recompress::recompress_pmtiles(input, out, &tmp, to, args.tile_compression_level)?;
+    let before = std::fs::metadata(input).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "pmtiles-recompress: {} -> {} ({}) · addressed {} · entries {} · contents {} · {} -> {} bytes ({:+.1}%) · {:.1}s",
+        args.input,
+        args.out,
+        to.http_token().unwrap_or("none"),
+        counts.addressed,
+        counts.entries,
+        counts.contents,
+        before,
+        counts.bytes,
+        (counts.bytes as f64 / before.max(1) as f64 - 1.0) * 100.0,
+        started.elapsed().as_secs_f64()
+    );
+    let checked = recompress::verify_same_tiles(input, out)?;
+    println!(
+        "verified: {checked} addressed tiles decode identically, same ids, metadata and bounds"
+    );
+    Ok(())
+}

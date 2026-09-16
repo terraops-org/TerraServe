@@ -77,6 +77,28 @@ impl PmtilesReader {
         })
     }
 
+    /// The archive header as read from disk.
+    pub fn header(&self) -> &super::Header {
+        &self.header
+    }
+
+    /// Every TILE entry (run_length > 0), leaves descended, in directory order (ascending ids).
+    pub fn tile_entries(&self) -> PmResult<Vec<Entry>> {
+        let mut out = Vec::new();
+        self.walk_dir(&self.root, &mut |e| out.push(*e))?;
+        Ok(out)
+    }
+
+    /// The stored blob one tile entry points at (not decompressed).
+    pub fn entry_blob(&self, e: &Entry) -> PmResult<Vec<u8>> {
+        let off = self
+            .header
+            .tile_data_offset
+            .checked_add(e.offset)
+            .ok_or_else(|| "pmtiles: offset overflow".to_string())?;
+        read_at(&self.file, self.file_len, off, e.length)
+    }
+
     pub fn metadata(&self) -> &str {
         &self.metadata
     }

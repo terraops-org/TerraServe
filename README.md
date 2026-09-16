@@ -180,6 +180,9 @@ terraserve build-pmtiles --vector buildings.fgb --vec-style buildings.sld --name
   --min-zoom 0 --max-zoom 10 --mvt-fine-extent-zoom 6 --tile-compression zstd --out buildings.pmtiles
 terraserve serve --vector buildings.fgb --vec-style buildings.sld --name buildings \
   --pmtiles buildings.pmtiles --mvt-fine-extent-zoom 6 --tile-encoding br --port 8080
+
+# re-encode an existing archive as zstd WITHOUT re-baking it; every tile is checked identical
+terraserve pmtiles-recompress --in buildings.pmtiles --out buildings.zstd.pmtiles
 ```
 
 Full flag reference, the multi-layer YAML, and the **pitfalls** worth knowing before you deploy:

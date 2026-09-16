@@ -57,6 +57,9 @@ enum Cmd {
     BuildTopology(terraserve::BuildTopologyArgs),
     /// Bake an offline `.pmtiles` vector pyramid from a vector source (PMTiles task 6).
     BuildPmtiles(terraserve::BuildPmtilesArgs),
+    /// Re-encode an MVT `.pmtiles` archive into another tile compression (zstd, br, gzip)
+    /// without re-baking it, then verify every tile decodes identically.
+    PmtilesRecompress(terraserve::RecompressPmtilesArgs),
     /// Write a per-zoom pre-generalized SUBSET of a vector source as a GeoPackage, so tiling
     /// becomes a pure spatial cut with no per-tile selection left to vary between neighbours.
     Extract(terraserve::ExtractArgs),
@@ -76,6 +79,7 @@ fn main() -> std::process::ExitCode {
         Cmd::Serve(args) => terraserve::run_serve(&args),
         Cmd::BuildTopology(args) => terraserve::run_build_topology(&args),
         Cmd::BuildPmtiles(args) => terraserve::run_build_pmtiles(&args),
+        Cmd::PmtilesRecompress(args) => terraserve::run_recompress_pmtiles(&args),
         Cmd::Extract(args) => terraserve::run_extract(&args),
     };
     match result {

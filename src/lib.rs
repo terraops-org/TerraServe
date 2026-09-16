@@ -49,7 +49,9 @@ pub type Error = Box<dyn std::error::Error>;
 pub use projdata::{ensure_proj_data, proj_status, run_info, ProjStatus};
 
 pub use cmd::extract::{run_extract, ExtractArgs};
-pub use cmd::pmtiles::{run_build_pmtiles, BuildPmtilesArgs};
+pub use cmd::pmtiles::{
+    run_build_pmtiles, run_recompress_pmtiles, BuildPmtilesArgs, RecompressPmtilesArgs,
+};
 pub use cmd::render::{run_render, run_wms_handle, RenderArgs, WmsArgs};
 pub use cmd::serve::{run_serve, ServeArgs};
 pub use cmd::topology::{run_build_topology, BuildTopologyArgs};

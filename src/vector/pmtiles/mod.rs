@@ -10,6 +10,7 @@ pub mod generate;
 pub mod overlay;
 pub mod raster;
 pub mod read;
+pub mod recompress;
 pub mod write;
 
 pub type PmResult<T> = Result<T, String>;
