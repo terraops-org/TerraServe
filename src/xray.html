@@ -341,7 +341,7 @@ function ruleValue(rule, feature) {
 
 function parseTheme(styleDoc) {
   if (!styleDoc || !Array.isArray(styleDoc.layers)) return null;
-  var t = { fill: null, line: null, circle: null, radius: null, glow: false, seamless: false, field: null, legend: null, title: null };
+  var t = { fill: null, line: null, circle: null, radius: null, glow: false, glowMinZoom: null, seamless: false, field: null, legend: null, title: null };
   var anyMatch = false, anyRule = false;
   // `metadata.glow: true` = the layer is made of SMALL, SPARSE features (building footprints,
   // parcels) rather than a wall-to-wall coverage. Such features go sub-pixel at overview zoom, so
@@ -351,6 +351,12 @@ function parseTheme(styleDoc) {
   // coverage like COS or landuse, where the dark boundary usefully separates adjacent classes.
   // Read per style layer (`layers[].metadata.glow`) with the document-level flag as the fallback.
   var docGlow = !!(styleDoc.metadata && styleDoc.metadata.glow === true);
+  // `metadata.glow_min_zoom: N` = glow only from map zoom N up. Glow is the treatment for
+  // SUB-PIXEL features, so a layer that replaces them with something bigger at overview zoom (the
+  // `--mvt-cell-px` mosaic: a 2 px cell is not sub-pixel) must not glow there, or the cells read as
+  // a bright halo field instead of the quiet mask they are. Read per style layer, then document.
+  var docGlowMin = styleDoc.metadata && typeof styleDoc.metadata.glow_min_zoom === 'number'
+    ? styleDoc.metadata.glow_min_zoom : null;
   styleDoc.layers.forEach(function (l) {
     var paint = l.paint || {};
     var rule = null;
@@ -366,6 +372,7 @@ function parseTheme(styleDoc) {
       anyMatch = true;
       if (!t.field) t.field = rule.field;
       if (l.metadata && l.metadata.glow === true) t.glow = true;
+      if (l.metadata && typeof l.metadata.glow_min_zoom === 'number') t.glowMinZoom = l.metadata.glow_min_zoom;
     }
     // `metadata.seamless: true` on a fill layer = a base coverage cut into arbitrary pieces (the
     // eu5 `land` layer is OSM land polygons split on a grid): stroke the pieces in their own
@@ -377,6 +384,7 @@ function parseTheme(styleDoc) {
   // cyan wireframe.
   if (!anyMatch && !anyRule) return null;
   if (docGlow) t.glow = true;
+  if (t.glowMinZoom === null) t.glowMinZoom = docGlowMin;
   // Operator legend (metadata.legend = [{color,label}], metadata.title), e.g. the DGT COS2018
   // megaclasses; otherwise the legend is built from the first class match below.
   if (styleDoc.metadata) { t.legend = styleDoc.metadata.legend || null; t.title = styleDoc.metadata.title || null; }
@@ -406,6 +414,14 @@ function pointZoomFactor(resolution) {
   if (!isFinite(z)) return 1;
   if (z >= POINT_FULL_SIZE_ZOOM) return 1;
   return Math.max(POINT_MIN_FACTOR, 1 - (POINT_FULL_SIZE_ZOOM - z) / POINT_FULL_SIZE_ZOOM);
+}
+
+// Glow on for THIS zoom? `metadata.glow_min_zoom` off (null) keeps the old always-on behaviour.
+function glowActive(theme, resolution) {
+  if (!theme || !theme.glow) return false;
+  if (theme.glowMinZoom === null || !xrayMap || !isFinite(resolution)) return true;
+  var z = xrayMap.getView().getZoomForResolution(resolution);
+  return !isFinite(z) || z >= theme.glowMinZoom;
 }
 
 function xrayStyle(feature, theme, resolution) {
@@ -447,7 +463,7 @@ function xrayStyle(feature, theme, resolution) {
   // with a thin dark class boundary. Falls through to the cyan wireframe when no theme is loaded.
   if (themed && (theme.fill || theme.line) && (type === 'Polygon' || type === 'MultiPolygon')) {
     var col = ruleValue(theme.fill || theme.line, feature);
-    if (theme.glow) {
+    if (glowActive(theme, resolution)) {
       // Sparse small features: halo + same-colour stroke so a sub-pixel footprint still paints
       // its own colour instead of the near-black boundary (which is ALL that renders once the
       // interior drops below a pixel — that's why fluorescent fills looked black at z6).
