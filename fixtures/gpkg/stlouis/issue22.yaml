@@ -1,0 +1,14 @@
+# Issue #22 exactly as reported: two layers over one multi-table GeoPackage and no table named.
+# Must REFUSE to start and list the tables (it used to serve the first table, PointsOfInterest,
+# as both layers). Paths are relative to the process CWD, i.e. the terraserve crate root.
+layers:
+  - name: Parks
+    vector: fixtures/gpkg/stlouis/stlouis.gpkg
+    vec_style: fixtures/gpkg/stlouis/parks.sld
+    src_crs: EPSG:4326
+    extent: [-90.3, 38.5, -90.1, 38.7]
+  - name: Pizza
+    vector: fixtures/gpkg/stlouis/stlouis.gpkg
+    vec_style: fixtures/gpkg/stlouis/pizza.sld
+    src_crs: EPSG:4326
+    extent: [-90.3, 38.5, -90.1, 38.7]

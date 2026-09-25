@@ -8,7 +8,7 @@ components and embed one third-party data file. Those distributions carry this n
 libproj (the default `cargo build`) links none of this statically and needs none of it.
 
 The Docker image is not affected either: it installs libproj from the distribution, under the
-distribution's own packaging.
+distribution's own packaging. It does carry one third-party sample data file, described at the end.
 
 ## PROJ, and the `proj.db` database embedded in the binary
 
@@ -64,6 +64,13 @@ required, and it is named here only for completeness.
 Embedded via `tikv-jemallocator` as the global allocator in the server binary (not in the
 Python extension module, which drops it). jemalloc is 2-clause BSD.
 Copyright (C) 2002-present Jason Evans and others.
+
+## Sample data in the Docker image
+
+The image copies `fixtures/`, which includes `fixtures/gpkg/stlouis/stlouis.gpkg`: the StLouis
+GeoPackage from <https://github.com/ngageoint/geopackage-js> (its raster `tiles` table removed),
+used as a test fixture. MIT licence, Copyright (c) 2015 National Geospatial-Intelligence Agency;
+the licence text travels beside it in `fixtures/gpkg/stlouis/LICENSE`.
 
 ## Rust crates
 

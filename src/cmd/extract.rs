@@ -51,6 +51,11 @@ pub struct ExtractArgs {
     /// are chained (extract z_n from the z_{n+1} subset, never from the full table).
     #[arg(long = "vector")]
     pub vector: String,
+    /// The table to read when `--vector` is a GeoPackage, e.g. `Parks`. Required when the file
+    /// holds more than one feature table (startup fails and lists them); optional with exactly
+    /// one. Refused on any other source. The `--config` equivalent is a layer's `vec_layer:`.
+    #[arg(long = "vector-layer")]
+    pub vector_layer: Option<String>,
 
     /// Vector style. Required only because `extract` builds its layer through the same path
     /// `serve` and `build-pmtiles` use; nothing here renders, and the style does not affect which
@@ -190,6 +195,7 @@ pub fn run_extract(args: &ExtractArgs) -> Result<(), Error> {
         "fixtures/fonts/DejaVuSans.ttf".to_string(),
         args.src_crs.clone(),
     )
+    .with_vec_layer(args.vector_layer.clone())
     .with_extent(match args.extent.as_deref() {
         Some(s) => Some(parse_bbox(s)?),
         None => None,
@@ -459,6 +465,7 @@ fn serve_args_for(args: &ExtractArgs) -> ServeArgs {
         s3_region: None,
         name: Some(args.name.clone()),
         vector: Some(args.vector.clone()),
+        vector_layer: args.vector_layer.clone(),
         pmtiles: Vec::new(),
         raster_pmtiles: Vec::new(),
         pmtiles_cache: false,

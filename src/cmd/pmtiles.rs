@@ -27,6 +27,11 @@ pub struct BuildPmtilesArgs {
     /// Vector source (.gpkg, .fgb, or GeoJSON) to bake into the pyramid.
     #[arg(long)]
     pub vector: Option<String>,
+    /// The table to read when `--vector` is a GeoPackage, e.g. `Parks`. Required when the file
+    /// holds more than one feature table (startup fails and lists them); optional with exactly
+    /// one. Refused on any other source. The `--config` equivalent is a layer's `vec_layer:`.
+    #[arg(long = "vector-layer")]
+    pub vector_layer: Option<String>,
     /// Output `.pmtiles` path.
     #[arg(long)]
     pub out: String,
@@ -274,6 +279,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         s3_region: None,
         name: args.name.clone(),
         vector: args.vector.clone(),
+        vector_layer: args.vector_layer.clone(),
         pmtiles: Vec::new(),
         raster_pmtiles: Vec::new(),
         pmtiles_cache: false,
@@ -350,6 +356,7 @@ pub fn run_build_pmtiles(args: &BuildPmtilesArgs) -> Result<(), Error> {
         font.to_string(),
         declared_crs,
     )
+    .with_vec_layer(serve_args.vector_layer.clone())
     .with_extent(extent)
     .with_grids(
         serve_args.tms_grids.clone(),

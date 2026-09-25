@@ -120,9 +120,15 @@ vector tiles** (bespoke protobuf encoder + TileJSON), all over one engine. A ras
 
 **Tile grids are projection-generic.** Web Mercator is a preset, not an assumption: any OGC
 TileMatrixSet 2.0 JSON works, and the tree ships `WebMercatorQuad`, `WorldCRS84Quad`, the two polar
-UPS grids, the Swiss `swissLV95` (EPSG:2056), and **`EuropeanETRS89_LAEAQuad`** (EPSG:3035) - the
+UPS grids, two Swiss grids for EPSG:2056 (`SwissLV95CellSizes` from the eCH-0056 standard, and
+`swissLV95`, swisstopo's own WMTS pyramid), and **`EuropeanETRS89_LAEAQuad`** (EPSG:3035) - the
 OGC-registered equal-area grid that Eurostat and INSPIRE standardise on for European work. Both the
 raster and vector tile paths serve any of them, and a layer can publish several at once.
+
+A grid document is checked when it loads: a level whose `matrixWidth` / `matrixHeight` cannot cover
+what the other levels cover is reported at startup (the published eCH-0056 file has one, level 5
+says 3 rows where 13 are needed; the shipped fixture corrects it), and two different grids under one
+id are refused, since `/tileMatrixSets/{id}` can only answer with one.
 
 Axis order is taken from the CRS rather than assumed, in both directions: a TMS document's
 `orderedAxes` is honoured on read, and WMTS capabilities writes `TopLeftCorner` in the order the
@@ -145,6 +151,10 @@ terraserve render --cog cascais.cog.deflate.tif --bbox -9.45,38.68,-9.38,38.72 \
 # native GeoPackage vector over WMS + MVT (auto-detects the layer CRS)
 terraserve serve --vector data.gpkg --vec-style fixtures/styles/cos2023.sld \
   --name mylayer --host 0.0.0.0 --port 8080
+
+# a GeoPackage with several feature tables: name the one to read (required when there is more
+# than one; startup lists them otherwise). In a --config layer this is `vec_layer: Parks`.
+terraserve serve --vector stlouis.gpkg --vector-layer Parks --vec-style parks.sld --port 8080
 
 # on-the-fly NDVI band-math from a Sentinel-2 COG
 terraserve serve --cog s2_stack.cog.tif --style fixtures/styles/ndvi.json --src-crs EPSG:32629 \

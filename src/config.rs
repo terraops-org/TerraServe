@@ -39,6 +39,12 @@ pub struct LayerConfig {
     /// Vector source: a local GeoJSON or GeoPackage path. Mutually exclusive with `cog`.
     #[serde(default)]
     pub vector: Option<String>,
+    /// The table to read when `vector` is a GeoPackage, e.g. `Parks`. Required when the file
+    /// holds more than one feature table (startup fails and lists them); optional with exactly
+    /// one. Chosen HERE and nowhere else: neither `name:` nor the style's `<NamedLayer><Name>`
+    /// selects data (issue #22). Refused on any source that is not a GeoPackage.
+    #[serde(default)]
+    pub vec_layer: Option<String>,
     /// Vector style (point/text/polygon/line Style IR JSON) for a `vector` layer. Required with `vector`.
     #[serde(default)]
     pub vec_style: Option<String>,
@@ -219,15 +225,14 @@ pub fn default_tile_px() -> u32 {
 /// alone (without per-level dims) would care, and that front-end already only advertises `full_extent`
 /// (level 0) for such a grid, a pre-existing, documented limitation (not one this task changes).
 ///
-/// CAVEAT scoping the "correct regardless of invariance" claim above: only tile GEOMETRY is
-/// invariance-agnostic. The OPT-IN, WebMercator-calibrated MVT feature-size heuristics —
-/// `--mvt-min-feature-px` and the per-zoom LOD tolerance, both routed through
-/// `vector::mvt::tile::merc_m_per_px` (a hardcoded `2^z` ladder) — ASSUME dyadic level doubling, so
-/// on a non-dyadic `.json` grid they over/under-thin features by the ratio between the real
-/// `cellSize` and the Mercator `2^z` resolution (an ~84x error at some `swissLV95` levels). This
-/// knob is OFF by default (`min_feature_px = 0.0`) and never affects tile geometry or the default
-/// path; the design spec declares these heuristics out-of-scope for v1. Fast-follow fix: make
-/// `min_area_src_for_zoom`/the LOD tolerance read `level(z).resolution` instead of `2^z`.
+/// CAVEAT scoping the "correct regardless of invariance" claim above, as of 2026-09-25: the MVT
+/// size gates (`--mvt-min-feature-px`, `--mvt-min-feature-len-px`) read the served level's REAL
+/// `cellSize` (`vector::mvt::tile::min_area_src_for_grid` / `min_len_src_for_grid`, fixed for the
+/// LAEA grid), and the raster gate derives its zoom from the real scale denominator, so both are
+/// right on a non-dyadic `.json` grid. What still ASSUMES the Mercator `2^z` ladder is the per-zoom
+/// topology LOD tolerance (`vector::topology::lod`, `--topology-simplify`), which over/under-thins
+/// by the ratio between the real `cellSize` and `merc_m_per_px(z)` (~84x at some `swissLV95`
+/// levels). Opt-in, never affects tile geometry, and no custom-grid demo uses it.
 fn resolve_one(
     id: &str,
     tile_px: u32,
@@ -263,9 +268,11 @@ pub fn resolve_grids_presets(
     tile_px: u32,
     custom: &BTreeMap<String, GridConfig>,
 ) -> Result<Vec<TileMatrixSet>, String> {
-    ids.iter()
+    let grids = ids
+        .iter()
         .map(|id| resolve_one(id, tile_px, None, custom))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    unique_grid_ids(ids, grids)
 }
 
 /// Resolve a layer's full grid id list (including `from_cog`, which needs the parsed COG + CRS).
@@ -276,9 +283,30 @@ pub fn resolve_grids(
     crs: &str,
     custom: &BTreeMap<String, GridConfig>,
 ) -> Result<Vec<TileMatrixSet>, String> {
-    ids.iter()
+    let grids = ids
+        .iter()
         .map(|id| resolve_one(id, tile_px, Some((cog, crs)), custom))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    unique_grid_ids(ids, grids)
+}
+
+/// A layer publishes each grid id once. Two entries resolving to the same id (the same preset
+/// twice, or two files that both declare `"id": "X"`) left the tile routes and
+/// `/tileMatrixSets/{id}` to pick one silently. `ids[i]` is what produced `grids[i]`.
+fn unique_grid_ids(
+    ids: &[String],
+    grids: Vec<TileMatrixSet>,
+) -> Result<Vec<TileMatrixSet>, String> {
+    for (i, g) in grids.iter().enumerate() {
+        if let Some(j) = grids[..i].iter().position(|h| h.id == g.id) {
+            return Err(format!(
+                "grid id '{}' is listed twice: by '{}' and by '{}'. A layer publishes each grid \
+                 once; if both are wanted, give one of them its own id.",
+                g.id, ids[j], ids[i]
+            ));
+        }
+    }
+    Ok(grids)
 }
 
 impl Config {
@@ -312,6 +340,13 @@ impl LayerConfig {
                 if self.style.is_none() {
                     return Err(format!(
                         "layer '{}': a `cog` layer needs a `style`",
+                        self.name
+                    ));
+                }
+                if self.vec_layer.is_some() {
+                    return Err(format!(
+                        "layer '{}': `vec_layer` names a GeoPackage table and needs a `vector` \
+                         source, not a `cog`",
                         self.name
                     ));
                 }
@@ -424,6 +459,68 @@ layers:
             cfg.layers[0].extent,
             Some([2485000.0, 1075000.0, 2834000.0, 1296000.0])
         );
+    }
+
+    /// A layer publishing one grid id twice is ambiguous: tile routes and `/tileMatrixSets/{id}`
+    /// pick one silently. Found 2026-09-25 while loading the published eCH-0056 file next to the
+    /// corrected one: both say `SwissLV95CellSizes`, and the layer advertised the id twice.
+    #[test]
+    fn a_layer_listing_one_grid_id_twice_is_refused() {
+        let dup = std::env::temp_dir().join(format!("ts_dup_grid_{}.json", std::process::id()));
+        std::fs::copy("fixtures/grids/eCH-0056_SwissLV95CellSizes.json", &dup).unwrap();
+        let ids = vec![
+            "fixtures/grids/eCH-0056_SwissLV95CellSizes.json".to_string(),
+            dup.to_str().unwrap().to_string(),
+        ];
+        let err = resolve_grids_presets(&ids, 256, &BTreeMap::new()).unwrap_err();
+        let _ = std::fs::remove_file(&dup);
+        assert!(
+            err.contains("SwissLV95CellSizes"),
+            "must name the id: {err}"
+        );
+        assert!(
+            err.contains(&ids[1]),
+            "must name where the second came from: {err}"
+        );
+
+        let presets = vec!["WebMercatorQuad".to_string(), "WebMercatorQuad".to_string()];
+        assert!(resolve_grids_presets(&presets, 256, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn distinct_grid_ids_on_one_layer_are_fine() {
+        let ids = vec![
+            "fixtures/grids/eCH-0056_SwissLV95CellSizes.json".to_string(),
+            "fixtures/grids/swissLV95.json".to_string(),
+            "WebMercatorQuad".to_string(),
+        ];
+        assert_eq!(
+            resolve_grids_presets(&ids, 256, &BTreeMap::new())
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn vec_layer_names_the_geopackage_table() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: Parks\n    vector: stlouis.gpkg\n    vec_layer: Parks\n    \
+             vec_style: parks.sld\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.layers[0].vec_layer.as_deref(), Some("Parks"));
+        cfg.layers[0].validate().unwrap();
+    }
+
+    #[test]
+    fn vec_layer_on_a_cog_layer_is_rejected() {
+        let cfg: Config = serde_yaml::from_str(
+            "layers:\n  - name: dem\n    cog: dem.tif\n    style: s.json\n    vec_layer: Parks\n",
+        )
+        .unwrap();
+        let err = cfg.layers[0].validate().unwrap_err();
+        assert!(err.contains("vec_layer"), "must name the setting: {err}");
     }
 
     #[test]

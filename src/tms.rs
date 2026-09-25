@@ -9,9 +9,10 @@
 //! Verified grid numbers: docs/tilematrixset-reference.md (authoritative OGC registry JSON).
 
 use crate::cog::Cog;
+use std::collections::BTreeMap;
 
 /// One zoom level of a grid. `resolution` = CRS units per pixel (== OGC cellSize == TMS upp).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TmLevel {
     pub z: u32,
     pub resolution: f64,
@@ -20,7 +21,7 @@ pub struct TmLevel {
 }
 
 /// A tile grid: CRS + top-left origin + tile size + the per-zoom pyramid.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TileMatrixSet {
     pub id: String,
     pub crs: String,
@@ -325,6 +326,96 @@ fn origin_is_northing_first(ordered_axes: Option<&Vec<String>>, crs: &str) -> bo
     from_crs.unwrap_or(false)
 }
 
+/// A grid level whose tiles cover LESS than the other levels do along one axis: requests for the
+/// missing rows/columns are refused as out of range, so part of the map disappears at that zoom.
+#[derive(Debug, PartialEq)]
+pub struct UndersizedLevel {
+    pub z: u32,
+    /// `"matrixWidth"` or `"matrixHeight"`, the field to fix in the grid document.
+    pub axis: &'static str,
+    pub declared: u32,
+    /// The smallest count that covers what the other levels agree the grid covers.
+    pub needed: u32,
+}
+
+/// Levels whose declared matrix size cannot cover the grid's extent (issue #21: eCH-0056 publishes
+/// `matrixHeight: 3` at its 100 m level where 13 are needed).
+///
+/// Every level covers the grid's extent `E`, rounded UP to whole tiles, so a correct level's
+/// coverage `c` and tile span `s` satisfy `c - s < E <= c`: each level gives a lower bound `c - s`
+/// on `E`. A level whose coverage falls below the MEDIAN of those bounds cannot reach the extent the
+/// other levels agree on. The median, not the maximum, because one over-generous level (a matrix
+/// larger than needed, which is harmless) would otherwise raise the bar and flag correct levels.
+/// Needs three levels to have a majority to compare against. Warns only: OGC TMS 2.0 allows a level
+/// to cover less, and this engine's single-origin model cannot tell intent from a typo.
+pub fn undersized_levels(tms: &TileMatrixSet) -> Vec<UndersizedLevel> {
+    let mut found = Vec::new();
+    if tms.levels.len() < 3 {
+        return found;
+    }
+    let axes: [(&'static str, u32, fn(&TmLevel) -> u32); 2] = [
+        ("matrixWidth", tms.tile_w, |l| l.matrix_w),
+        ("matrixHeight", tms.tile_h, |l| l.matrix_h),
+    ];
+    for (axis, tile_px, count) in axes {
+        let span = |l: &TmLevel| l.resolution * f64::from(tile_px);
+        let mut bounds: Vec<f64> = tms
+            .levels
+            .iter()
+            .map(|l| f64::from(count(l)) * span(l) - span(l))
+            .filter(|b| b.is_finite())
+            .collect();
+        if bounds.len() < 3 {
+            continue;
+        }
+        bounds.sort_by(|a, b| a.total_cmp(b));
+        let extent_at_least = bounds[bounds.len() / 2];
+        for l in &tms.levels {
+            let (n, sp) = (count(l), span(l));
+            if !(sp > 0.0) {
+                continue;
+            }
+            // Relative epsilon: a coverage equal to the bound is fine, rounding noise is not a typo.
+            if f64::from(n) * sp < extent_at_least * (1.0 - 1e-9) {
+                found.push(UndersizedLevel {
+                    z: l.z,
+                    axis,
+                    declared: n,
+                    needed: (extent_at_least / sp).ceil().max(1.0) as u32,
+                });
+            }
+        }
+    }
+    found
+}
+
+/// Every grid id must mean ONE grid across the whole server. Layers sharing an id is normal (the
+/// swiss demo's seven layers all publish `swissLV95`), but `/tileMatrixSets/{id}` serves the first
+/// layer's grid under that id, so a second layer with a DIFFERENT grid under the same id would have
+/// its viewer build the wrong tile geometry. `grids` is `(layer name, grid)` pairs.
+pub fn conflicting_grid_ids<'a>(
+    grids: impl IntoIterator<Item = (&'a str, &'a TileMatrixSet)>,
+) -> Result<(), String> {
+    let mut first: BTreeMap<&str, (&str, &TileMatrixSet)> = BTreeMap::new();
+    for (layer, tms) in grids {
+        match first.get(tms.id.as_str()) {
+            Some((other, seen)) if *seen != tms => {
+                return Err(format!(
+                    "grid id '{}' means two different grids: layer '{other}' and layer '{layer}' \
+                     publish different tile geometry under it, and a client asking for \
+                     /tileMatrixSets/{} would get only one. Give one of them its own id.",
+                    tms.id, tms.id
+                ));
+            }
+            Some(_) => {}
+            None => {
+                first.insert(tms.id.as_str(), (layer, tms));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse an OGC TileMatrixSet 2.0 JSON document into a `TileMatrixSet`.
 pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
     let doc: OgcTms = serde_json::from_str(json).map_err(|e| format!("OGC TMS JSON: {e}"))?;
@@ -361,7 +452,7 @@ pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(TileMatrixSet {
+    let tms = TileMatrixSet {
         id: doc.id,
         crs,
         origin_x: origin[0],
@@ -369,7 +460,16 @@ pub fn from_ogc_json(json: &str) -> Result<TileMatrixSet, String> {
         tile_w,
         tile_h,
         levels,
-    })
+    };
+    for u in undersized_levels(&tms) {
+        eprintln!(
+            "WARNING: tile grid {}: level {} declares {} {}, but the other levels need at least \
+             {}. Tiles past it are refused as out of range, so part of the map is missing at that \
+             zoom. A typo in the grid document?",
+            tms.id, u.z, u.axis, u.declared, u.needed
+        );
+    }
+    Ok(tms)
 }
 
 /// Inverse of `normalize_crs`'s URI shortcut: `EPSG:<n>` → the OGC CRS URI form. Everything else
@@ -825,5 +925,121 @@ mod axis_order_tests {
         );
         let back = from_ogc_json(&serde_json::to_string(&v).unwrap()).expect("reparse");
         assert_eq!((back.origin_x, back.origin_y), (2_000_000.0, 5_500_000.0));
+    }
+}
+
+#[cfg(test)]
+mod grid_coverage_tests {
+    use super::*;
+
+    fn load(path: &str) -> TileMatrixSet {
+        from_ogc_json(&std::fs::read_to_string(path).expect("fixture readable")).expect(path)
+    }
+
+    /// The eCH-0056 grid as the standard defines it (issue #21), with the one correction the
+    /// fixture makes: level 5 (100 m) `matrixHeight` 3 -> 13, which its `description` states.
+    /// Everything else is verbatim, including the non-round origin.
+    #[test]
+    fn the_ech_0056_fixture_matches_the_standard() {
+        let t = load("fixtures/grids/eCH-0056_SwissLV95CellSizes.json");
+        assert_eq!(t.id, "SwissLV95CellSizes");
+        assert_eq!(t.crs, "EPSG:2056");
+        assert_eq!((t.origin_x, t.origin_y), (2419995.75, 1350004.29));
+        assert_eq!((t.tile_w, t.tile_h), (256, 256));
+        assert_eq!(t.levels.len(), 16);
+        assert_eq!(t.levels[0].resolution, 4000.0);
+        assert_eq!(t.levels[15].resolution, 0.05);
+        assert_eq!((t.levels[5].matrix_w, t.levels[5].matrix_h), (19, 13));
+        assert_eq!(
+            (t.levels[15].matrix_w, t.levels[15].matrix_h),
+            (37500, 25000)
+        );
+    }
+
+    /// The published eCH-0056 file says `matrixHeight: 3` at level 5. Served as-is, rows 3-12 of
+    /// that level answer "out of range", i.e. most of Switzerland is missing at 100 m. The check
+    /// must name that level and the row count the other levels imply.
+    #[test]
+    fn the_published_ech_typo_is_caught() {
+        let mut t = load("fixtures/grids/eCH-0056_SwissLV95CellSizes.json");
+        t.levels[5].matrix_h = 3;
+        let found = undersized_levels(&t);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let f = &found[0];
+        assert_eq!(
+            (f.z, f.axis, f.declared, f.needed),
+            (5, "matrixHeight", 3, 13)
+        );
+    }
+
+    #[test]
+    fn an_undersized_width_is_caught_too() {
+        let mut t = load("fixtures/grids/eCH-0056_SwissLV95CellSizes.json");
+        t.levels[8].matrix_w = 100; // 188 needed at 10 m
+        let found = undersized_levels(&t);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            (found[0].z, found[0].axis, found[0].declared),
+            (8, "matrixWidth", 100)
+        );
+    }
+
+    #[test]
+    fn every_shipped_grid_is_consistent() {
+        for path in [
+            "fixtures/grids/swissLV95.json",
+            "fixtures/grids/eCH-0056_SwissLV95CellSizes.json",
+            "fixtures/grids/EuropeanETRS89_LAEAQuad.json",
+        ] {
+            assert_eq!(undersized_levels(&load(path)), Vec::new(), "{path}");
+        }
+        for id in [
+            "WebMercatorQuad",
+            "WorldCRS84Quad",
+            "UPSArcticWGS84Quad",
+            "UPSAntarcticWGS84Quad",
+        ] {
+            let t = preset(id, 256).expect(id);
+            assert_eq!(undersized_levels(&t), Vec::new(), "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod grid_id_conflict_tests {
+    use super::*;
+
+    fn swiss() -> TileMatrixSet {
+        from_ogc_json(
+            &std::fs::read_to_string("fixtures/grids/eCH-0056_SwissLV95CellSizes.json").unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn layers_sharing_one_grid_definition_is_the_normal_case() {
+        let (a, b) = (swiss(), swiss());
+        assert_eq!(
+            conflicting_grid_ids([("ch_roads", &a), ("ch_water", &b)]),
+            Ok(())
+        );
+    }
+
+    /// `/tileMatrixSets/{id}` serves the FIRST layer's grid under that id, so a second layer with a
+    /// different grid under the same id would have its viewer build the wrong tile geometry.
+    #[test]
+    fn two_layers_with_different_grids_under_one_id_are_refused() {
+        let a = swiss();
+        let mut b = swiss();
+        b.origin_x = 2420000.0; // e.g. swisstopo's round origin under the eCH id
+        let err = conflicting_grid_ids([("ch_roads", &a), ("ch_water", &b)]).unwrap_err();
+        assert!(
+            err.contains("SwissLV95CellSizes"),
+            "must name the id: {err}"
+        );
+        assert!(
+            err.contains("ch_roads") && err.contains("ch_water"),
+            "must name both: {err}"
+        );
     }
 }

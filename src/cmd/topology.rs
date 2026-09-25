@@ -23,7 +23,7 @@ pub struct BuildTopologyArgs {
     pub vector: String,
     /// Optional layer name (GeoPackage only; ignored for a single-layer .fgb or .geojson); default =
     /// the source's auto-detected layer.
-    #[arg(long)]
+    #[arg(long, alias = "vector-layer")]
     pub layer: Option<String>,
     /// Snap tolerance in source-CRS units. Fine default leaves a clean coverage untouched.
     #[arg(long, default_value_t = 0.01)]
@@ -163,6 +163,23 @@ mod build_topology_cli_tests {
 
     use super::*;
     use crate::vector::topology::BuildReport;
+
+    /// `/cli` documents `--vector-layer` as an alias of `--layer`, the spelling the other commands
+    /// and every "several tables" error use (issue #22). Pin both.
+    #[test]
+    fn layer_also_parses_as_vector_layer() {
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            inner: BuildTopologyArgs,
+        }
+        use clap::Parser;
+        for flag in ["--layer", "--vector-layer"] {
+            let w = Wrap::try_parse_from(["t", "--vector", "a.gpkg", flag, "Parks"])
+                .unwrap_or_else(|e| panic!("{flag} must parse: {e}"));
+            assert_eq!(w.inner.layer.as_deref(), Some("Parks"), "{flag}");
+        }
+    }
 
     #[test]
     fn format_report_lists_the_key_counts() {

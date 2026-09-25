@@ -169,6 +169,10 @@ pub(crate) struct VectorLayerSpec {
     // ---- identity + source (per layer) ----
     pub name: String,
     pub vector_path: String,
+    /// The GeoPackage table to read (`vec_layer:` / `--vector-layer`). `None` = the file's only
+    /// feature table; a GeoPackage with several is refused rather than guessed (issue #22).
+    /// Meaningless for any other format, so setting it on one is refused too.
+    pub vec_layer: Option<String>,
     pub vec_style_path: String,
     pub font_path: String,
     /// The source CRS **as declared**; `None` = not declared, so adopt the file header's.
@@ -260,6 +264,10 @@ impl VectorLayerSpec {
         Self {
             name,
             vector_path,
+            // Never from `args`: this constructor also serves the `--config` path, where the
+            // global flag would leak into every layer (the `src_crs` bug shape, bc21155). Each
+            // call site sets it with `with_vec_layer`.
+            vec_layer: None,
             vec_style_path,
             font_path,
             declared_crs,
@@ -292,6 +300,13 @@ impl VectorLayerSpec {
         self.grid_ids = grid_ids;
         self.tile_px = tile_px;
         self.custom_grids = custom_grids;
+        self
+    }
+
+    /// The GeoPackage table: `LayerConfig.vec_layer` on the `--config` path, `--vector-layer` on
+    /// the single-`--vector`, `extract` and `build-pmtiles` paths.
+    pub(crate) fn with_vec_layer(mut self, vec_layer: Option<String>) -> Self {
+        self.vec_layer = vec_layer;
         self
     }
 
@@ -392,6 +407,9 @@ pub(crate) fn build_vector_layer(
     for b in &spec.zoom_sources {
         let mut band_spec = VectorLayerSpec {
             vector_path: b.vector.clone(),
+            // NOT the layer's table: an `extract` subset is its own single-table file with its own
+            // table name, so inheriting `vec_layer: Parks` would fail every band's lookup.
+            vec_layer: None,
             zoom_sources: Vec::new(),
             pmtiles_paths: Vec::new(),
             raster_pmtiles_paths: Vec::new(),
@@ -481,6 +499,7 @@ fn clone_spec(s: &VectorLayerSpec) -> VectorLayerSpec {
     VectorLayerSpec {
         name: s.name.clone(),
         vector_path: s.vector_path.clone(),
+        vec_layer: s.vec_layer.clone(),
         vec_style_path: s.vec_style_path.clone(),
         font_path: s.font_path.clone(),
         declared_crs: s.declared_crs.clone(),
@@ -512,6 +531,7 @@ fn build_vector_layer_base(
     let VectorLayerSpec {
         name,
         vector_path: geojson_path,
+        vec_layer,
         vec_style_path,
         font_path,
         declared_crs,
@@ -532,6 +552,20 @@ fn build_vector_layer_base(
     // the arms below can still ask "did the operator actually say?" -- that question is what
     // the old code had to answer by peeking at the global --src-crs flag.
     let src_crs: String = declared_crs.clone().unwrap_or_else(config::default_src_crs);
+    // Only a GeoPackage holds several tables. On any other source the name would be silently
+    // ignored, which is how a wrong assumption ships as a working-looking layer: refuse it.
+    let vec_layer = vec_layer.as_deref();
+    if let Some(t) = vec_layer {
+        if !matches!(
+            vector::uri::classify(geojson_path),
+            vector::uri::SourceKind::GeoPackage
+        ) {
+            return Err(Box::<dyn std::error::Error>::from(format!(
+                "layer '{name}': `vec_layer: {t}` names a GeoPackage table, but {geojson_path} is \
+                 not a GeoPackage (a PostGIS table goes in the URI itself)"
+            )));
+        }
+    }
     use vector::source::FeatureSource;
     // Resolve the layer's tile grids ONCE, up front — a vector layer has no COG, so `from_cog`
     // (raster's native-pyramid grid) is meaningless here; `resolve_grids_presets` is the no-COG
@@ -990,10 +1024,11 @@ fn build_vector_layer_base(
     ) && spec.topology_simplify.is_none()
         && spec.topology_dissolve.is_none()
         && spec.keep_fields.is_none()
-        && vector::gpkg::gpkg_has_rtree(geojson_path, None);
+        && vector::gpkg::gpkg_has_rtree(geojson_path, vec_layer);
     if windowed_gpkg {
-        let gpkg = vector::gpkg::GpkgWindowedSource::open(geojson_path, None)
+        let gpkg = vector::gpkg::GpkgWindowedSource::open(geojson_path, vec_layer)
             .map_err(|e| format!("gpkg {geojson_path}: {e}"))?;
+        let gpkg_table = gpkg.table().to_string();
         // CRS precedence mirrors the load-all `.gpkg` arm below: an explicit `--src-crs` always
         // wins; only when the operator did NOT pass one do we adopt the gpkg's own detected CRS.
         let resolved_crs = if declared_crs.is_none() {
@@ -1021,7 +1056,7 @@ fn build_vector_layer_base(
         };
         let paths = vector_serves_note(&grids);
         println!(
-            "layer '{name}': vector (windowed .gpkg)  bounds W {:.4} S {:.4} E {:.4} N {:.4}  {paths}",
+            "layer '{name}': vector (windowed .gpkg, table {gpkg_table})  bounds W {:.4} S {:.4} E {:.4} N {:.4}  {paths}",
             bounds_wgs84[0],
             bounds_wgs84[1],
             bounds_wgs84[2],
@@ -1061,11 +1096,17 @@ fn build_vector_layer_base(
         });
     }
 
+    // Which GeoPackage table was read, for the startup line (empty for other formats).
+    let mut table_note = String::new();
     let (src, src_crs): (std::sync::Arc<dyn FeatureSource>, String) = if matches!(
         vector::uri::classify(geojson_path),
         vector::uri::SourceKind::GeoPackage
     ) {
-        let g = vector::gpkg::GpkgSource::load(geojson_path, None)?;
+        // Name the layer: in a multi-layer config, "3 feature tables" alone does not say which
+        // layer to fix.
+        let g = vector::gpkg::GpkgSource::load(geojson_path, vec_layer)
+            .map_err(|e| format!("layer '{name}': {e}"))?;
+        table_note = format!(", table {}", g.table());
         let crs = if declared_crs.is_none() {
             match g.crs() {
                 Some(c) => c.to_string(),
@@ -1252,7 +1293,7 @@ fn build_vector_layer_base(
     };
     let paths = vector_serves_note(&grids);
     println!(
-        "layer '{name}': vector ({} features)  bounds W {:.4} S {:.4} E {:.4} N {:.4}  {paths}",
+        "layer '{name}': vector ({} features{table_note})  bounds W {:.4} S {:.4} E {:.4} N {:.4}  {paths}",
         src_vs.features_in(src_vs.full_extent())?.as_slice().len(),
         bounds_wgs84[0],
         bounds_wgs84[1],
@@ -1351,6 +1392,7 @@ mod windowed_gpkg_dispatch_tests {
             s3_region: None,
             name: None,
             vector: None,
+            vector_layer: None,
             pmtiles: Vec::new(),
             raster_pmtiles: Vec::new(),
             pmtiles_cache: false,
@@ -1385,6 +1427,122 @@ mod windowed_gpkg_dispatch_tests {
             tile_max_age: 0,
             mvt_style: None,
         }
+    }
+
+    /// A temp copy of mini.gpkg (one table, `feats`, 3 features) with a SECOND feature table,
+    /// `second`, holding one of them plus its own R-tree: the shape of the multi-table GeoPackage in
+    /// issue #22. Deleted on drop.
+    struct TwoTableMini(std::path::PathBuf);
+    impl TwoTableMini {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir()
+                .join(format!("ts_two_table_{}_{tag}.gpkg", std::process::id()));
+            std::fs::copy(MINI, &p).expect("copy mini.gpkg");
+            let c = rusqlite::Connection::open(&p).expect("open the copy");
+            c.execute_batch(
+                "CREATE TABLE second (fid INTEGER PRIMARY KEY AUTOINCREMENT, geom BLOB, name TEXT,
+                                      rank INTEGER);
+                 INSERT INTO second SELECT fid, geom, name, rank FROM feats
+                     WHERE fid = (SELECT min(fid) FROM feats);
+                 INSERT INTO gpkg_contents (table_name, data_type, identifier, min_x, min_y, max_x,
+                                            max_y, srs_id)
+                     SELECT 'second', 'features', 'second', min_x, min_y, max_x, max_y, srs_id
+                     FROM gpkg_contents WHERE table_name = 'feats';
+                 INSERT INTO gpkg_geometry_columns
+                     SELECT 'second', column_name, geometry_type_name, srs_id, z, m
+                     FROM gpkg_geometry_columns WHERE table_name = 'feats';
+                 CREATE VIRTUAL TABLE rtree_second_geom USING rtree(id, minx, maxx, miny, maxy);
+                 INSERT INTO rtree_second_geom
+                     SELECT * FROM rtree_feats_geom WHERE id IN (SELECT fid FROM second);",
+            )
+            .expect("add the second table");
+            TwoTableMini(p)
+        }
+        fn spec(&self, args: &ServeArgs, vec_layer: Option<&str>) -> VectorLayerSpec {
+            VectorLayerSpec::from_serve_args(
+                args,
+                "two".to_string(),
+                self.0.to_str().unwrap().to_string(),
+                VEC_STYLE.to_string(),
+                FONT.to_string(),
+                Some("EPSG:4326".to_string()),
+            )
+            .with_vec_layer(vec_layer.map(str::to_string))
+        }
+    }
+    impl Drop for TwoTableMini {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const WORLD: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+
+    #[test]
+    fn a_multi_table_gpkg_without_vec_layer_fails_at_startup() {
+        let g = TwoTableMini::new("none");
+        let s3 = crate::s3::S3Config::from_env();
+        let err = build_vector_layer(&g.spec(&base_serve_args(), None), &s3)
+            .err()
+            .expect("two feature tables and no vec_layer must not start")
+            .to_string();
+        assert!(
+            err.contains("feats") && err.contains("second"),
+            "must list the tables: {err}"
+        );
+        assert!(
+            err.contains("layer 'two'"),
+            "must say which layer to fix: {err}"
+        );
+    }
+
+    #[test]
+    fn vec_layer_selects_the_table_on_the_windowed_path() {
+        let g = TwoTableMini::new("windowed");
+        let s3 = crate::s3::S3Config::from_env();
+        let layer = build_vector_layer(&g.spec(&base_serve_args(), Some("second")), &s3).unwrap();
+        let v = layer.vector.expect("vector layer");
+        assert!(matches!(v.source, VectorSource::Windowed(_)));
+        assert_eq!(
+            v.source.features_in(WORLD).unwrap().len(),
+            1,
+            "must read `second`"
+        );
+    }
+
+    #[test]
+    fn vec_layer_selects_the_table_on_the_load_all_path() {
+        let g = TwoTableMini::new("loadall");
+        let mut args = base_serve_args();
+        args.keep_fields = Some("name".to_string()); // a load-all-only transform
+        let s3 = crate::s3::S3Config::from_env();
+        let layer = build_vector_layer(&g.spec(&args, Some("second")), &s3).unwrap();
+        let v = layer.vector.expect("vector layer");
+        assert!(matches!(v.source, VectorSource::LoadAll(_)));
+        assert_eq!(
+            v.source.features_in(WORLD).unwrap().len(),
+            1,
+            "must read `second`"
+        );
+    }
+
+    #[test]
+    fn vec_layer_on_a_non_geopackage_source_is_refused() {
+        let s3 = crate::s3::S3Config::from_env();
+        let spec = VectorLayerSpec::from_serve_args(
+            &base_serve_args(),
+            "c".to_string(),
+            "fixtures/vector/countries.geojson".to_string(),
+            VEC_STYLE.to_string(),
+            FONT.to_string(),
+            Some("EPSG:4326".to_string()),
+        )
+        .with_vec_layer(Some("countries".to_string()));
+        let err = build_vector_layer(&spec, &s3)
+            .err()
+            .expect("vec_layer on a GeoJSON source must be refused, not ignored")
+            .to_string();
+        assert!(err.contains("vec_layer"), "must name the setting: {err}");
     }
 
     #[test]
@@ -1744,6 +1902,7 @@ mod zoom_source_tests {
         VectorLayerSpec {
             name: "banded".into(),
             vector_path: "fixtures/vector/mini_mvt.geojson".into(),
+            vec_layer: None,
             vec_style_path: "fixtures/styles/airports.vec.json".into(),
             font_path: "fixtures/fonts/DejaVuSans.ttf".into(),
             declared_crs: Some("EPSG:4326".into()),

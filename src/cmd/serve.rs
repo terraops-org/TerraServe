@@ -74,6 +74,11 @@ pub struct ServeArgs {
     /// Pair with `--vec-style` and `--font`; `--src-crs` is the feature CRS (default EPSG:4326).
     #[arg(long)]
     pub vector: Option<String>,
+    /// The table to read when `--vector` is a GeoPackage, e.g. `Parks`. Required when the file
+    /// holds more than one feature table (startup fails and lists them); optional with exactly
+    /// one. Refused on any other source. The `--config` equivalent is a layer's `vec_layer:`.
+    #[arg(long = "vector-layer")]
+    pub vector_layer: Option<String>,
     /// Serve MVT tiles from a pre-built PMTiles archive (read-through); a tile not in the archive is
     /// live-encoded from `--vector`. Requires `--vector`. Opt-in, repeatable — pass once per grid
     /// (each archive self-describes the grid it was baked on via its `grid_id` metadata; serve
@@ -377,6 +382,7 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
             // For a single `--vector`, the global `--src-crs` IS this layer's declaration.
             args.src_crs.clone(),
         )
+        .with_vec_layer(args.vector_layer.clone())
         .with_grids(args.tms_grids.clone(), args.tms_tile_px, no_custom_grids)
         .with_pmtiles(args.pmtiles.clone())
         .with_raster_pmtiles(args.raster_pmtiles.clone());
@@ -464,6 +470,8 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
                     // what silently discarded every per-layer `src_crs:` before bc21155.
                     lc.src_crs.clone(),
                 )
+                // THIS layer's table, never `args.vector_layer` (same reason as `src_crs` above).
+                .with_vec_layer(lc.vec_layer.clone())
                 .with_grids(lc.grids.clone(), lc.tile_px, cfg.grids.clone())
                 .with_pmtiles(lc.pmtiles.clone())
                 .with_raster_pmtiles(lc.raster_pmtiles.clone())
@@ -559,6 +567,13 @@ pub fn run_serve(args: &ServeArgs) -> Result<(), Error> {
         )?]
     };
 
+    // One grid id, one grid, across every layer: `/tileMatrixSets/{id}` answers with the first
+    // match, so a second layer with different geometry under the same id would be misread.
+    crate::tms::conflicting_grid_ids(
+        layers
+            .iter()
+            .flat_map(|l| l.grids.iter().map(move |g| (l.name.as_str(), &g.tms))),
+    )?;
     println!(
         "serving {} layer(s): {}",
         layers.len(),
@@ -786,6 +801,16 @@ mod cli_name_tests {
         assert_eq!(w.inner.mvt_fine_extent_zoom, 6);
         let d = Wrap::try_parse_from(["serve", "--cog", "x.tif"]).expect("defaults parse");
         assert_eq!(d.inner.mvt_fine_extent_zoom, 0);
+    }
+
+    /// `--vector-layer` is the spelling in the docs and in every error that asks for it; pin it.
+    #[test]
+    fn the_vector_layer_flag_parses_and_defaults_to_none() {
+        let w = Wrap::try_parse_from(["serve", "--vector", "a.gpkg", "--vector-layer", "Parks"])
+            .expect("--vector-layer must parse");
+        assert_eq!(w.inner.vector_layer.as_deref(), Some("Parks"));
+        let d = Wrap::try_parse_from(["serve", "--vector", "a.gpkg"]).expect("defaults parse");
+        assert_eq!(d.inner.vector_layer, None);
     }
 
     /// `--tile-encoding` defaults to gzip, which is what makes a flagless 0.3.3 byte-identical to

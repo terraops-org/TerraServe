@@ -17,6 +17,7 @@ use terraserve::{run_extract, ExtractArgs};
 fn args(out: &str) -> ExtractArgs {
     ExtractArgs {
         vector: "fixtures/vector/mini_mvt.geojson".into(),
+        vector_layer: None,
         vec_style: "fixtures/styles/airports.vec.json".into(),
         out: out.into(),
         name: "subset".into(),

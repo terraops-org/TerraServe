@@ -54,3 +54,13 @@ fn a_trailing_comma_does_not_produce_an_empty_column() {
     let a = parse(&["--columns", "building,"]);
     assert_eq!(a.clean_columns(), vec!["building".to_string()]);
 }
+
+#[test]
+fn vector_layer_is_accepted() {
+    // The GeoPackage table to bake (issue #22); the spelling every error message asks for.
+    assert_eq!(
+        parse(&["--vector-layer", "Parks"]).vector_layer.as_deref(),
+        Some("Parks")
+    );
+    assert_eq!(parse(&[]).vector_layer, None);
+}

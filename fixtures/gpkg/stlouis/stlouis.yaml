@@ -1,0 +1,15 @@
+# The same two layers with the table named: `vec_layer:` picks the GeoPackage table. The layer
+# `name:` and the SLD's <NamedLayer><Name> never select data.
+layers:
+  - name: Parks
+    vector: fixtures/gpkg/stlouis/stlouis.gpkg
+    vec_layer: Parks
+    vec_style: fixtures/gpkg/stlouis/parks.sld
+    src_crs: EPSG:4326
+    extent: [-90.3, 38.5, -90.1, 38.7]
+  - name: Pizza
+    vector: fixtures/gpkg/stlouis/stlouis.gpkg
+    vec_layer: Pizza
+    vec_style: fixtures/gpkg/stlouis/pizza.sld
+    src_crs: EPSG:4326
+    extent: [-90.3, 38.5, -90.1, 38.7]

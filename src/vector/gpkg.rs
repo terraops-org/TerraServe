@@ -41,10 +41,11 @@ pub struct GpkgSource {
     features: Vec<Feature>,
     extent: [f64; 4],
     crs: Option<String>,
+    table: String,
 }
 
 impl GpkgSource {
-    /// Parse-once load: opens `path` read-only, picks a features layer (`layer`, or the first
+    /// Parse-once load: opens `path` read-only, picks a features layer (`layer`, or the only
     /// `gpkg_contents` row with `data_type='features'` when `None`), decodes every row's
     /// geometry + attributes across a partitioned parallel load, and holds the result in memory
     /// for the source's lifetime.
@@ -113,7 +114,13 @@ impl GpkgSource {
             features,
             extent: [w, s, e, n],
             crs,
+            table,
         })
+    }
+
+    /// The feature table this source read, as `gpkg_contents` spells it.
+    pub fn table(&self) -> &str {
+        &self.table
     }
 
     /// The resolved CRS of the loaded layer (`Some("EPSG:<code>")`), or `None` when the
@@ -133,24 +140,53 @@ impl FeatureSource for GpkgSource {
     }
 }
 
-/// Pick the feature table: the given `layer` name (validated against `gpkg_contents`), or the
-/// first `data_type='features'` row when `None`. Errors if a named layer isn't found, or if the
-/// GeoPackage has no features layer at all.
+/// Pick the feature table: the given `layer` name, or the only `data_type='features'` table when
+/// `None`.
+///
+/// A GeoPackage with several feature tables and no name is REFUSED, listing the tables. It used
+/// to read the first one, so every layer pointed at a multi-table file served that same table
+/// whatever its `name:` or style said (issue #22: `Parks` and `Pizza` both served
+/// `PointsOfInterest`). A name is matched exactly, then case-insensitively (SQLite table names are
+/// case-insensitive), and the returned name is always the one `gpkg_contents` spells, because the
+/// R-tree lookup builds `rtree_<table>_<geom>` from it.
 fn find_features_table(conn: &Connection, layer: Option<&str>) -> Result<String, String> {
-    const BASE: &str = "SELECT table_name FROM gpkg_contents WHERE data_type='features'";
+    let tables: Vec<String> = conn
+        .prepare("SELECT table_name FROM gpkg_contents WHERE data_type='features'")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|e| format!("gpkg: reading gpkg_contents: {e}"))?;
+    let listed = || tables.join(", ");
     match layer {
-        Some(name) => conn
-            .query_row(&format!("{BASE} AND table_name = ?1"), [name], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(|e| format!("gpkg: no features layer named `{name}` in gpkg_contents: {e}")),
-        None => conn
-            .query_row(BASE, [], |r| r.get::<_, String>(0))
-            .map_err(|e| {
-                format!(
-                    "gpkg: no features layer found in gpkg_contents (data_type='features'): {e}"
-                )
-            }),
+        Some(name) => {
+            if let Some(t) = tables.iter().find(|t| t.as_str() == name) {
+                return Ok(t.clone());
+            }
+            let folded: Vec<&String> = tables
+                .iter()
+                .filter(|t| t.eq_ignore_ascii_case(name))
+                .collect();
+            match folded.as_slice() {
+                [only] => Ok((*only).clone()),
+                _ => Err(format!(
+                    "gpkg: no features table named `{name}`; this GeoPackage has: {}",
+                    listed()
+                )),
+            }
+        }
+        None => match tables.as_slice() {
+            [] => Err(
+                "gpkg: no features layer found in gpkg_contents (data_type='features')".to_string(),
+            ),
+            [only] => Ok(only.clone()),
+            _ => Err(format!(
+                "gpkg: {} feature tables ({}) and none chosen; name one with `vec_layer:` on the \
+                 config layer, or `--vector-layer` on the command line",
+                tables.len(),
+                listed()
+            )),
+        },
     }
 }
 
@@ -578,8 +614,13 @@ pub struct GpkgWindowedSource {
 }
 
 impl GpkgWindowedSource {
-    /// Open `path`'s features layer (`layer`, or the first `data_type='features'` row when
-    /// `None`) as a windowed source: resolve the table/geom-col/CRS/PK via the same metadata
+    /// The feature table this source reads, as `gpkg_contents` spells it.
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Open `path`'s features layer (`layer`, or the only `data_type='features'` table when
+    /// `None`; several without a name is an error) as a windowed source: resolve the table/geom-col/CRS/PK via the same metadata
     /// helpers `GpkgSource::load` uses, then read the extent and attribute schema — all from
     /// cheap metadata, no feature row is ever touched. The one-shot connection is dropped before
     /// returning (§ connection strategy A — `query_capped` opens its own per call).
@@ -1051,6 +1092,150 @@ mod windowed_tests {
     fn windowed_open_errs_on_missing_file() {
         assert!(
             GpkgWindowedSource::open("fixtures/gpkg/does_not_exist_at_all.gpkg", None).is_err()
+        );
+    }
+
+    // -- choosing a table in a multi-table GeoPackage (issue #22) ------------------------------
+
+    /// `build_temp_gpkg(true)` plus a SECOND features table, `Parks`, holding the first two fixture
+    /// features with its own R-tree. The shape of the StLouis.gpkg in issue #22, where each table
+    /// is a separate layer and the reader silently served the first one for every layer.
+    fn build_two_table_gpkg() -> std::path::PathBuf {
+        let path = build_temp_gpkg(true);
+        let conn = Connection::open(&path).expect("reopen temp gpkg");
+        conn.execute_batch(
+            "CREATE TABLE \"Parks\" (
+                 fid INTEGER PRIMARY KEY AUTOINCREMENT,
+                 geom BLOB,
+                 name TEXT,
+                 rank INTEGER
+             );
+             INSERT INTO gpkg_contents VALUES
+                 ('Parks','features','Parks','','2026-01-01T00:00:00.000Z',5.0,4.0,66.0,26.0,4326);
+             INSERT INTO gpkg_geometry_columns VALUES ('Parks','geom','GEOMETRY',4326,0,0);
+             CREATE VIRTUAL TABLE \"rtree_Parks_geom\" USING rtree(id, minx, maxx, miny, maxy);",
+        )
+        .expect("create the second features table");
+        for (fid, blob, bbox, name, rank) in temp_features().iter().take(2) {
+            conn.execute(
+                "INSERT INTO \"Parks\" (fid, geom, name, rank) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![fid, blob, name, rank],
+            )
+            .expect("insert Parks row");
+            conn.execute(
+                "INSERT INTO \"rtree_Parks_geom\" (id, minx, maxx, miny, maxy) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![fid, bbox[0], bbox[2], bbox[1], bbox[3]],
+            )
+            .expect("insert Parks rtree row");
+        }
+        path
+    }
+
+    fn two_tables() -> TempGpkg {
+        TempGpkg(build_two_table_gpkg())
+    }
+
+    #[test]
+    fn load_refuses_to_guess_between_two_feature_tables() {
+        let g = two_tables();
+        let err = GpkgSource::load(g.path(), None)
+            .err()
+            .expect("two feature tables and no name must not silently pick one");
+        assert!(
+            err.contains("feats") && err.contains("Parks"),
+            "must list the tables: {err}"
+        );
+        assert!(err.contains("vec_layer"), "must say how to choose: {err}");
+    }
+
+    #[test]
+    fn windowed_open_refuses_to_guess_between_two_feature_tables() {
+        let g = two_tables();
+        let err = GpkgWindowedSource::open(g.path(), None)
+            .err()
+            .expect("two feature tables and no name must not silently pick one");
+        assert!(
+            err.contains("feats") && err.contains("Parks"),
+            "must list the tables: {err}"
+        );
+    }
+
+    #[test]
+    fn load_reads_the_named_table() {
+        let g = two_tables();
+        assert_eq!(
+            GpkgSource::load(g.path(), Some("Parks"))
+                .unwrap()
+                .features()
+                .len(),
+            2
+        );
+        assert_eq!(
+            GpkgSource::load(g.path(), Some("feats"))
+                .unwrap()
+                .features()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn windowed_open_reads_the_named_table() {
+        let g = two_tables();
+        let src = GpkgWindowedSource::open(g.path(), Some("Parks")).unwrap();
+        let all = src.query_capped([-1e9, -1e9, 1e9, 1e9], 1000).unwrap();
+        assert_eq!(all.len(), 2, "must read Parks, not the first table");
+    }
+
+    #[test]
+    fn table_name_matches_case_insensitively() {
+        // SQLite table names are case-insensitive, so `parks` is the same table as `Parks`.
+        let g = two_tables();
+        assert_eq!(
+            GpkgSource::load(g.path(), Some("parks"))
+                .unwrap()
+                .features()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn unknown_table_error_lists_the_real_ones() {
+        let g = two_tables();
+        let err = GpkgSource::load(g.path(), Some("Pizza"))
+            .err()
+            .expect("an unknown table must be refused");
+        assert!(err.contains("Pizza"), "must name what was asked for: {err}");
+        assert!(
+            err.contains("feats") && err.contains("Parks"),
+            "must list the tables: {err}"
+        );
+    }
+
+    #[test]
+    fn sources_report_the_table_as_gpkg_contents_spells_it() {
+        // The startup line prints it, so a layer reading the wrong table is visible at a glance.
+        let g = two_tables();
+        assert_eq!(
+            GpkgSource::load(g.path(), Some("parks")).unwrap().table(),
+            "Parks"
+        );
+        assert_eq!(
+            GpkgWindowedSource::open(g.path(), Some("parks"))
+                .unwrap()
+                .table(),
+            "Parks"
+        );
+    }
+
+    #[test]
+    fn a_single_table_gpkg_still_needs_no_name() {
+        let g = TempGpkg::build(true);
+        assert_eq!(
+            GpkgSource::load(g.path(), None).unwrap().features().len(),
+            8
         );
     }
 }
