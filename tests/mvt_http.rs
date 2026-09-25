@@ -390,6 +390,33 @@ fn xray_html_is_the_ol_mvt_viewer() {
     );
 }
 
+/// The X-ray page is told which grids each layer publishes over WMTS, so it can leave the raster
+/// underlay off for a layer that has none. Without this, a `--config` layer with no `grids:` drew
+/// its vector tiles fine under a map of failed underlay tiles (every one a 400, "publishes no tile
+/// grids"), found on the issue #22 showcase, 2026-09-25.
+#[test]
+fn xray_page_tells_the_viewer_each_layers_wmts_grids() {
+    let mut st = state();
+    let page = server::xray_page(&st);
+    assert!(
+        !page.contains("__TS_RASTER_GRIDS__"),
+        "placeholder left unsubstituted"
+    );
+    assert!(
+        page.contains(&format!("{{\"{LAYER}\":[]}}")),
+        "a layer without grids must be injected with none"
+    );
+    st.layers[0].grids.push(PublishedGrid {
+        tms: terraserve::tms::preset("WebMercatorQuad", 512).unwrap(),
+        data_bounds: None,
+    });
+    let page = server::xray_page(&st);
+    assert!(
+        page.contains(&format!("{{\"{LAYER}\":[\"WebMercatorQuad_512\"]}}")),
+        "the published grid id must be injected as the server names it"
+    );
+}
+
 #[test]
 fn xray_route_serves_html_over_real_http() {
     // Route-wiring smoke test: spin the actual axum server and GET /xray for real, so a typo'd

@@ -900,6 +900,24 @@ function boot(tmsDoc) {
   if (params.get('wms') === '0' || params.get('wms') === 'false') {
     wmsChk.checked = false;
   }
+  // Only offer the underlay when the layer publishes this grid over WMTS. The picker offers every
+  // preset because /mvt falls back to them, but /wmts does not: a layer with no `grids:` answers
+  // every underlay tile with a 400. `__TS_RASTER_GRIDS__` is {layer: [grid ids]} as the server
+  // names them (`WebMercatorQuad_512`), compared without that size suffix, as the server does.
+  // An unsubstituted page, or a layer the server did not list, keeps the old behaviour.
+  var rasterGrids;
+  try { rasterGrids = __TS_RASTER_GRIDS__; } catch (e) {}
+  function stripSizeSuffix(id) { return String(id).replace(/_[0-9]+$/, ''); }
+  var publishedHere = !rasterGrids || typeof rasterGrids !== 'object' ||
+    !Array.isArray(rasterGrids[wmsName]) ||
+    rasterGrids[wmsName].some(function (g) { return stripSizeSuffix(g) === stripSizeSuffix(gridId); });
+  if (!publishedHere) {
+    wmsChk.checked = false;
+    wmsChk.disabled = true;
+    document.getElementById('wmsHint').textContent = 'No raster underlay: layer "' + wmsName +
+      '" publishes no WMTS grid for ' + gridId + '. Add it to the layer, e.g. grids: [' +
+      stripSizeSuffix(gridId) + '].';
+  }
   function setWmsUnderlay(on) {
     if (on && !wmsLayer) {
       var src = new ol.source.TileImage({

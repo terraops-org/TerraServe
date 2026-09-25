@@ -1374,6 +1374,15 @@ fn inline_json<T: serde::Serialize>(v: &T) -> String {
 }
 
 async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(xray_page(&state)))
+        .unwrap()
+}
+
+/// The X-ray page with this server's values substituted in: `xray_handler`'s body, pulled out so
+/// the substitution is testable without an HTTP listener.
+pub fn xray_page(state: &ServeState) -> String {
     // Substitute the server's FIRST layer as the viewer's default. Without this the page
     // defaulted to the literal "vector" and every tile 404'd whenever the layer was named
     // anything else (`--name airports` on the published demo image, for instance) — the
@@ -1419,16 +1428,24 @@ async fn xray_handler(State(state): State<Arc<ServeState>>) -> Response {
     // Both placeholders expand into an inline <script> as JS expressions, so encode them with
     // `inline_json` (HTML/JS-context-safe) rather than raw substitution: a grid id or layer name is
     // an operator-controlled config value that could otherwise close the <script> or break the JS.
+    // Per layer, the grids it publishes over WMTS/TMS, as the server names them
+    // (`WebMercatorQuad_512`). The picker list above always offers the presets, because the /mvt
+    // route falls back to them; the raster underlay has no such fallback, so a layer with no
+    // `grids:` answers every underlay tile with a 400. The viewer uses this to leave it off.
+    let raster_grids: std::collections::BTreeMap<&str, Vec<&str>> = state
+        .layers
+        .iter()
+        .map(|l| {
+            let ids = l.grids.iter().map(|g| g.tms.id.as_str()).collect();
+            (l.name.as_str(), ids)
+        })
+        .collect();
     let grids_json = inline_json(&grids);
     let layer_json = inline_json(&default_layer);
-    Response::builder()
-        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-        .body(Body::from(
-            xray_html()
-                .replace("__TS_DEFAULT_LAYER__", &layer_json)
-                .replace("__TS_GRIDS__", &grids_json),
-        ))
-        .unwrap()
+    xray_html()
+        .replace("__TS_DEFAULT_LAYER__", &layer_json)
+        .replace("__TS_GRIDS__", &grids_json)
+        .replace("__TS_RASTER_GRIDS__", &inline_json(&raster_grids))
 }
 
 /// The embedded X-ray viewer page, exposed as a function (rather than inlining `include_str!` at
