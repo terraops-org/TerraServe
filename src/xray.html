@@ -424,6 +424,32 @@ function glowActive(theme, resolution) {
   return !isFinite(z) || z >= theme.glowMinZoom;
 }
 
+// Point styles are SHARED, never built per feature. OpenLayers calls the style function for every
+// point of every tile, again on each frame of a zoom animation, and each `ol.style.Circle` owns a
+// canvas plus a hit-detection canvas: built per point, a world view of a dense layer allocated
+// ~100,000 of them and froze the tab for seconds (issue #24, 228,090 WoSIS profiles). A tile of N
+// points now shares one or two Style objects per (colour, radius, halo).
+var PLAIN_POINT_STYLES = [
+  new ol.style.Style({ image: new ol.style.Circle({ radius: 9, fill: new ol.style.Fill({ color: GLOW }) }) }),
+  new ol.style.Style({ image: new ol.style.Circle({ radius: 2.5, fill: new ol.style.Fill({ color: BRIGHT }) }) })
+];
+var pointStyleCache = {};
+function themedPointStyles(col, radius, halo) {
+  // Quarter-pixel steps: the zoom factor is continuous during an animation, and an unrounded
+  // radius would make every frame a cache miss. Bounded: colours x radius steps x 2.
+  var r = Math.round(radius * 4) / 4;
+  var key = col + '|' + r + '|' + halo;
+  var hit = pointStyleCache[key];
+  if (hit) return hit;
+  var pt = [];
+  if (halo) {
+    pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: r * 2.4, fill: new ol.style.Fill({ color: withAlpha(col, 0.22) }) }) }));
+  }
+  pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: r, fill: new ol.style.Fill({ color: col }),
+    stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.75)', width: halo ? 0.8 : 0 }) }) }));
+  return (pointStyleCache[key] = pt);
+}
+
 function xrayStyle(feature, theme, resolution) {
   var type = feature.getGeometry().getType();
   var themed = useWmsStyle && theme;
@@ -435,29 +461,9 @@ function xrayStyle(feature, theme, resolution) {
       var pr = theme.radius ? Number(ruleValue(theme.radius, feature)) : 3;
       if (!isFinite(pr) || pr <= 0) pr = 3;
       var zf = pointZoomFactor(resolution);
-      pr = Math.max(0.8, pr * zf);
-      var pt = [];
-      if (zf > 0.6) {
-        pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: pr * 2.4, fill: new ol.style.Fill({ color: withAlpha(pcol, 0.22) }) }) }));
-      }
-      pt.push(new ol.style.Style({ image: new ol.style.Circle({ radius: pr, fill: new ol.style.Fill({ color: pcol }),
-        stroke: new ol.style.Stroke({ color: 'rgba(255,255,255,0.75)', width: zf > 0.6 ? 0.8 : 0 }) }) }));
-      return pt;
+      return themedPointStyles(pcol, Math.max(0.8, pr * zf), zf > 0.6);
     }
-    return [
-      new ol.style.Style({
-        image: new ol.style.Circle({
-          radius: 9,
-          fill: new ol.style.Fill({ color: GLOW })
-        })
-      }),
-      new ol.style.Style({
-        image: new ol.style.Circle({
-          radius: 2.5,
-          fill: new ol.style.Fill({ color: BRIGHT })
-        })
-      })
-    ];
+    return PLAIN_POINT_STYLES;
   }
   // Thematic fill (e.g. COS land cover): colour the polygon by the style's data-driven field,
   // with a thin dark class boundary. Falls through to the cyan wireframe when no theme is loaded.
